@@ -199,6 +199,8 @@ if [ -f ../SillyTavern/src/tokenizers/llama3.json ]; then
 else
   echo SKIP_NO_LLAMA
 fi
+echo "== REPL coverage =="
+printf "/presets\n/worldinfo\n/groups\n/themes\n/stats\n/secrets\n/users\n/extensions\n/backups\n/exit\n" | timeout 5 ./zig-out/bin/st-client --port $PORT 2>&1 | grep -q '"ok":true' && echo PASS
 echo "== bad method =="
 ./zig-out/bin/st-client --port $PORT nope | grep -q '"ok":false' && echo PASS
 cat "$TMP/server.log"

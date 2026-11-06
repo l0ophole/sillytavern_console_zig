@@ -50,7 +50,7 @@ fn repl(alloc: std.mem.Allocator, host: []const u8, port: u16) !void {
         if (trimmed.len == 0) continue;
         if (std.mem.eql(u8, trimmed, "/exit") or std.mem.eql(u8, trimmed, "exit") or std.mem.eql(u8, trimmed, "/quit")) break;
         if (std.mem.eql(u8, trimmed, "/help")) {
-            out.writeAll("Commands: /ping /version /health /characters /settings /chats /exit\n  Usage: /<method> [params-json]\n") catch {};
+            out.writeAll("Commands: /ping /version /health /characters /settings /chats /presets /worldinfo /groups /themes /search /vectors /extensions /backups /stats /secrets /users /exit\n  Usage: /<method> [params-json]\n") catch {};
             continue;
         }
         var method: []const u8 = trimmed;
@@ -66,6 +66,17 @@ fn repl(alloc: std.mem.Allocator, host: []const u8, port: u16) !void {
         if (std.mem.eql(u8, method, "characters")) method = "characters.list";
         if (std.mem.eql(u8, method, "settings")) method = "settings.get";
         if (std.mem.eql(u8, method, "chats")) method = "chats.list";
+        if (std.mem.eql(u8, method, "presets")) method = "presets.list";
+        if (std.mem.eql(u8, method, "worldinfo")) method = "worldinfo.list";
+        if (std.mem.eql(u8, method, "groups")) method = "groups.list";
+        if (std.mem.eql(u8, method, "themes")) method = "themes.list";
+        if (std.mem.eql(u8, method, "search")) method = "search.query";
+        if (std.mem.eql(u8, method, "vectors")) method = "vectors.list";
+        if (std.mem.eql(u8, method, "extensions")) method = "extensions.list";
+        if (std.mem.eql(u8, method, "backups")) method = "backups.list";
+        if (std.mem.eql(u8, method, "stats")) method = "stats.summary";
+        if (std.mem.eql(u8, method, "secrets")) method = "secrets.list";
+        if (std.mem.eql(u8, method, "users")) method = "users.list";
         const resp = sendRequest(alloc, host, port, method, params) catch |e| {
             const m = std.fmt.allocPrint(alloc, "error: {}\n", .{e}) catch "";
             err_out.writeAll(m) catch {};
