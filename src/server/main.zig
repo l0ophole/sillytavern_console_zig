@@ -2920,6 +2920,28 @@ fn handleClient(conn: posix.fd_t) void {
                             }
                         }
                     }
+                    // Google streaming: candidates[0].content.parts[0].text
+                    if (parsed.value.object.get("candidates")) |cands| {
+                        if (cands == .array and cands.array.items.len > 0) {
+                            const cf = cands.array.items[0];
+                            if (cf == .object) {
+                                if (cf.object.get("content")) |cont| {
+                                    if (cont == .object) {
+                                        if (cont.object.get("parts")) |parts| {
+                                            if (parts == .array and parts.array.items.len > 0) {
+                                                const p0 = parts.array.items[0];
+                                                if (p0 == .object) {
+                                                    if (p0.object.get("text")) |t| {
+                                                        if (t == .string) full.appendSlice(alloc, t.string) catch return;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                     // Generic text field
                     if (parsed.value.object.get("text")) |t| {
                         if (t == .string and full.items.len == 0) full.appendSlice(alloc, t.string) catch return;

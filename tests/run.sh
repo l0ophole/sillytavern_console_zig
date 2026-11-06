@@ -387,6 +387,21 @@ if [ -f "$SNAP/onnx/model.onnx" ]; then
 else
   echo SKIP_NO_MINILM
 fi
+echo "== anthropic streaming =="
+cat > /rpf/tmp/opencode/mock_sse_anth.py <<'PYEOF'
+from http.server import BaseHTTPRequestHandler, HTTPServer
+class H(BaseHTTPRequestHandler):
+    def do_POST(self):
+        ln=int(self.headers.get('Content-Length',0)); self.rfile.read(ln)
+        body=b'event: content_block_delta\ndata: {"type":"content_block_delta","delta":{"type":"text_delta","text":"Anthropic "}}\n\nevent: content_block_delta\ndata: {"type":"content_block_delta","delta":{"type":"text_delta","text":"stream"}}\n\ndata: [DONE]\n\n'
+        self.send_response(200); self.send_header('Content-Type','text/event-stream'); self.send_header('Content-Length',str(len(body))); self.end_headers(); self.wfile.write(body)
+    def log_message(self,*a): pass
+HTTPServer(('127.0.0.1',18156),H).handle_request()
+PYEOF
+python3 /rpf/tmp/opencode/mock_sse_anth.py > /rpf/tmp/opencode/sse2.log 2>&1 & echo $! > /rpf/tmp/opencode/sse2.pid
+sleep 1
+./zig-out/bin/st-client --port $PORT backend.stream '{"provider":"anthropic","model":"claude-3","api_key":"k","base_url":"http://127.0.0.1:18156","path":"/v1/messages","messages":[{"role":"user","content":"hi"}]}' | grep -q 'Anthropic stream' && echo PASS
+kill $(cat /rpf/tmp/opencode/sse2.pid) 2>/dev/null || true
 echo "== bad method =="
 ./zig-out/bin/st-client --port $PORT nope | grep -q '"ok":false' && echo PASS
 cat "$TMP/server.log"
