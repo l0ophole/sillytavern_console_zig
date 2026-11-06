@@ -349,6 +349,8 @@ python3 /rpf/tmp/opencode/mock_err.py > /rpf/tmp/opencode/e.log 2>&1 & echo $! >
 sleep 1
 ./zig-out/bin/st-client --port $PORT backend.native '{"provider":"openai","model":"gpt-4","api_key":"bad","base_url":"http://127.0.0.1:18145","path":"/v1/chat/completions","messages":[{"role":"user","content":"hi"}]}' | grep -q 'provider_error' && echo PASS
 kill $(cat /rpf/tmp/opencode/e.pid) 2>/dev/null || true
+echo "== onnx save integration =="
+./zig-out/bin/st-client --port $PORT vectors.save '{"collection":"oc","id":"o1","model":"/rpf/tmp/opencode/test.onnx","value":{"text":"hello onnx"}}' | grep -q '"saved"' && echo PASS
 echo "== bad method =="
 ./zig-out/bin/st-client --port $PORT nope | grep -q '"ok":false' && echo PASS
 cat "$TMP/server.log"

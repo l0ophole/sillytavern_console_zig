@@ -1441,16 +1441,40 @@ fn handleClient(conn: posix.fd_t) void {
                         var gen: []f64 = undefined;
                         const gen_owned = true;
                         if (getStr(req, "model")) |mpath| {
-                            var mlp = model_mod.loadModel(alloc, mpath) catch {
-                                resp = protocol.encodeErr(alloc, "model_not_found") catch return;
-                                defer alloc.free(resp);
-                                _ = posix.write(conn, resp) catch {};
-                                return;
-                            };
-                            defer mlp.deinit();
-                            const inp = vectors_mod.localEmbed(alloc, tv.string, mlp.input_dim) catch return;
-                            defer alloc.free(inp);
-                            gen = mlp.forward(alloc, inp) catch return;
+                            if (std.mem.endsWith(u8, mpath, ".onnx")) {
+                                var om = onnx_mod.loadOnnx(alloc, mpath) catch {
+                                    resp = protocol.encodeErr(alloc, "model_not_found") catch return;
+                                    defer alloc.free(resp);
+                                    _ = posix.write(conn, resp) catch {};
+                                    return;
+                                };
+                                defer om.deinit();
+                                const inp64 = vectors_mod.localEmbed(alloc, tv.string, 32) catch return;
+                                defer alloc.free(inp64);
+                                var inp32 = alloc.alloc(f32, inp64.len) catch return;
+                                defer alloc.free(inp32);
+                                for (inp64, 0..) |v, ii| inp32[ii] = @floatCast(v);
+                                const out32 = om.run(alloc, inp32) catch {
+                                    resp = protocol.encodeErr(alloc, "model_failed") catch return;
+                                    defer alloc.free(resp);
+                                    _ = posix.write(conn, resp) catch {};
+                                    return;
+                                };
+                                defer alloc.free(out32);
+                                gen = alloc.alloc(f64, out32.len) catch return;
+                                for (out32, 0..) |v, ii| gen[ii] = @floatCast(v);
+                            } else {
+                                var mlp = model_mod.loadModel(alloc, mpath) catch {
+                                    resp = protocol.encodeErr(alloc, "model_not_found") catch return;
+                                    defer alloc.free(resp);
+                                    _ = posix.write(conn, resp) catch {};
+                                    return;
+                                };
+                                defer mlp.deinit();
+                                const inp = vectors_mod.localEmbed(alloc, tv.string, mlp.input_dim) catch return;
+                                defer alloc.free(inp);
+                                gen = mlp.forward(alloc, inp) catch return;
+                            }
                         } else {
                             gen = vectors_mod.localEmbed(alloc, tv.string, 32) catch return;
                         }
