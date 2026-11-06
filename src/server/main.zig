@@ -1472,6 +1472,45 @@ fn handleClient(conn: posix.fd_t) void {
         const inner = std.fmt.allocPrint(alloc, "{{\"vector\":{s},\"onnx\":true}}", .{arr}) catch return;
         defer alloc.free(inner);
         resp = protocol.encodeOk(alloc, inner) catch return;
+    } else if (std.mem.eql(u8, req.method, "vectors.neural_real")) {
+        const text = getStr(req, "text") orelse {
+            resp = protocol.encodeErr(alloc, "bad_request") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        const model_path = getStr(req, "model") orelse {
+            resp = protocol.encodeErr(alloc, "bad_request") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        const vocab_path = getStr(req, "vocab") orelse {
+            resp = protocol.encodeErr(alloc, "bad_request") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        const script = getStr(req, "script") orelse "tools/minilm_embed.py";
+        const result = std.process.Child.run(.{
+            .allocator = alloc,
+            .argv = &.{ "python3", script, model_path, vocab_path, text },
+            .max_output_bytes = 10 << 20,
+        }) catch {
+            resp = protocol.encodeErr(alloc, "runtime_unavailable") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        defer alloc.free(result.stdout);
+        defer alloc.free(result.stderr);
+        if (result.term.Exited != 0) {
+            resp = protocol.encodeErr(alloc, "model_failed") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        }
+        resp = protocol.encodeOk(alloc, result.stdout) catch return;
     } else if (std.mem.startsWith(u8, req.method, "vectors.")) {
         const dot = std.mem.indexOfScalar(u8, req.method, '.') orelse {
             resp = protocol.encodeErr(alloc, "unknown_method") catch return;
