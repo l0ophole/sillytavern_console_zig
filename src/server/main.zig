@@ -987,9 +987,119 @@ fn handleClient(conn: posix.fd_t) void {
                 _ = posix.write(conn, resp) catch {};
                 return;
             }
-            const inner = std.fmt.allocPrint(alloc, "{{\"token\":\"{s}\",\"handle\":\"{s}\"}}", .{ stored.string, handle_s }) catch return;
+            // Create session (24h expiry)
+            const token = users_mod.generateSessionToken(alloc) catch return;
+            defer alloc.free(token);
+            const spath = std.fs.path.join(alloc, &.{ data_root, "sessions.json" }) catch return;
+            defer alloc.free(spath);
+            var smap = std.json.ObjectMap.init(alloc);
+            if (store.readFileAlloc(alloc, spath)) |existing| {
+                if (std.json.parseFromSlice(std.json.Value, alloc, existing, .{})) |parsed| {
+                    if (parsed.value == .object) smap = parsed.value.object;
+                } else |_| {}
+            } else |_| {}
+            const now_s: i64 = @intCast(@divFloor(std.time.milliTimestamp(), 1000));
+            var sess = std.json.ObjectMap.init(alloc);
+            sess.put("handle", .{ .string = handle_s }) catch return;
+            sess.put("expires", .{ .integer = now_s + 86400 }) catch return;
+            smap.put(token, .{ .object = sess }) catch return;
+            const sv: std.json.Value = .{ .object = smap };
+            const ss = store.stringifyValue(alloc, sv) catch return;
+            defer alloc.free(ss);
+            store.writeAtomic(spath, ss) catch {};
+            const inner = std.fmt.allocPrint(alloc, "{{\"token\":\"{s}\",\"handle\":\"{s}\",\"expires\":{d}}}", .{ token, handle_s, now_s + 86400 }) catch return;
             defer alloc.free(inner);
             resp = protocol.encodeOk(alloc, inner) catch return;
+        } else if (std.mem.eql(u8, action, "validate") or std.mem.eql(u8, action, "validate_session")) {
+            const token = getStr(req, "token") orelse {
+                resp = protocol.encodeErr(alloc, "bad_request") catch return;
+                defer alloc.free(resp);
+                _ = posix.write(conn, resp) catch {};
+                return;
+            };
+            const spath = std.fs.path.join(alloc, &.{ data_root, "sessions.json" }) catch return;
+            defer alloc.free(spath);
+            const content = store.readFileAlloc(alloc, spath) catch {
+                resp = protocol.encodeErr(alloc, "invalid_session") catch return;
+                defer alloc.free(resp);
+                _ = posix.write(conn, resp) catch {};
+                return;
+            };
+            const parsed = std.json.parseFromSlice(std.json.Value, alloc, content, .{}) catch {
+                resp = protocol.encodeErr(alloc, "invalid_session") catch return;
+                defer alloc.free(resp);
+                _ = posix.write(conn, resp) catch {};
+                return;
+            };
+            if (parsed.value != .object) {
+                resp = protocol.encodeErr(alloc, "invalid_session") catch return;
+                defer alloc.free(resp);
+                _ = posix.write(conn, resp) catch {};
+                return;
+            }
+            const sess = parsed.value.object.get(token) orelse {
+                resp = protocol.encodeErr(alloc, "invalid_session") catch return;
+                defer alloc.free(resp);
+                _ = posix.write(conn, resp) catch {};
+                return;
+            };
+            if (sess != .object) {
+                resp = protocol.encodeErr(alloc, "invalid_session") catch return;
+                defer alloc.free(resp);
+                _ = posix.write(conn, resp) catch {};
+                return;
+            }
+            const exp = sess.object.get("expires") orelse {
+                resp = protocol.encodeErr(alloc, "invalid_session") catch return;
+                defer alloc.free(resp);
+                _ = posix.write(conn, resp) catch {};
+                return;
+            };
+            const now_s: i64 = @intCast(@divFloor(std.time.milliTimestamp(), 1000));
+            if (exp == .integer and exp.integer < now_s) {
+                resp = protocol.encodeErr(alloc, "session_expired") catch return;
+                defer alloc.free(resp);
+                _ = posix.write(conn, resp) catch {};
+                return;
+            }
+            const handle_s = sess.object.get("handle") orelse {
+                resp = protocol.encodeErr(alloc, "invalid_session") catch return;
+                defer alloc.free(resp);
+                _ = posix.write(conn, resp) catch {};
+                return;
+            };
+            if (handle_s != .string) {
+                resp = protocol.encodeErr(alloc, "invalid_session") catch return;
+                defer alloc.free(resp);
+                _ = posix.write(conn, resp) catch {};
+                return;
+            }
+            const inner = std.fmt.allocPrint(alloc, "{{\"handle\":\"{s}\",\"valid\":true}}", .{handle_s.string}) catch return;
+            defer alloc.free(inner);
+            resp = protocol.encodeOk(alloc, inner) catch return;
+        } else if (std.mem.eql(u8, action, "logout")) {
+            const token = getStr(req, "token") orelse {
+                resp = protocol.encodeOk(alloc, "{\"deleted\":true}") catch return;
+                defer alloc.free(resp);
+                _ = posix.write(conn, resp) catch {};
+                return;
+            };
+            const spath = std.fs.path.join(alloc, &.{ data_root, "sessions.json" }) catch return;
+            defer alloc.free(spath);
+            if (store.readFileAlloc(alloc, spath)) |existing| {
+                if (std.json.parseFromSlice(std.json.Value, alloc, existing, .{})) |parsed| {
+                    if (parsed.value == .object) {
+                        var smap = parsed.value.object;
+                        _ = smap.orderedRemove(token);
+                        const sv: std.json.Value = .{ .object = smap };
+                        if (store.stringifyValue(alloc, sv)) |s| {
+                            defer alloc.free(s);
+                            store.writeAtomic(spath, s) catch {};
+                        } else |_| {}
+                    }
+                } else |_| {}
+            } else |_| {}
+            resp = protocol.encodeOk(alloc, "{\"deleted\":true}") catch return;
         } else {
             resp = protocol.encodeErr(alloc, "unknown_method") catch return;
         }

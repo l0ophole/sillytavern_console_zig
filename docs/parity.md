@@ -19,7 +19,7 @@ Status legend: DONE = implemented in Zig + tested (`zig build test` / `tests/run
 | tokenizers | `tokenizer.estimate` (chars/4 heuristic; tiktoken TODO) | DONE Task 7 (estimate) |
 | backends/chat-completions, openai, anthropic, google, azure, openrouter, novelai, horde, kobold, text-completions | `backend.chat` (OpenAI-compatible HTTP proxy; native SDKs TODO) | DONE Task 7 (HTTP proxy) |
 | image-metadata | `image-metadata.get/detect` | DONE |
-| users-admin/users-private/users-public | `users.*`/`users-admin.*`/`users-private.*`/`users-public.*` create/list/delete/login | DONE (Sha256, no session cookies) |
+| users-admin/users-private/users-public | `users.*` create/list/delete/login/validate/logout (Sha256 + session tokens, 24h) | DONE |
 | vectors | `vectors.save/list/query/delete` (cosine, client-supplied embeddings) | DONE |
 | search | `search.query` (local substring over characters/worldinfo/presets) | DONE (local; web search TODO) |
 | speech/caption/classify/translate/stable-diffusion/openai/anthropic/google/azure/openrouter/novelai/horde/minimax/volcengine/nanogpt/backends | `*.proxy` generic HTTP forward (host/port/path/body) | DONE (HTTP proxy; HTTPS/native SDKs TODO) |
