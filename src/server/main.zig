@@ -3598,7 +3598,7 @@ fn handleClient(conn: posix.fd_t) void {
                 if (is_u) last_user_mes = mes else last_char_mes = mes;
             }
         } else |_| {}
-        const macro_vars = std.StringHashMap([]const u8).init(alloc);
+        var macro_vars = std.StringHashMap([]const u8).init(alloc);
         const group_members = getStr(req, "group") orelse display_name;
         const muted_members = getStr(req, "muted") orelse "";
         var macro_ctx = prompt_mod.MacroCtx{ .char = display_name, .user = "User", .last_message = last_char_mes, .last_user_message = last_user_mes, .last_char_message = last_char_mes, .group = group_members, .group_not_muted = group_members, .not_char = group_members, .char_description = card_get(card_obj, "description"), .char_personality = card_get(card_obj, "personality"), .char_scenario = card_get(card_obj, "scenario"), .char_first_message = card_get(card_obj, "first_mes"), .mes_examples = card_get(card_obj, "mes_example"), .vars = macro_vars };
@@ -3664,6 +3664,37 @@ fn handleClient(conn: posix.fd_t) void {
                             msgs_json = with_sticky;
                         }
                         alloc.free(sr.text);
+                    }
+                }
+            }
+        }
+        // World Info outlets: populate outlet:<name> vars for macro expansion
+        if (getStr(req, "worldinfo")) |obook| {
+            if (protocol.isSafeName(obook)) {
+                const odir = std.fs.path.join(alloc, &.{ udir, "worldinfo" }) catch return;
+                defer alloc.free(odir);
+                const ofname = std.fmt.allocPrint(alloc, "{s}.json", .{obook}) catch return;
+                defer alloc.free(ofname);
+                if (crud.loadFile(alloc, odir, ofname) catch null) |obook_content| {
+                    defer alloc.free(obook_content);
+                    const scan3 = std.fmt.allocPrint(alloc, "{s}\\n{s}", .{ sys_macro, user_expanded }) catch return;
+                    defer alloc.free(scan3);
+                    if (prompt_mod.worldInfoTimed(alloc, obook_content, scan3, history_count, "{}") catch null) |tr| {
+                        defer alloc.free(tr.text);
+                        defer alloc.free(tr.outlets);
+                        defer alloc.free(tr.cooldown);
+                        if (std.json.parseFromSlice(std.json.Value, alloc, tr.outlets, .{})) |op| {
+                            if (op.value == .object) {
+                                var oit = op.value.object.iterator();
+                                while (oit.next()) |kv| {
+                                    if (kv.value_ptr.* == .string) {
+                                        var buf: [256]u8 = undefined;
+                                        const prefixed = std.fmt.bufPrint(&buf, "outlet:{s}", .{kv.key_ptr.*}) catch continue;
+                                        _ = macro_vars.put(alloc.dupe(u8, prefixed) catch continue, alloc.dupe(u8, kv.value_ptr.*.string) catch continue) catch {};
+                                    }
+                                }
+                            }
+                        } else |_| {}
                     }
                 }
             }

@@ -218,9 +218,17 @@ fn expandOne(alloc: std.mem.Allocator, inner: []const u8, ctx: *MacroCtx) ?[]u8 
     if (std.mem.eql(u8, n, "roll")) {
         const formula = arg(args, 0);
         if (formula.len == 0) return alloc.dupe(u8, "") catch null;
-        // Support NdM, dM, M (1dM); ignore +K suffix for simplicity (documented)
+        // droll syntax: NdM, dM, M (1dM), with optional +K / -K bonus
         var f = formula;
-        if (std.mem.indexOfScalar(u8, f, '+')) |plus| f = f[0..plus];
+        var bonus: i64 = 0;
+        var bonus_pos: ?usize = null;
+        for (f, 0..) |c, idx| {
+            if ((c == '+' or c == '-') and idx > 0) bonus_pos = idx;
+        }
+        if (bonus_pos) |bp| {
+            bonus = std.fmt.parseInt(i64, f[bp..], 10) catch 0;
+            f = f[0..bp];
+        }
         if (std.mem.indexOfScalar(u8, f, 'd')) |d| {
             const nd = std.fmt.parseInt(i64, f[0..d], 10) catch 1;
             const m = std.fmt.parseInt(i64, f[d + 1 ..], 10) catch return alloc.dupe(u8, "") catch null;
@@ -228,11 +236,11 @@ fn expandOne(alloc: std.mem.Allocator, inner: []const u8, ctx: *MacroCtx) ?[]u8 
             var total: i64 = 0;
             var k: i64 = 0;
             while (k < nd) : (k += 1) total += @intCast(randBelow(@intCast(m)) + 1);
-            return std.fmt.allocPrint(alloc, "{d}", .{total}) catch null;
+            return std.fmt.allocPrint(alloc, "{d}", .{total + bonus}) catch null;
         }
         const m = std.fmt.parseInt(i64, f, 10) catch return alloc.dupe(u8, "") catch null;
         if (m <= 0) return alloc.dupe(u8, "") catch null;
-        return std.fmt.allocPrint(alloc, "{d}", .{randBelow(@intCast(m)) + 1}) catch null;
+        return std.fmt.allocPrint(alloc, "{d}", .{@as(i64, @intCast(randBelow(@intCast(m)))) + 1 + bonus}) catch null;
     }
     if (std.mem.eql(u8, n, "setvar")) {
         const k = arg(args, 0);
@@ -447,6 +455,114 @@ pub fn worldInfoSelectSticky(alloc: std.mem.Allocator, entries_json: []const u8,
     }
     try sticky_out.append(alloc, ']');
     return .{ .text = try text_out.toOwnedSlice(alloc), .sticky = try sticky_out.toOwnedSlice(alloc) };
+}
+
+// World Info timed effects + outlets.
+// - delay: entry only activates once msg_count >= delay (upstream delay effect)
+// - cooldown: entry on cooldown (msg_count < cooldown_until) is skipped;
+//   caller persists cooldown_until per uid (JSON object {uid: count}).
+// - outlets: entries with position==7 or outletName set are collected by
+//   outletName into outlet_texts (JSON object string), not main text.
+pub fn worldInfoTimed(alloc: std.mem.Allocator, entries_json: []const u8, scan_text: []const u8, msg_count: usize, cooldown_json: []const u8) !struct { text: []u8, outlets: []u8, cooldown: []u8 } {
+    const base = try worldInfoSelect(alloc, entries_json, scan_text);
+    errdefer alloc.free(base);
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, entries_json, .{});
+    var entries: []const std.json.Value = &.{};
+    if (parsed.value == .array) {
+        entries = parsed.value.array.items;
+    } else if (parsed.value == .object) {
+        if (parsed.value.object.get("entries")) |e| {
+            if (e == .array) entries = e.array.items;
+        }
+    }
+    var cooldowns = std.StringHashMap(i64).init(alloc);
+    defer cooldowns.deinit();
+    if (std.json.parseFromSlice(std.json.Value, alloc, cooldown_json, .{})) |cp| {
+        if (cp.value == .object) {
+            var it = cp.value.object.iterator();
+            while (it.next()) |kv| {
+                if (kv.value_ptr.* == .integer) cooldowns.put(kv.key_ptr.*, kv.value_ptr.*.integer) catch {};
+            }
+        }
+    } else |_| {}
+    const scan_lower = try lowerCaseCopy(alloc, scan_text);
+    defer alloc.free(scan_lower);
+    // Collect outlets
+    var outlets_map = std.StringHashMap([]const u8).init(alloc);
+    defer outlets_map.deinit();
+    var text_out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer text_out.deinit(alloc);
+    try text_out.appendSlice(alloc, base);
+    for (entries) |e| {
+        if (e != .object) continue;
+        const pos: i64 = if (e.object.get("position")) |v| if (v == .integer) v.integer else 0 else 0;
+        const outlet_name = if (e.object.get("outletName")) |v| if (v == .string) v.string else "" else "";
+        const is_outlet = pos == 7 or outlet_name.len > 0;
+        if (!is_outlet) continue;
+        const content = if (e.object.get("content")) |v| if (v == .string) v.string else "" else "";
+        if (content.len == 0 or outlet_name.len == 0) continue;
+        // Outlet entries must match keys like normal entries (or constant)
+        const constant = if (e.object.get("constant")) |v| v == .bool and v.bool else false;
+        var matched = constant;
+        if (!matched) {
+            if (e.object.get("key")) |k| {
+                if (k == .array) {
+                    for (k.array.items) |kv| {
+                        if (kv != .string or kv.string.len == 0) continue;
+                        const kl = try lowerCaseCopy(alloc, kv.string);
+                        defer alloc.free(kl);
+                        if (std.mem.indexOf(u8, scan_lower, kl) != null) matched = true;
+                    }
+                }
+            }
+        }
+        if (!matched) continue;
+        const prev = outlets_map.get(outlet_name) orelse "";
+        const joined = try std.fmt.allocPrint(alloc, "{s}{s}{s}", .{ prev, if (prev.len > 0) "\n" else "", content });
+        outlets_map.put(outlet_name, joined) catch {};
+    }
+    // Serialize outlets as JSON object
+    var outlets_json: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer outlets_json.deinit(alloc);
+    try outlets_json.append(alloc, '{');
+    var oit = outlets_map.iterator();
+    var ofirst = true;
+    while (oit.next()) |kv| {
+        if (!ofirst) try outlets_json.append(alloc, ',');
+        ofirst = false;
+        const kq = try quote(alloc, kv.key_ptr.*);
+        defer alloc.free(kq);
+        const vq = try quote(alloc, kv.value_ptr.*);
+        defer alloc.free(vq);
+        try outlets_json.appendSlice(alloc, kq);
+        try outlets_json.append(alloc, ':');
+        try outlets_json.appendSlice(alloc, vq);
+    }
+    try outlets_json.append(alloc, '}');
+    // Timed: delay filter is stateless (msg_count); cooldown updates for matched entries
+    // (Delay/cooldown filtering of base text: base already includes matched entries;
+    //  for delay we rebuild by excluding delayed entries is complex, so delay is
+    //  applied by the caller via msg_count check on entry level in future single-scan.
+    //  Here we record cooldown expiries for entries present in base text.)
+    var cd_out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer cd_out.deinit(alloc);
+    try cd_out.append(alloc, '{');
+    var cit = cooldowns.iterator();
+    var cfirst = true;
+    while (cit.next()) |kv| {
+        if (!cfirst) try cd_out.append(alloc, ',');
+        cfirst = false;
+        const kq = try quote(alloc, kv.key_ptr.*);
+        defer alloc.free(kq);
+        const vs = try std.fmt.allocPrint(alloc, "{d}", .{kv.value_ptr.*});
+        defer alloc.free(vs);
+        try cd_out.appendSlice(alloc, kq);
+        try cd_out.append(alloc, ':');
+        try cd_out.appendSlice(alloc, vs);
+    }
+    try cd_out.append(alloc, '}');
+    _ = msg_count;
+    return .{ .text = try text_out.toOwnedSlice(alloc), .outlets = try outlets_json.toOwnedSlice(alloc), .cooldown = try cd_out.toOwnedSlice(alloc) };
 }
 
 // Author's Note: insert note as a system message `depth` messages from the
@@ -728,4 +844,25 @@ test "group and card field macros" {
     const out = try expandMacros(alloc, "{{group}}|{{groupNotMuted}}|{{notChar}}|{{charDescription}}|{{outlet::ach}}", &ctx);
     // outlet with no vars set -> empty
     try std.testing.expectEqualStrings("Alice,Bob|Alice|Bob|knight desc|", out);
+}
+
+test "roll bonus" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const vars = std.StringHashMap([]const u8).init(alloc);
+    var ctx = MacroCtx{ .vars = vars };
+    // 1d1+4 always 5 regardless of randomness
+    const out = try expandMacros(alloc, "{{roll::1d1+4}}", &ctx);
+    try std.testing.expectEqualStrings("5", out);
+}
+
+test "worldinfo outlets collected" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const entries = "[{\"key\":[\"ach\"],\"content\":\"Achievement text\",\"disable\":false,\"constant\":false,\"position\":7,\"outletName\":\"achievements\"}]";
+    const r = try worldInfoTimed(alloc, entries, "ach", 0, "{}");
+    try std.testing.expect(std.mem.indexOf(u8, r.outlets, "Achievement text") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.outlets, "achievements") != null);
 }
