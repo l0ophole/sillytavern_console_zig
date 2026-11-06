@@ -155,7 +155,9 @@ pub fn buildNativeBody(alloc: std.mem.Allocator, provider_name: []const u8, mode
     defer tmp2.deinit();
     var s2: std.json.Stringify = .{ .writer = &tmp2.writer };
     try s2.write(mq2.value);
-    return std.fmt.allocPrint(alloc, "{{\"model\":\"{s}\",\"messages\":{s}}}", .{ model, tmp2.written() });
+    const mt2 = try std.fmt.allocPrint(alloc, "{d}", .{max_tokens});
+    defer alloc.free(mt2);
+    return std.fmt.allocPrint(alloc, "{{\"model\":\"{s}\",\"messages\":{s},\"max_tokens\":{s}}}", .{ model, tmp2.written(), mt2 });
 }
 
 /// Extract text from provider-specific response body.
@@ -319,4 +321,35 @@ test "buildUrl" {
     const url2 = try buildUrl(alloc, p, "https://custom.example/", null);
     defer alloc.free(url2);
     try std.testing.expectEqualStrings("https://custom.example/v1/chat/completions", url2);
+}
+
+test "per-provider byte shape comparison" {
+    // Parse each provider's native body and verify the exact top-level
+    // keys upstream expects (byte-level shape, not just substring presence).
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const msgs = "[{\"role\":\"user\",\"content\":\"hi\"}]";
+    const cases = [_]struct { name: []const u8, keys: []const []const u8 }{
+        .{ .name = "openai", .keys = &.{ "model", "messages", "max_tokens" } },
+        .{ .name = "azure", .keys = &.{ "model", "messages", "max_tokens" } },
+        .{ .name = "openrouter", .keys = &.{ "model", "messages", "max_tokens" } },
+        .{ .name = "minimax", .keys = &.{ "model", "messages", "max_tokens" } },
+        .{ .name = "volcengine", .keys = &.{ "model", "messages", "max_tokens" } },
+        .{ .name = "nanogpt", .keys = &.{ "model", "messages", "max_tokens" } },
+        .{ .name = "anthropic", .keys = &.{ "model", "max_tokens", "messages" } },
+        .{ .name = "google", .keys = &.{ "contents" } },
+        .{ .name = "novelai", .keys = &.{ "prompt", "model", "parameters" } },
+        .{ .name = "horde", .keys = &.{ "prompt", "params" } },
+        .{ .name = "kobold", .keys = &.{ "prompt", "max_length" } },
+    };
+    for (cases) |c| {
+        const body = try buildNativeBody(alloc, c.name, "m", msgs, 7);
+        defer alloc.free(body);
+        const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+        try std.testing.expect(parsed.value == .object);
+        for (c.keys) |k| {
+            try std.testing.expect(parsed.value.object.get(k) != null);
+        }
+    }
 }

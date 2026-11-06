@@ -28,6 +28,7 @@ pub const MacroCtx = struct {
     char_scenario: []const u8 = "",
     char_first_message: []const u8 = "",
     mes_examples: []const u8 = "",
+    chat_id: []const u8 = "",
     max_prompt: u32 = 0,
     max_context: u32 = 0,
     max_response: u32 = 0,
@@ -984,4 +985,16 @@ test "worldinfo delay and cooldown in main scan" {
     const r6 = try worldInfoSelectTimed(alloc, entries, "a b c", 6, r0.cooldown);
     try std.testing.expect(std.mem.indexOf(u8, r6.text, "Delayed") != null);
     try std.testing.expect(std.mem.indexOf(u8, r6.text, "Cool") != null);
+}
+
+test "pick determinism stable across calls" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const vars = std.StringHashMap([]const u8).init(alloc);
+    var ctx = MacroCtx{ .chat_id = "chat-1", .vars = vars };
+    const a = try expandMacros(alloc, "{{pick::blonde::brown::red}}", &ctx);
+    const b = try expandMacros(alloc, "{{pick::blonde::brown::red}}", &ctx);
+    try std.testing.expectEqualStrings(a, b);
+    try std.testing.expect(a.len > 0);
 }

@@ -3601,7 +3601,7 @@ fn handleClient(conn: posix.fd_t) void {
         var macro_vars = std.StringHashMap([]const u8).init(alloc);
         const group_members = getStr(req, "group") orelse display_name;
         const muted_members = getStr(req, "muted") orelse "";
-        var macro_ctx = prompt_mod.MacroCtx{ .char = display_name, .user = "User", .last_message = last_char_mes, .last_user_message = last_user_mes, .last_char_message = last_char_mes, .group = group_members, .group_not_muted = group_members, .not_char = group_members, .char_description = card_get(card_obj, "description"), .char_personality = card_get(card_obj, "personality"), .char_scenario = card_get(card_obj, "scenario"), .char_first_message = card_get(card_obj, "first_mes"), .mes_examples = card_get(card_obj, "mes_example"), .vars = macro_vars };
+        var macro_ctx = prompt_mod.MacroCtx{ .char = display_name, .user = "User", .last_message = last_char_mes, .last_user_message = last_user_mes, .last_char_message = last_char_mes, .group = group_members, .group_not_muted = group_members, .not_char = group_members, .char_description = card_get(card_obj, "description"), .char_personality = card_get(card_obj, "personality"), .char_scenario = card_get(card_obj, "scenario"), .char_first_message = card_get(card_obj, "first_mes"), .mes_examples = card_get(card_obj, "mes_example"), .chat_id = chat_name, .vars = macro_vars };
         _ = muted_members;
         const user_expanded = prompt_mod.expandMacros(alloc, user_msg2, &macro_ctx) catch return;
         defer alloc.free(user_expanded);
