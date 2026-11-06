@@ -404,6 +404,32 @@ sleep 1
 kill $(cat /rpf/tmp/opencode/sse2.pid) 2>/dev/null || true
 echo "== frontend HTTP flow verify =="
 ./zig-out/bin/st-client --port $PORT frontend.http_verify | grep -q '"ok":3' && echo PASS
+echo "== streaming retry =="
+cat > /rpf/tmp/opencode/mock_retry.py <<'PYEOF'
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import threading
+count=[0]
+class H(BaseHTTPRequestHandler):
+    def do_POST(self):
+        ln=int(self.headers.get('Content-Length',0)); self.rfile.read(ln)
+        count[0]+=1
+        if count[0]<3:
+            data=b'{"error":"busy"}'
+            self.send_response(429)
+        else:
+            data=b'data: {"choices":[{"delta":{"content":"Recovered"}}]}\n\ndata: [DONE]\n\n'
+            self.send_response(200)
+        self.send_header('Content-Type','text/event-stream'); self.send_header('Content-Length',str(len(data))); self.end_headers(); self.wfile.write(data)
+    def log_message(self,*a): pass
+srv=HTTPServer(('127.0.0.1',18160),H)
+threads=[threading.Thread(target=srv.handle_request,daemon=True) for _ in range(3)]
+[t.start() for t in threads]
+import time; time.sleep(20)
+PYEOF
+timeout 25 python3 /rpf/tmp/opencode/mock_retry.py > /rpf/tmp/opencode/retry.log 2>&1 & echo $! > /rpf/tmp/opencode/retry.pid
+sleep 1
+timeout 30 ./zig-out/bin/st-client --port $PORT backend.stream '{"provider":"openai","model":"gpt-4","api_key":"k","base_url":"http://127.0.0.1:18160","path":"/v1/chat/completions","messages":[{"role":"user","content":"hi"}]}' | grep -q 'Recovered' && echo PASS
+kill $(cat /rpf/tmp/opencode/retry.pid) 2>/dev/null || true
 echo "== bad method =="
 ./zig-out/bin/st-client --port $PORT nope | grep -q '"ok":false' && echo PASS
 cat "$TMP/server.log"

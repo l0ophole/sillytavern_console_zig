@@ -2872,13 +2872,41 @@ fn handleClient(conn: posix.fd_t) void {
             nheaders = 2;
         }
         defer if (auth_val) |av| alloc.free(av);
-        const fetched = backend.fetchUrlHeaders(alloc, url, "POST", with_stream, headers_buf[0..nheaders]) catch {
+        // SDK retry with backoff on 429/5xx (max 3 attempts)
+        var fetched: backend.FetchResult = undefined;
+        var attempt: usize = 0;
+        var got = false;
+        while (attempt < 3) : (attempt += 1) {
+            const fr = backend.fetchUrlHeaders(alloc, url, "POST", with_stream, headers_buf[0..nheaders]) catch {
+                resp = protocol.encodeErr(alloc, "backend_unreachable") catch return;
+                defer alloc.free(resp);
+                _ = posix.write(conn, resp) catch {};
+                return;
+            };
+            if ((fr.status == 429 or fr.status >= 500) and attempt < 2) {
+                alloc.free(fr.body);
+                std.Thread.sleep(100_000_000 * @as(u64, @intCast(attempt + 1)));
+                continue;
+            }
+            fetched = fr;
+            got = true;
+            break;
+        }
+        if (!got) {
             resp = protocol.encodeErr(alloc, "backend_unreachable") catch return;
             defer alloc.free(resp);
             _ = posix.write(conn, resp) catch {};
             return;
-        };
+        }
         defer alloc.free(fetched.body);
+        if (fetched.status < 200 or fetched.status >= 300) {
+            const inner = std.fmt.allocPrint(alloc, "{{\"provider\":\"{s}\",\"status\":{d},\"error\":\"provider_error\",\"retries\":{d}}}", .{ prov.name, fetched.status, attempt }) catch return;
+            defer alloc.free(inner);
+            resp = protocol.encodeOk(alloc, inner) catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        }
         // Parse SSE: split on \n\n, each data: {...} or [DONE]
         var full: std.ArrayListUnmanaged(u8) = .empty;
         defer full.deinit(alloc);
