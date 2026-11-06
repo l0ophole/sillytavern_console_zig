@@ -378,6 +378,8 @@ python3 /rpf/tmp/opencode/mock_sse.py > /rpf/tmp/opencode/sse.log 2>&1 & echo $!
 sleep 1
 ./zig-out/bin/st-client --port $PORT backend.stream '{"provider":"openai","model":"gpt-4","api_key":"k","base_url":"http://127.0.0.1:18151","path":"/v1/chat/completions","messages":[{"role":"user","content":"hi"}]}' | grep -q 'Hello stream' && echo PASS
 kill $(cat /rpf/tmp/opencode/sse.pid) 2>/dev/null || true
+echo "== browser smoke =="
+./zig-out/bin/st-client --port $PORT frontend.browser_smoke '{"script":"authors-note.js"}' | grep -q '"syntax_ok":true' && echo PASS
 echo "== bad method =="
 ./zig-out/bin/st-client --port $PORT nope | grep -q '"ok":false' && echo PASS
 cat "$TMP/server.log"

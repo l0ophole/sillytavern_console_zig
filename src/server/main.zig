@@ -2895,6 +2895,37 @@ fn handleClient(conn: posix.fd_t) void {
         const inner = std.fmt.allocPrint(alloc, "{{\"provider\":\"{s}\",\"status\":{d},\"text\":{s},\"chunks\":{d},\"streamed\":true}}", .{ prov.name, fetched.status, tq, chunks }) catch return;
         defer alloc.free(inner);
         resp = protocol.encodeOk(alloc, inner) catch return;
+    } else if (std.mem.eql(u8, req.method, "frontend.browser_smoke")) {
+        // Syntax-verify a real SillyTavern frontend script with node --check
+        const script = getStr(req, "script") orelse "authors-note.js";
+        if (!protocol.isSafeName(script)) {
+            resp = protocol.encodeErr(alloc, "bad_name") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        }
+        const web_root = getStr(req, "web_root") orelse "../SillyTavern/public";
+        const fpath = std.fs.path.join(alloc, &.{ web_root, "scripts", script }) catch return;
+        defer alloc.free(fpath);
+        const result = std.process.Child.run(.{
+            .allocator = alloc,
+            .argv = &.{ "node", "--check", fpath },
+            .max_output_bytes = 1 << 20,
+        }) catch {
+            resp = protocol.encodeErr(alloc, "runtime_unavailable") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        defer alloc.free(result.stdout);
+        defer alloc.free(result.stderr);
+        const oq = protocol.jsonQuote(alloc, result.stdout) catch return;
+        defer alloc.free(oq);
+        const eq = protocol.jsonQuote(alloc, result.stderr) catch return;
+        defer alloc.free(eq);
+        const inner = std.fmt.allocPrint(alloc, "{{\"script\":\"{s}\",\"syntax_ok\":{s},\"exit_code\":{d},\"stderr\":{s}}}", .{ script, if (result.term.Exited == 0) "true" else "false", result.term.Exited, eq }) catch return;
+        defer alloc.free(inner);
+        resp = protocol.encodeOk(alloc, inner) catch return;
     } else if (std.mem.eql(u8, req.method, "ping")) {
         resp = protocol.encodeOk(alloc, "{\"pong\":true,\"version\":\"" ++ protocol.VERSION ++ "\"}") catch return;
     } else if (std.mem.eql(u8, req.method, "version")) {
