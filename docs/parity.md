@@ -23,7 +23,7 @@ Status legend: DONE = implemented in Zig + tested (`zig build test` / `tests/run
 | vectors | `vectors.save/list/query/delete/generate/embed` (local hash embed + API proxy, cosine) | DONE |
 | search | `search.query` (local) + `search.web` (DuckDuckGo/custom URL, HTTP+HTTPS) | DONE |
 | speech/caption/classify/translate/stable-diffusion/openai/anthropic/google/azure/openrouter/novelai/horde/minimax/volcengine/nanogpt/backends | `*.proxy` + `backend.fetch` (HTTP+HTTPS) | DONE |
-| extensions | `extensions.save/list/get/delete` | DONE (text store; JS execution TODO) |
+| extensions | `extensions.save/list/get/delete/execute` (node subprocess) | DONE |
 | content-manager | `content-manager.import/list/import_url` (HTTP+HTTPS fetch) | DONE |
 | byaf/charx | `byaf.import`/`charx.import`/`characters.import_zip` (ZIP card.json, stored+deflate) | DONE |
 

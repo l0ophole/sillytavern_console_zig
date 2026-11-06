@@ -1439,6 +1439,54 @@ fn handleClient(conn: posix.fd_t) void {
         const inner = std.fmt.allocPrint(alloc, "{{\"status\":{d},\"body\":{s}}}", .{ split.status, q }) catch return;
         defer alloc.free(inner);
         resp = protocol.encodeOk(alloc, inner) catch return;
+    } else if (std.mem.eql(u8, req.method, "extensions.execute")) {
+        // Execute JS via node subprocess (if available). Params: {code} or {name}
+        var code: []const u8 = getStr(req, "code") orelse "";
+        var code_owned: ?[]u8 = null;
+        if (code.len == 0) {
+            if (getStr(req, "name")) |nm| {
+                if (!protocol.isSafeName(nm)) {
+                    resp = protocol.encodeErr(alloc, "bad_name") catch return;
+                    defer alloc.free(resp);
+                    _ = posix.write(conn, resp) catch {};
+                    return;
+                }
+                const edir = std.fs.path.join(alloc, &.{ udir, "extensions" }) catch return;
+                defer alloc.free(edir);
+                code_owned = crud.loadFile(alloc, edir, nm) catch {
+                    resp = protocol.encodeErr(alloc, "not_found") catch return;
+                    defer alloc.free(resp);
+                    _ = posix.write(conn, resp) catch {};
+                    return;
+                };
+                code = code_owned.?;
+            }
+        }
+        if (code.len == 0) {
+            resp = protocol.encodeErr(alloc, "bad_request") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        }
+        const result = std.process.Child.run(.{
+            .allocator = alloc,
+            .argv = &.{ "node", "-e", code },
+            .max_output_bytes = 1 << 20,
+        }) catch {
+            resp = protocol.encodeErr(alloc, "extension_runtime_unavailable") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        defer alloc.free(result.stdout);
+        defer alloc.free(result.stderr);
+        const oq = protocol.jsonQuote(alloc, result.stdout) catch return;
+        defer alloc.free(oq);
+        const eq = protocol.jsonQuote(alloc, result.stderr) catch return;
+        defer alloc.free(eq);
+        const inner = std.fmt.allocPrint(alloc, "{{\"stdout\":{s},\"stderr\":{s},\"exit_code\":{d}}}", .{ oq, eq, result.term.Exited }) catch return;
+        defer alloc.free(inner);
+        resp = protocol.encodeOk(alloc, inner) catch return;
     } else if (std.mem.startsWith(u8, req.method, "extensions.") or std.mem.startsWith(u8, req.method, "content-manager.")) {
         const dot = std.mem.indexOfScalar(u8, req.method, '.') orelse {
             resp = protocol.encodeErr(alloc, "unknown_method") catch return;
