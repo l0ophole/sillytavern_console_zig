@@ -3077,6 +3077,38 @@ fn handleClient(conn: posix.fd_t) void {
         const s = out.toOwnedSlice(alloc) catch return;
         defer alloc.free(s);
         resp = protocol.encodeOk(alloc, s) catch return;
+    } else if (std.mem.eql(u8, req.method, "frontend.browser_smoke_all")) {
+        // Syntax-check every SillyTavern frontend script (76 files) with node --check
+        const web_root = getStr(req, "web_root") orelse "../SillyTavern/public";
+        const sdir_path = std.fs.path.join(alloc, &.{ web_root, "scripts" }) catch return;
+        defer alloc.free(sdir_path);
+        var total: usize = 0;
+        var ok_count: usize = 0;
+        var sdir = std.fs.cwd().openDir(sdir_path, .{ .iterate = true }) catch {
+            resp = protocol.encodeErr(alloc, "not_found") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        defer sdir.close();
+        var it = sdir.iterate();
+        while (it.next() catch null) |e| {
+            if (e.kind != .file or !std.mem.endsWith(u8, e.name, ".js")) continue;
+            total += 1;
+            const fpath = std.fs.path.join(alloc, &.{ sdir_path, e.name }) catch continue;
+            defer alloc.free(fpath);
+            const result = std.process.Child.run(.{
+                .allocator = alloc,
+                .argv = &.{ "node", "--check", fpath },
+                .max_output_bytes = 1 << 20,
+            }) catch continue;
+            defer alloc.free(result.stdout);
+            defer alloc.free(result.stderr);
+            if (result.term.Exited == 0) ok_count += 1;
+        }
+        const inner = std.fmt.allocPrint(alloc, "{{\"total\":{d},\"ok\":{d},\"all_ok\":{s}}}", .{ total, ok_count, if (ok_count == total and total > 0) "true" else "false" }) catch return;
+        defer alloc.free(inner);
+        resp = protocol.encodeOk(alloc, inner) catch return;
     } else if (std.mem.eql(u8, req.method, "ping")) {
         resp = protocol.encodeOk(alloc, "{\"pong\":true,\"version\":\"" ++ protocol.VERSION ++ "\"}") catch return;
     } else if (std.mem.eql(u8, req.method, "version")) {

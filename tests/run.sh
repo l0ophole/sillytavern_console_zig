@@ -442,6 +442,8 @@ timeout 25 python3 /rpf/tmp/opencode/mock_retry.py > /rpf/tmp/opencode/retry.log
 sleep 1
 timeout 30 ./zig-out/bin/st-client --port $PORT backend.stream '{"provider":"openai","model":"gpt-4","api_key":"k","base_url":"http://127.0.0.1:18160","path":"/v1/chat/completions","messages":[{"role":"user","content":"hi"}]}' | grep -q 'Recovered' && echo PASS
 kill $(cat /rpf/tmp/opencode/retry.pid) 2>/dev/null || true
+echo "== browser smoke all =="
+timeout 120 ./zig-out/bin/st-client --port $PORT frontend.browser_smoke_all | grep -q '"all_ok":true' && echo PASS
 echo "== bad method =="
 ./zig-out/bin/st-client --port $PORT nope | grep -q '"ok":false' && echo PASS
 cat "$TMP/server.log"
