@@ -295,7 +295,7 @@ def pf32(f,vals): return fl(f,b''.join(struct.pack('<f',v) for v in vals))
 def tensor(n,dims,data): return pi64(1,dims)+fv(2,1)+pf32(4,data)+fs(8,n)
 def node():
     n=fs(1,"X")+fs(1,"W")+fs(1,"B")+fs(2,"Y")+fs(4,"Gemm")
-    attr=fs(1,"transB")+fv(7,2)+fv(3,1)
+    attr=fs(1,"transB")+fv(20,2)+fv(3,1)
     return n+fl(5,attr)
 def vi(n,dims):
     shape=b''
@@ -305,9 +305,21 @@ def vi(n,dims):
 W=[0.0]*64
 for i in range(2): W[i*32+i]=1.0
 graph=fl(1,node())+fs(2,"g")+fl(5,tensor("W",[2,32],W))+fl(5,tensor("B",[2],[0.0,0.0]))+fl(11,vi("X",[1,32]))+fl(12,vi("Y",[1,2]))
-open('/rpf/tmp/opencode/test.onnx','wb').write(fv(1,8)+fl(8,fv(1,13))+fl(7,graph))
+opset=fs(1,"")+fv(2,13)
+open('/rpf/tmp/opencode/test.onnx','wb').write(fv(1,8)+fl(8,opset)+fl(7,graph))
 PYEOF
 ./zig-out/bin/st-client --port $PORT vectors.onnx '{"text":"hello","model":"/rpf/tmp/opencode/test.onnx"}' | grep -q '"onnx":true' && echo PASS
+python3 - <<'PYEOF'
+try:
+    import onnxruntime as ort, numpy as np
+    s=ort.InferenceSession('/rpf/tmp/opencode/test.onnx', providers=['CPUExecutionProvider'])
+    x=np.arange(32,dtype=np.float32).reshape(1,32)
+    y=s.run(None,{s.get_inputs()[0].name:x})[0]
+    assert abs(y[0,1]-1.0)<1e-5, y
+    print("ORT_EQUIV_PASS")
+except ImportError:
+    print("SKIP_NO_ORT")
+PYEOF
 echo "== browser frontend verify =="
 ./zig-out/bin/st-client --port $PORT frontend.browser_verify | grep -q '"browser_equivalent":true' && echo PASS
 echo "== chat end-to-end =="
