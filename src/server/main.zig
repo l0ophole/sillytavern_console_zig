@@ -1448,6 +1448,74 @@ fn handleClient(conn: posix.fd_t) void {
         const s = out.toOwnedSlice(alloc) catch return;
         defer alloc.free(s);
         resp = protocol.encodeOk(alloc, s) catch return;
+    } else if (std.mem.eql(u8, req.method, "stable-diffusion.generate_and_save")) {
+        const name = getStr(req, "name") orelse {
+            resp = protocol.encodeErr(alloc, "bad_request") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        if (!protocol.isSafeName(name)) {
+            resp = protocol.encodeErr(alloc, "bad_name") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        }
+        const bhost = getStr(req, "host") orelse "127.0.0.1";
+        const bpath = getStr(req, "path") orelse "/sdapi/v1/txt2img";
+        var bport: u16 = 7860;
+        if (getObjValue(req, "port")) |pv| {
+            if (pv == .integer) bport = @intCast(pv.integer);
+        }
+        var body_str: []u8 = undefined;
+        if (getObjValue(req, "body")) |bv| {
+            body_str = store.stringifyValue(alloc, bv) catch return;
+        } else {
+            body_str = alloc.dupe(u8, "{}") catch return;
+        }
+        defer alloc.free(body_str);
+        const raw = backend.forwardHttp(alloc, bhost, bport, bpath, body_str) catch {
+            resp = protocol.encodeErr(alloc, "backend_unreachable") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        defer alloc.free(raw);
+        const split = backend.splitHttpResponse(raw);
+        // Expect {"images":["<base64>",...]} — save first image
+        var saved_name: []const u8 = name;
+        if (std.json.parseFromSlice(std.json.Value, alloc, split.body, .{})) |parsed| {
+            if (parsed.value == .object) {
+                if (parsed.value.object.get("images")) |imgs| {
+                    if (imgs == .array and imgs.array.items.len > 0) {
+                        if (imgs.array.items[0] == .string) {
+                            const b64 = imgs.array.items[0].string;
+                            const dec = std.base64.standard.Decoder;
+                            if (dec.calcSizeForSlice(b64)) |sz| {
+                                const img_bytes = alloc.alloc(u8, sz) catch return;
+                                defer alloc.free(img_bytes);
+                                if (dec.decode(img_bytes, b64)) |_| {
+                                    const idir = std.fs.path.join(alloc, &.{ udir, "images" }) catch return;
+                                    defer alloc.free(idir);
+                                    std.fs.cwd().makePath(idir) catch {};
+                                    const fname = std.fmt.allocPrint(alloc, "{s}.png", .{name}) catch return;
+                                    defer alloc.free(fname);
+                                    const ipath = std.fs.path.join(alloc, &.{ idir, fname }) catch return;
+                                    defer alloc.free(ipath);
+                                    store.writeAtomic(ipath, img_bytes) catch {};
+                                    saved_name = alloc.dupe(u8, fname) catch fname;
+                                } else |_| {}
+                            } else |_| {}
+                        }
+                    }
+                }
+            }
+        } else |_| {}
+        const q = protocol.jsonQuote(alloc, saved_name) catch return;
+        defer alloc.free(q);
+        const inner = std.fmt.allocPrint(alloc, "{{\"saved\":{s},\"status\":{d}}}", .{ q, split.status }) catch return;
+        defer alloc.free(inner);
+        resp = protocol.encodeOk(alloc, inner) catch return;
     } else if (std.mem.startsWith(u8, req.method, "speech.") or std.mem.startsWith(u8, req.method, "caption.") or std.mem.startsWith(u8, req.method, "classify.") or std.mem.startsWith(u8, req.method, "translate.") or std.mem.startsWith(u8, req.method, "stable-diffusion.") or std.mem.startsWith(u8, req.method, "openai.") or std.mem.startsWith(u8, req.method, "anthropic.") or std.mem.startsWith(u8, req.method, "google.") or std.mem.startsWith(u8, req.method, "azure.") or std.mem.startsWith(u8, req.method, "openrouter.") or std.mem.startsWith(u8, req.method, "novelai.") or std.mem.startsWith(u8, req.method, "horde.") or std.mem.startsWith(u8, req.method, "minimax.") or std.mem.startsWith(u8, req.method, "volcengine.") or std.mem.startsWith(u8, req.method, "nanogpt.") or std.mem.startsWith(u8, req.method, "backends.")) {
         // Generic HTTP proxy to third-party APIs (speech TTS/STT, caption, classify,
         // translate, SD image gen, LLM providers, horde, backends/*).

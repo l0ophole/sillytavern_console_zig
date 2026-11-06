@@ -160,6 +160,23 @@ else
 fi
 echo "== REPL =="
 printf "/help\n/ping\n/exit\n" | timeout 5 ./zig-out/bin/st-client --port $PORT | grep -q '"pong":true' && echo PASS
+echo "== image gen save =="
+cat > /rpf/tmp/opencode/mock_sd.py <<'PYEOF'
+import json, base64
+from http.server import BaseHTTPRequestHandler, HTTPServer
+class H(BaseHTTPRequestHandler):
+    def do_POST(self):
+        ln=int(self.headers.get('Content-Length',0)); self.rfile.read(ln)
+        img=base64.b64encode(b'\x89PNG\r\n\x1a\nFAKE').decode()
+        data=json.dumps({"images":[img]}).encode()
+        self.send_response(200); self.send_header('Content-Type','application/json'); self.send_header('Content-Length',str(len(data))); self.end_headers(); self.wfile.write(data)
+    def log_message(self,*a): pass
+HTTPServer(('127.0.0.1',18123),H).handle_request()
+PYEOF
+python3 /rpf/tmp/opencode/mock_sd.py > /rpf/tmp/opencode/sd.log 2>&1 & echo $! > /rpf/tmp/opencode/sd.pid
+sleep 1
+./zig-out/bin/st-client --port $PORT stable-diffusion.generate_and_save '{"name":"cat","host":"127.0.0.1","port":18123,"path":"/sdapi/v1/txt2img","body":{}}' | grep -q 'cat.png' && echo PASS
+kill $(cat /rpf/tmp/opencode/sd.pid) 2>/dev/null || true
 echo "== bad method =="
 ./zig-out/bin/st-client --port $PORT nope | grep -q '"ok":false' && echo PASS
 cat "$TMP/server.log"
