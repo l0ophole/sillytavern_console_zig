@@ -583,13 +583,13 @@ fn handleClient(conn: posix.fd_t) void {
         defer alloc.free(arr);
         resp = protocol.encodeOk(alloc, arr) catch return;
     } else if (std.mem.eql(u8, req.method, "chats.save")) {
-        const ch = getStr(req, "character") orelse {
+        const ch = getStr(req, "character") orelse getStr(req, "avatar_url") orelse getStr(req, "avatar") orelse {
             resp = protocol.encodeErr(alloc, "bad_request") catch return;
             defer alloc.free(resp);
             _ = posix.write(conn, resp) catch {};
             return;
         };
-        const chat = getStr(req, "chat") orelse {
+        const chat = getStr(req, "chat") orelse getStr(req, "file_name") orelse {
             resp = protocol.encodeErr(alloc, "bad_request") catch return;
             defer alloc.free(resp);
             _ = posix.write(conn, resp) catch {};
@@ -611,6 +611,8 @@ fn handleClient(conn: posix.fd_t) void {
         var content: []u8 = undefined;
         if (getStr(req, "content")) |c| {
             content = alloc.dupe(u8, c) catch return;
+        } else if (getStr(req, "chat")) |c2| {
+            content = alloc.dupe(u8, c2) catch return;
         } else if (getObjValue(req, "data")) |d| {
             if (d == .array) {
                 var out: std.ArrayListUnmanaged(u8) = .empty;
