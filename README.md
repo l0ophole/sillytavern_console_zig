@@ -40,12 +40,12 @@ zig build
 Cross-compile (baseline CPU, no AVX):
 
 ```sh
-zig build -Dtarget=x86_64-linux-gnu -mcpu=baseline
-zig build -Dtarget=x86_64-linux-musl -mcpu=baseline
+zig build -Dtarget=x86_64-linux-gnu -Dcpu=baseline
+zig build -Dtarget=x86_64-linux-musl -Dcpu=baseline
 file zig-out/bin/st-server  # musl build is statically linked
 ```
 
-Note: `-mcpu` is a `zig build` flag in 0.15 (`zig build -mcpu=baseline`); the build script also documents baseline as the supported floor. Test both targets with `tests/run.sh`.
+`-Dcpu=baseline` is the `zig build` option (via `standardTargetOptions`) that guarantees no AVX requirement. Verified: both targets build, musl binary runs, `objdump` shows no `ymm`/AVX instructions.
 
 ## Data compatibility
 
