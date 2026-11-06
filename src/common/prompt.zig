@@ -28,6 +28,13 @@ pub const MacroCtx = struct {
     char_scenario: []const u8 = "",
     char_first_message: []const u8 = "",
     mes_examples: []const u8 = "",
+    alt_greetings: []const []const u8 = &.{},
+    char_version: []const u8 = "",
+    char_creator_notes: []const u8 = "",
+    char_depth_prompt: []const u8 = "",
+    persona: []const u8 = "",
+    model: []const u8 = "",
+    original: []const u8 = "",
     chat_id: []const u8 = "",
     max_prompt: u32 = 0,
     max_context: u32 = 0,
@@ -53,6 +60,173 @@ fn civilFromDays(alloc: std.mem.Allocator, secs: i64) ![]u8 {
     const mm: i64 = @divFloor(@mod(rem, 3600), 60);
     return std.fmt.allocPrint(alloc, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}", .{ y, m, d, hh, mm });
 }
+const Civil = struct { year: i64, month: u64, day: u64, hour: i64, minute: i64, second: i64, weekday: u64 };
+
+fn civilParts(secs: i64) Civil {
+    const days: i64 = @divFloor(secs, 86400);
+    // Howard Hinnant civil_from_days
+    const z: i64 = days + 719468;
+    const era: i64 = @divFloor(z, 146097);
+    const doe: u64 = @intCast(z - era * 146097);
+    const yoe: u64 = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    var y: i64 = @as(i64, @intCast(yoe)) + era * 400;
+    const doy: u64 = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    const mp: u64 = (5 * doy + 2) / 153;
+    const d: u64 = doy - (153 * mp + 2) / 5 + 1;
+    const m: u64 = if (mp < 10) mp + 3 else mp - 9;
+    if (m <= 2) y += 1;
+    const rem: i64 = @mod(secs, 86400);
+    const wd: u64 = @intCast(@mod(days + 4, 7)); // 0=Sunday (1970-01-01 was Thursday)
+    return .{ .year = y, .month = m, .day = d, .hour = @divFloor(rem, 3600), .minute = @divFloor(@mod(rem, 3600), 60), .second = @mod(@mod(rem, 3600), 60), .weekday = wd };
+}
+
+fn civilNow() Civil {
+    const ts = std.time.milliTimestamp();
+    return civilParts(@divFloor(ts, 1000));
+}
+
+// moment-format subset for {{datetimeformat}} (upstream time-macros.js):
+// YYYY MM MMM MMMM DD D HH H hh h mm m ss s dddd ddd A a. Unknown chars pass through.
+fn formatMoment(alloc: std.mem.Allocator, civil: Civil, fmt: []const u8) ![]u8 {
+    const month_names = [_][]const u8{ "January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December" };
+    const month_abbr = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+    const day_names = [_][]const u8{ "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday" };
+    const day_abbr = [_][]const u8{ "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(alloc);
+    var i: usize = 0;
+    while (i < fmt.len) {
+        const rest = fmt[i..];
+        if (std.mem.startsWith(u8, rest, "YYYY")) {
+            try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "{d:0>4}", .{civil.year}));
+            i += 4;
+        } else if (std.mem.startsWith(u8, rest, "MMMM")) {
+            try out.appendSlice(alloc, month_names[civil.month - 1]);
+            i += 4;
+        } else if (std.mem.startsWith(u8, rest, "dddd")) {
+            try out.appendSlice(alloc, day_names[civil.weekday]);
+            i += 4;
+        } else if (std.mem.startsWith(u8, rest, "MMM")) {
+            try out.appendSlice(alloc, month_abbr[civil.month - 1]);
+            i += 3;
+        } else if (std.mem.startsWith(u8, rest, "ddd")) {
+            try out.appendSlice(alloc, day_abbr[civil.weekday]);
+            i += 3;
+        } else if (std.mem.startsWith(u8, rest, "MM")) {
+            try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "{d:0>2}", .{civil.month}));
+            i += 2;
+        } else if (std.mem.startsWith(u8, rest, "DD")) {
+            try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "{d:0>2}", .{civil.day}));
+            i += 2;
+        } else if (std.mem.startsWith(u8, rest, "HH")) {
+            try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "{d:0>2}", .{civil.hour}));
+            i += 2;
+        } else if (std.mem.startsWith(u8, rest, "hh")) {
+            const h12: i64 = @mod(civil.hour + 11, 12) + 1;
+            try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "{d:0>2}", .{h12}));
+            i += 2;
+        } else if (std.mem.startsWith(u8, rest, "mm")) {
+            try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "{d:0>2}", .{civil.minute}));
+            i += 2;
+        } else if (std.mem.startsWith(u8, rest, "ss")) {
+            try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "{d:0>2}", .{civil.second}));
+            i += 2;
+        } else if (rest[0] == 'M') {
+            try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "{d}", .{civil.month}));
+            i += 1;
+        } else if (rest[0] == 'D') {
+            try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "{d}", .{civil.day}));
+            i += 1;
+        } else if (rest[0] == 'H') {
+            try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "{d}", .{civil.hour}));
+            i += 1;
+        } else if (rest[0] == 'h') {
+            const h12: i64 = @mod(civil.hour + 11, 12) + 1;
+            try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "{d}", .{h12}));
+            i += 1;
+        } else if (rest[0] == 'm') {
+            try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "{d}", .{civil.minute}));
+            i += 1;
+        } else if (rest[0] == 's') {
+            try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "{d}", .{civil.second}));
+            i += 1;
+        } else if (rest[0] == 'A') {
+            try out.appendSlice(alloc, if (civil.hour < 12) "AM" else "PM");
+            i += 1;
+        } else if (rest[0] == 'a') {
+            try out.appendSlice(alloc, if (civil.hour < 12) "am" else "pm");
+            i += 1;
+        } else {
+            try out.append(alloc, rest[0]);
+            i += 1;
+        }
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+// Parse "YYYY-MM-DD [HH:mm[:ss]]" (also allows / and T separators) to epoch secs.
+fn parseDateTimeSecs(s: []const u8) ?i64 {
+    var date_part: []const u8 = s;
+    var time_part: []const u8 = "";
+    if (std.mem.indexOfScalar(u8, s, ' ')) |sp| {
+        date_part = s[0..sp];
+        time_part = s[sp + 1 ..];
+    } else if (std.mem.indexOfScalar(u8, s, 'T')) |sp| {
+        date_part = s[0..sp];
+        time_part = s[sp + 1 ..];
+    }
+    var dit = std.mem.splitScalar(u8, date_part, '-');
+    const ys = dit.next() orelse return null;
+    const mos = dit.next() orelse return null;
+    const ds = dit.next() orelse return null;
+    const y: i64 = std.fmt.parseInt(i64, ys, 10) catch return null;
+    const mo: u64 = std.fmt.parseInt(u64, mos, 10) catch return null;
+    const d: u64 = std.fmt.parseInt(u64, ds, 10) catch return null;
+    var hh: i64 = 0;
+    var mm: i64 = 0;
+    var ss: i64 = 0;
+    if (time_part.len > 0) {
+        var tit = std.mem.splitScalar(u8, time_part, ':');
+        const hs = tit.next() orelse return null;
+        const mis = tit.next() orelse return null;
+        hh = std.fmt.parseInt(i64, hs, 10) catch return null;
+        mm = std.fmt.parseInt(i64, mis, 10) catch return null;
+        if (tit.next()) |sss| ss = std.fmt.parseInt(i64, sss, 10) catch 0;
+    }
+    // days from civil (inverse of civil_from_days)
+    var yy = y;
+    if (mo <= 2) yy -= 1;
+    const era: i64 = @divFloor(yy, 400);
+    const yoe: u64 = @intCast(yy - era * 400);
+    const mp: u64 = if (mo > 2) mo - 3 else mo + 9;
+    const doy: u64 = (153 * mp + 2) / 5 + d - 1;
+    const doe: u64 = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    const days: i64 = era * 146097 + @as(i64, @intCast(doe)) - 719468;
+    return days * 86400 + hh * 3600 + mm * 60 + ss;
+}
+
+// Simplified moment duration.humanize() buckets (upstream timeDiff examples
+// use moment.humanize(); our approximation uses the same thresholds).
+fn humanizeSecs(alloc: std.mem.Allocator, secs: i64) ![]u8 {
+    const a: i64 = if (secs < 0) -secs else secs;
+    const m = @divFloor(a, 60);
+    const h = @divFloor(m, 60);
+    const d = @divFloor(h, 24);
+    const mo = @divFloor(d, 30);
+    const y = @divFloor(d, 365);
+    if (a <= 44) return alloc.dupe(u8, "a few seconds");
+    if (a <= 89) return alloc.dupe(u8, "a minute");
+    if (m <= 44) return std.fmt.allocPrint(alloc, "{d} minutes", .{m});
+    if (m <= 89) return alloc.dupe(u8, "an hour");
+    if (h <= 21) return std.fmt.allocPrint(alloc, "{d} hours", .{h});
+    if (h <= 35) return alloc.dupe(u8, "a day");
+    if (d <= 25) return std.fmt.allocPrint(alloc, "{d} days", .{d});
+    if (d <= 45) return alloc.dupe(u8, "a month");
+    if (mo <= 10) return std.fmt.allocPrint(alloc, "{d} months", .{mo});
+    if (d <= 547) return alloc.dupe(u8, "a year");
+    return std.fmt.allocPrint(alloc, "{d} years", .{y});
+}
+
 fn nowTime(alloc: std.mem.Allocator) []u8 {
     const ts = std.time.milliTimestamp();
     const full = civilFromDays(alloc, @divFloor(ts, 1000)) catch return &.{};
@@ -320,13 +494,40 @@ fn expandOne(alloc: std.mem.Allocator, inner: []const u8, ctx: *MacroCtx) ?[]u8 
         if (ctx.weekday_str.len > 0) return alloc.dupe(u8, ctx.weekday_str) catch null;
         return nowWeekday(alloc);
     }
+    if (std.mem.eql(u8, n, "isotime")) {
+        if (ctx.time_str.len > 0) return alloc.dupe(u8, ctx.time_str) catch null;
+        return nowTime(alloc);
+    }
+    if (std.mem.eql(u8, n, "isodate")) {
+        if (ctx.date_str.len > 0) return alloc.dupe(u8, ctx.date_str) catch null;
+        return nowDate(alloc);
+    }
+    if (std.mem.eql(u8, n, "datetimeformat")) {
+        const fmt_str = arg(args, 0);
+        return formatMoment(alloc, civilNow(), fmt_str) catch null;
+    }
+    if (std.mem.eql(u8, n, "timeDiff")) {
+        const left = parseDateTimeSecs(arg(args, 0)) orelse return alloc.dupe(u8, "") catch null;
+        const right = parseDateTimeSecs(arg(args, 1)) orelse return alloc.dupe(u8, "") catch null;
+        return humanizeSecs(alloc, left - right) catch null;
+    }
+    if (std.mem.eql(u8, n, "model")) return alloc.dupe(u8, ctx.model) catch null;
+    if (std.mem.eql(u8, n, "original")) return alloc.dupe(u8, ctx.original) catch null;
+    if (std.mem.eql(u8, n, "isMobile")) return alloc.dupe(u8, "false") catch null;
+    if (std.mem.eql(u8, n, "persona")) return alloc.dupe(u8, ctx.persona) catch null;
     if (std.mem.eql(u8, n, "space")) return alloc.dupe(u8, " ") catch null;
     if (std.mem.eql(u8, n, "newline")) return alloc.dupe(u8, "\n") catch null;
     if (std.mem.eql(u8, n, "trim") or std.mem.eql(u8, n, "noop") or std.mem.eql(u8, n, "//")) return alloc.dupe(u8, "") catch null;
     if (std.mem.eql(u8, n, "random") or std.mem.eql(u8, n, "pick")) {
         if (args.items.len == 0) return alloc.dupe(u8, "") catch null;
+        if (std.mem.eql(u8, n, "pick")) {
+            // Deterministic per (chat, macro text): stable across calls (upstream pick)
+            var h: u64 = 1469598103934665603;
+            for (ctx.chat_id) |c| h = (h ^ c) *% 1099511628211;
+            for (inner) |c| h = (h ^ c) *% 1099511628211;
+            return alloc.dupe(u8, args.items[@intCast(h % @as(u64, @intCast(args.items.len)))]) catch null;
+        }
         const idx = randBelow(args.items.len);
-        if (std.mem.eql(u8, n, "pick")) return alloc.dupe(u8, args.items[0]) catch null;
         return alloc.dupe(u8, args.items[idx]) catch null;
     }
     if (std.mem.eql(u8, n, "roll")) {
@@ -412,7 +613,17 @@ fn expandOne(alloc: std.mem.Allocator, inner: []const u8, ctx: *MacroCtx) ?[]u8 
     if (std.mem.eql(u8, n, "charDescription") or std.mem.eql(u8, n, "description")) return alloc.dupe(u8, ctx.char_description) catch null;
     if (std.mem.eql(u8, n, "charPersonality") or std.mem.eql(u8, n, "personality")) return alloc.dupe(u8, ctx.char_personality) catch null;
     if (std.mem.eql(u8, n, "charScenario") or std.mem.eql(u8, n, "scenario")) return alloc.dupe(u8, ctx.char_scenario) catch null;
-    if (std.mem.eql(u8, n, "charFirstMessage") or std.mem.eql(u8, n, "firstMessage")) return alloc.dupe(u8, ctx.char_first_message) catch null;
+    if (std.mem.eql(u8, n, "charFirstMessage") or std.mem.eql(u8, n, "firstMessage") or std.mem.eql(u8, n, "greeting")) {
+        const idx = std.fmt.parseInt(i64, arg(args, 0), 10) catch 0;
+        if (idx == 0) return alloc.dupe(u8, ctx.char_first_message) catch null;
+        if (idx > 0 and @as(usize, @intCast(idx - 1)) < ctx.alt_greetings.len) {
+            return alloc.dupe(u8, ctx.alt_greetings[@intCast(idx - 1)]) catch null;
+        }
+        return alloc.dupe(u8, "") catch null;
+    }
+    if (std.mem.eql(u8, n, "charVersion") or std.mem.eql(u8, n, "version") or std.mem.eql(u8, n, "char_version")) return alloc.dupe(u8, ctx.char_version) catch null;
+    if (std.mem.eql(u8, n, "charCreatorNotes") or std.mem.eql(u8, n, "creatorNotes")) return alloc.dupe(u8, ctx.char_creator_notes) catch null;
+    if (std.mem.eql(u8, n, "charDepthPrompt")) return alloc.dupe(u8, ctx.char_depth_prompt) catch null;
     if (std.mem.eql(u8, n, "mesExamples") or std.mem.eql(u8, n, "mesExamplesRaw")) return alloc.dupe(u8, ctx.mes_examples) catch null;
     if (std.mem.eql(u8, n, "outlet")) {
         const key = arg(args, 0);
@@ -1013,7 +1224,7 @@ test "macros random/pick/roll" {
     var ctx = MacroCtx{ .vars = vars };
     const p = try expandMacros(alloc, "{{pick::a::b::c}}", &ctx);
     defer alloc.free(p);
-    try std.testing.expectEqualStrings("a", p);
+    try std.testing.expect(p.len == 1 and (p[0] == 'a' or p[0] == 'b' or p[0] == 'c'));
     const r = try expandMacros(alloc, "{{roll::1}}", &ctx);
     defer alloc.free(r);
     try std.testing.expectEqualStrings("1", r);
@@ -1205,4 +1416,49 @@ test "object/array var macros (setvarkey/getvarkey)" {
     // deletevar removes the whole object
     const out4 = try expandMacros(alloc, "{{deletevar::obj}}after={{hasvar::obj}};", &ctx);
     try std.testing.expectEqualStrings("after=false;", out4);
+}
+
+test "isotime/isodate/datetimeformat" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const vars = std.StringHashMap([]const u8).init(alloc);
+    var ctx = MacroCtx{ .time_str = "12:34", .date_str = "2026-11-06", .weekday_str = "Friday", .vars = vars };
+    const out = try expandMacros(alloc, "{{isotime}} {{isodate}}", &ctx);
+    try std.testing.expectEqualStrings("12:34 2026-11-06", out);
+    // 2026-11-06 is a Friday; civil fields are derived from the real clock but
+    // the literal text passes through and tokens are replaced structurally.
+    const out2 = try expandMacros(alloc, "{{datetimeformat::YYYY-MM-DD}}|{{datetimeformat::dddd}}", &ctx);
+    try std.testing.expect(std.mem.indexOf(u8, out2, "-") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out2, "|") != null);
+    try std.testing.expect(out2.len > 15);
+}
+
+test "civilParts epoch" {
+    try std.testing.expectEqual(@as(i64, 1970), civilParts(0).year);
+    try std.testing.expectEqual(@as(u64, 1), civilParts(0).month);
+    try std.testing.expectEqual(@as(u64, 1), civilParts(0).day);
+    try std.testing.expectEqual(@as(u64, 4), civilParts(0).weekday); // Thursday
+}
+
+test "timeDiff humanize" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const vars = std.StringHashMap([]const u8).init(alloc);
+    var ctx = MacroCtx{ .vars = vars };
+    const out = try expandMacros(alloc, "{{timeDiff::2023-01-01 12:00:00::2023-01-01 15:00:00}}", &ctx);
+    try std.testing.expectEqualStrings("3 hours", out);
+    const out2 = try expandMacros(alloc, "{{timeDiff::2023-01-01 12:00:00::2023-01-02 12:00:00}}", &ctx);
+    try std.testing.expectEqualStrings("a day", out2);
+}
+
+test "model/original/greeting/card fields" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const vars = std.StringHashMap([]const u8).init(alloc);
+    var ctx = MacroCtx{ .model = "openai/gpt-4o-mini", .original = "raw text", .char_first_message = "Hello!", .alt_greetings = &.{ "Alt one", "Alt two" }, .char_version = "1.2", .char_creator_notes = "made by x", .char_depth_prompt = "dep", .persona = "per", .vars = vars };
+    const out = try expandMacros(alloc, "{{model}}|{{original}}|{{greeting}}|{{greeting::1}}|{{greeting::2}}|{{charVersion}}|{{charCreatorNotes}}|{{charDepthPrompt}}|{{persona}}|{{isMobile}}", &ctx);
+    try std.testing.expectEqualStrings("openai/gpt-4o-mini|raw text|Hello!|Alt one|Alt two|1.2|made by x|dep|per|false", out);
 }

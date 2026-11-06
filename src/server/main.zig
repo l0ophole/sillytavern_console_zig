@@ -3601,7 +3601,23 @@ fn handleClient(conn: posix.fd_t) void {
         var macro_vars = std.StringHashMap([]const u8).init(alloc);
         const group_members = getStr(req, "group") orelse display_name;
         const muted_members = getStr(req, "muted") orelse "";
-        var macro_ctx = prompt_mod.MacroCtx{ .char = display_name, .user = "User", .last_message = last_char_mes, .last_user_message = last_user_mes, .last_char_message = last_char_mes, .group = group_members, .group_not_muted = group_members, .not_char = group_members, .char_description = card_get(card_obj, "description"), .char_personality = card_get(card_obj, "personality"), .char_scenario = card_get(card_obj, "scenario"), .char_first_message = card_get(card_obj, "first_mes"), .mes_examples = card_get(card_obj, "mes_example"), .chat_id = chat_name, .vars = macro_vars };
+        // Alternate greetings from the card (upstream alternateGreetings)
+        var alt_greetings_list: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer alt_greetings_list.deinit(alloc);
+        if (card_obj.get("alternate_greetings")) |ag| {
+            if (ag == .array) {
+                for (ag.array.items) |item| {
+                    if (item == .string) alt_greetings_list.append(alloc, item.string) catch return;
+                }
+            }
+        }
+        const alt_greetings = alt_greetings_list.toOwnedSlice(alloc) catch return;
+        defer alloc.free(alt_greetings);
+        const version_field: []const u8 = if (card_get(card_obj, "character_version").len > 0) card_get(card_obj, "character_version") else card_get(card_obj, "version");
+        const creator_field: []const u8 = if (card_get(card_obj, "creatorcomment").len > 0) card_get(card_obj, "creatorcomment") else card_get(card_obj, "creatorNotes");
+        const depth_field: []const u8 = if (card_get(card_obj, "depth_prompt").len > 0) card_get(card_obj, "depth_prompt") else card_get(card_obj, "charDepthPrompt");
+        const persona_field: []const u8 = if (card_get(card_obj, "persona").len > 0) card_get(card_obj, "persona") else getStr(req, "persona") orelse "";
+        var macro_ctx = prompt_mod.MacroCtx{ .char = display_name, .user = "User", .last_message = last_char_mes, .last_user_message = last_user_mes, .last_char_message = last_char_mes, .group = group_members, .group_not_muted = group_members, .not_char = group_members, .char_description = card_get(card_obj, "description"), .char_personality = card_get(card_obj, "personality"), .char_scenario = card_get(card_obj, "scenario"), .char_first_message = card_get(card_obj, "first_mes"), .mes_examples = card_get(card_obj, "mes_example"), .alt_greetings = alt_greetings, .char_version = version_field, .char_creator_notes = creator_field, .char_depth_prompt = depth_field, .persona = persona_field, .model = model_name, .original = user_msg_raw, .chat_id = chat_name, .vars = macro_vars };
         _ = muted_members;
         const user_expanded = prompt_mod.expandMacros(alloc, user_msg2, &macro_ctx) catch return;
         defer alloc.free(user_expanded);
@@ -4013,7 +4029,7 @@ fn handleClient(conn: posix.fd_t) void {
         defer alloc.free(inner);
         resp = protocol.encodeOk(alloc, inner) catch return;
     } else if (std.mem.eql(u8, req.method, "prompt.macros")) {
-        resp = protocol.encodeOk(alloc, "{\"macros\":[\"char\",\"user\",\"time\",\"date\",\"weekday\",\"lastMessage\",\"lastUserMessage\",\"lastCharMessage\",\"space\",\"newline\",\"trim\",\"noop\",\"//\",\"random\",\"pick\",\"roll\",\"setvar\",\"getvar\",\"addvar\",\"incvar\",\"decvar\",\"hasvar\",\"deletevar\"],\"note\":\"Full upstream macro registry (26 definition sets) is larger; this is the implemented core subset. Unknown macros pass through unchanged.\"}") catch return;
+        resp = protocol.encodeOk(alloc, "{\"macros\":[\"char\",\"user\",\"time\",\"date\",\"weekday\",\"isotime\",\"isodate\",\"datetimeformat\",\"timeDiff\",\"model\",\"original\",\"isMobile\",\"persona\",\"greeting\",\"charVersion\",\"charCreatorNotes\",\"charDepthPrompt\",\"lastMessage\",\"lastUserMessage\",\"lastCharMessage\",\"space\",\"newline\",\"trim\",\"noop\",\"//\",\"random\",\"pick\",\"roll\",\"if\",\"else\",\"input\",\"maxPrompt\",\"maxContext\",\"maxResponse\",\"reverse\",\"group\",\"groupNotMuted\",\"notChar\",\"charPrompt\",\"charInstruction\",\"charDescription\",\"charPersonality\",\"charScenario\",\"charFirstMessage\",\"mesExamples\",\"outlet\",\"banned\",\"comment\",\"setvar\",\"getvar\",\"addvar\",\"incvar\",\"decvar\",\"hasvar\",\"deletevar\",\"setvarkey\",\"getvarkey\",\"setvarindex\",\"getvarindex\",\"setglobalvar\",\"getglobalvar\",\"hasglobalvar\",\"deleteglobalvar\",\"setglobalvarkey\",\"getglobalvarkey\",\"setglobalvarindex\",\"getglobalvarindex\"],\"note\":\"Implemented subset of the upstream macro registry (definitions/*.js). Unknown macros pass through unchanged. Chat-state macros (firstIncludedMessageId, swipe ids, allChatRange) and hasExtension/lastGenerationType/idleDuration are not ported.\"}") catch return;
     } else if (std.mem.eql(u8, req.method, "prompt.preview")) {
         // Prompt manager: show the ordered prompt entries without calling a backend.
         const ch_name = getStr(req, "character") orelse getStr(req, "name") orelse {
