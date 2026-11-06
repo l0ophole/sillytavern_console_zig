@@ -2,6 +2,8 @@ const std = @import("std");
 const protocol = @import("common");
 const store = @import("store");
 const crud = @import("crud");
+const tokenizer = @import("tokenizer");
+const backend = @import("backend");
 const posix = std.posix;
 
 var data_root: []const u8 = "data";
@@ -468,6 +470,41 @@ fn handleClient(conn: posix.fd_t) void {
         } else |_| {
             resp = protocol.encodeOk(alloc, "{}") catch return;
         }
+    } else if (std.mem.eql(u8, req.method, "tokenizer.estimate")) {
+        const text = getStr(req, "text") orelse "";
+        const ntok = tokenizer.estimateTokens(text);
+        const inner = std.fmt.allocPrint(alloc, "{{\"tokens\":{d},\"estimate\":true}}", .{ntok}) catch return;
+        defer alloc.free(inner);
+        resp = protocol.encodeOk(alloc, inner) catch return;
+    } else if (std.mem.eql(u8, req.method, "backend.chat")) {
+        const bhost = getStr(req, "host") orelse "127.0.0.1";
+        const bpath = getStr(req, "path") orelse "/v1/chat/completions";
+        var bport: u16 = 11434;
+        if (getObjValue(req, "port")) |pv| {
+            if (pv == .integer) bport = @intCast(pv.integer);
+        }
+        var body_str: []u8 = undefined;
+        if (getObjValue(req, "body")) |bv| {
+            body_str = store.stringifyValue(alloc, bv) catch return;
+        } else {
+            body_str = alloc.dupe(u8, "{}") catch return;
+        }
+        defer alloc.free(body_str);
+        const raw = backend.forwardHttp(alloc, bhost, bport, bpath, body_str) catch |ferr| {
+            const emsg = std.fmt.allocPrint(alloc, "backend {s}:{d}{s} err={}\n", .{ bhost, bport, bpath, ferr }) catch "";
+            std.fs.File.stderr().writeAll(emsg) catch {};
+            resp = protocol.encodeErr(alloc, "backend_unreachable") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        defer alloc.free(raw);
+        const split = backend.splitHttpResponse(raw);
+        const q = protocol.jsonQuote(alloc, split.body) catch return;
+        defer alloc.free(q);
+        const inner = std.fmt.allocPrint(alloc, "{{\"status\":{d},\"body\":{s}}}", .{ split.status, q }) catch return;
+        defer alloc.free(inner);
+        resp = protocol.encodeOk(alloc, inner) catch return;
     } else if (std.mem.eql(u8, req.method, "ping")) {
         resp = protocol.encodeOk(alloc, "{\"pong\":true,\"version\":\"" ++ protocol.VERSION ++ "\"}") catch return;
     } else if (std.mem.eql(u8, req.method, "version")) {

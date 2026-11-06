@@ -10,11 +10,15 @@ pub fn build(b: *std.Build) void {
     const crud = b.addModule("crud", .{ .root_source_file = b.path("src/common/crud.zig") });
     crud.addImport("common", common);
     crud.addImport("store", store);
+    const tokenizer = b.addModule("tokenizer", .{ .root_source_file = b.path("src/common/tokenizer.zig") });
+    const backend = b.addModule("backend", .{ .root_source_file = b.path("src/common/backend.zig") });
 
     const server_mod = b.createModule(.{ .root_source_file = b.path("src/server/main.zig"), .target = target, .optimize = optimize });
     server_mod.addImport("common", common);
     server_mod.addImport("store", store);
     server_mod.addImport("crud", crud);
+    server_mod.addImport("tokenizer", tokenizer);
+    server_mod.addImport("backend", backend);
     const server = b.addExecutable(.{ .name = "st-server", .root_module = server_mod });
     b.installArtifact(server);
 
@@ -42,8 +46,14 @@ pub fn build(b: *std.Build) void {
     crud_test_mod.addImport("common", common);
     crud_test_mod.addImport("store", store);
     const crud_tests = b.addTest(.{ .root_module = crud_test_mod });
+    const tok_test_mod = b.createModule(.{ .root_source_file = b.path("src/common/tokenizer.zig"), .target = target, .optimize = optimize });
+    const tok_tests = b.addTest(.{ .root_module = tok_test_mod });
+    const be_test_mod = b.createModule(.{ .root_source_file = b.path("src/common/backend.zig"), .target = target, .optimize = optimize });
+    const be_tests = b.addTest(.{ .root_module = be_test_mod });
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&b.addRunArtifact(unit_tests).step);
     test_step.dependOn(&b.addRunArtifact(store_tests).step);
     test_step.dependOn(&b.addRunArtifact(crud_tests).step);
+    test_step.dependOn(&b.addRunArtifact(tok_tests).step);
+    test_step.dependOn(&b.addRunArtifact(be_tests).step);
 }
