@@ -1528,6 +1528,42 @@ fn handleClient(conn: posix.fd_t) void {
         const inner = std.fmt.allocPrint(alloc, "{{\"stdout\":{s},\"stderr\":{s},\"exit_code\":{d}}}", .{ oq, eq, result.term.Exited }) catch return;
         defer alloc.free(inner);
         resp = protocol.encodeOk(alloc, inner) catch return;
+    } else if (std.mem.eql(u8, req.method, "extensions.execute_browser")) {
+        // Browser-equivalent shim: document/window/SillyTavern stubs, slash-command registry.
+        const code = getStr(req, "code") orelse {
+            resp = protocol.encodeErr(alloc, "bad_request") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        if (code.len == 0) {
+            resp = protocol.encodeErr(alloc, "bad_request") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        }
+        const shim = "const __commands=[];const __mkEl=()=>({style:{},children:[],appendChild(c){this.children.push(c)},addEventListener(){},setAttribute(){},querySelector(){return null},querySelectorAll(){return []}});globalThis.document={createElement:()=>__mkEl(),querySelector:()=>null,querySelectorAll:()=>[],body:__mkEl(),addEventListener(){}};globalThis.window=globalThis;globalThis.SillyTavern={getContext:()=>({registerSlashCommand:(n,f)=>__commands.push(n),generate:m=>Promise.resolve({completion:'ok'})})};globalThis.registerSlashCommand=(n,f)=>__commands.push(n);globalThis.SlashCommandParser={addCommand:(n,f)=>__commands.push(n)};";
+        const wrapper = std.fmt.allocPrint(alloc, "{s}{s};console.log(JSON.stringify({{commands:__commands}}));", .{ shim, code }) catch return;
+        defer alloc.free(wrapper);
+        const result = std.process.Child.run(.{
+            .allocator = alloc,
+            .argv = &.{ "node", "-e", wrapper },
+            .max_output_bytes = 1 << 20,
+        }) catch {
+            resp = protocol.encodeErr(alloc, "extension_runtime_unavailable") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        defer alloc.free(result.stdout);
+        defer alloc.free(result.stderr);
+        const oq = protocol.jsonQuote(alloc, result.stdout) catch return;
+        defer alloc.free(oq);
+        const eq = protocol.jsonQuote(alloc, result.stderr) catch return;
+        defer alloc.free(eq);
+        const inner = std.fmt.allocPrint(alloc, "{{\"stdout\":{s},\"stderr\":{s},\"exit_code\":{d}}}", .{ oq, eq, result.term.Exited }) catch return;
+        defer alloc.free(inner);
+        resp = protocol.encodeOk(alloc, inner) catch return;
     } else if (std.mem.startsWith(u8, req.method, "extensions.") or std.mem.startsWith(u8, req.method, "content-manager.")) {
         const dot = std.mem.indexOfScalar(u8, req.method, '.') orelse {
             resp = protocol.encodeErr(alloc, "unknown_method") catch return;

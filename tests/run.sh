@@ -133,6 +133,8 @@ echo "== neural model =="
 python3 -c "import json; m={'input_dim':32,'hidden_dim':4,'output_dim':2,'W1':[0]*128,'b1':[0]*4,'W2':[1,0,0,0,0,1,0,0],'b2':[0,0]}; [exec(\"m['W1'].__setitem__(h*32+h,1)\") for h in range(4)]; json.dump(m, open('/rpf/tmp/opencode/model.json','w'))"
 ./zig-out/bin/st-client --port $PORT vectors.model '{"text":"hello","model":"/rpf/tmp/opencode/model.json"}' | grep -q '"neural":true' && echo PASS
 ./zig-out/bin/st-client --port $PORT vectors.model '{"text":"hello","model":"/nonexistent.json"}' | grep -q 'model_not_found' && echo PASS
+echo "== browser extension runtime =="
+./zig-out/bin/st-client --port $PORT extensions.execute_browser '{"code":"registerSlashCommand(\"hello\", ()=>{});"}' | grep -q 'hello' && echo PASS
 echo "== bad method =="
 ./zig-out/bin/st-client --port $PORT nope | grep -q '"ok":false' && echo PASS
 cat "$TMP/server.log"
