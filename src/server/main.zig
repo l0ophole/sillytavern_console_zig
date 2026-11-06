@@ -2495,6 +2495,95 @@ fn handleClient(conn: posix.fd_t) void {
         const inner = std.fmt.allocPrint(alloc, "{{\"index_ok\":{s},\"ids\":{d},\"scripts\":{d},\"browser_equivalent\":{s}}}", .{ if (index_ok) "true" else "false", id_count, script_count, if (ok) "true" else "false" }) catch return;
         defer alloc.free(inner);
         resp = protocol.encodeOk(alloc, inner) catch return;
+    } else if (std.mem.eql(u8, req.method, "chat.generate_and_save")) {
+        // End-to-end provider SDK flow: native build -> forward -> parse -> append to chat file
+        const pname = getStr(req, "provider") orelse "openai";
+        const prov = providers_mod.getProvider(pname) orelse {
+            resp = protocol.encodeErr(alloc, "unknown_provider") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        const model_name = getStr(req, "model") orelse "gpt-4";
+        var max_tokens: u32 = 1024;
+        if (getObjValue(req, "max_tokens")) |mv| {
+            if (mv == .integer) max_tokens = @intCast(mv.integer);
+        }
+        var msgs_json: []u8 = undefined;
+        if (getObjValue(req, "messages")) |mv| {
+            msgs_json = store.stringifyValue(alloc, mv) catch return;
+        } else {
+            msgs_json = alloc.dupe(u8, "[]") catch return;
+        }
+        defer alloc.free(msgs_json);
+        const native_body = providers_mod.buildNativeBody(alloc, pname, model_name, msgs_json, max_tokens) catch {
+            resp = protocol.encodeErr(alloc, "bad_request") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        defer alloc.free(native_body);
+        const url = providers_mod.buildUrl(alloc, prov, getStr(req, "base_url"), getStr(req, "path")) catch return;
+        defer alloc.free(url);
+        const ak = getStr(req, "api_key") orelse "";
+        var headers_buf: [4]std.http.Header = undefined;
+        headers_buf[0] = .{ .name = "Content-Type", .value = "application/json" };
+        var nheaders: usize = 1;
+        var auth_val: ?[]u8 = null;
+        if (prov.auth_header.len > 0) {
+            auth_val = std.fmt.allocPrint(alloc, "{s}{s}", .{ prov.auth_prefix, ak }) catch return;
+            headers_buf[1] = .{ .name = prov.auth_header, .value = auth_val.? };
+            nheaders = 2;
+            if (std.mem.eql(u8, pname, "anthropic")) {
+                headers_buf[2] = .{ .name = "anthropic-version", .value = "2023-06-01" };
+                nheaders = 3;
+            }
+        }
+        defer if (auth_val) |av| alloc.free(av);
+        const fetched = backend.fetchUrlHeaders(alloc, url, "POST", native_body, headers_buf[0..nheaders]) catch {
+            resp = protocol.encodeErr(alloc, "backend_unreachable") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        defer alloc.free(fetched.body);
+        const text = providers_mod.parseNativeResponse(alloc, pname, fetched.body) catch return;
+        defer alloc.free(text);
+        // Append to chat if character/chat given
+        var saved = false;
+        if (getStr(req, "character")) |ch| {
+            if (getStr(req, "chat")) |chat_name| {
+                if (protocol.isSafeName(ch) and protocol.isSafeName(chat_name)) {
+                    const cdir = std.fs.path.join(alloc, &.{ udir, "chats", ch }) catch return;
+                    defer alloc.free(cdir);
+                    std.fs.cwd().makePath(cdir) catch {};
+                    const fname = std.fmt.allocPrint(alloc, "{s}.jsonl", .{chat_name}) catch return;
+                    defer alloc.free(fname);
+                    const fpath = std.fs.path.join(alloc, &.{ cdir, fname }) catch return;
+                    defer alloc.free(fpath);
+                    const tq = protocol.jsonQuote(alloc, text) catch return;
+                    defer alloc.free(tq);
+                    const line = std.fmt.allocPrint(alloc, "{{\"name\":\"{s}\",\"mes\":{s},\"is_user\":false}}\n", .{ model_name, tq }) catch return;
+                    defer alloc.free(line);
+                    // Append (read existing + write new via atomic)
+                    var existing: []u8 = alloc.dupe(u8, "") catch return;
+                    defer alloc.free(existing);
+                    if (store.readFileAlloc(alloc, fpath)) |ex| {
+                        alloc.free(existing);
+                        existing = ex;
+                    } else |_| {}
+                    const combined = std.fmt.allocPrint(alloc, "{s}{s}", .{ existing, line }) catch return;
+                    defer alloc.free(combined);
+                    store.writeAtomic(fpath, combined) catch {};
+                    saved = true;
+                }
+            }
+        }
+        const tq = protocol.jsonQuote(alloc, text) catch return;
+        defer alloc.free(tq);
+        const inner = std.fmt.allocPrint(alloc, "{{\"text\":{s},\"provider\":\"{s}\",\"status\":{d},\"saved\":{s}}}", .{ tq, prov.name, fetched.status, if (saved) "true" else "false" }) catch return;
+        defer alloc.free(inner);
+        resp = protocol.encodeOk(alloc, inner) catch return;
     } else if (std.mem.eql(u8, req.method, "ping")) {
         resp = protocol.encodeOk(alloc, "{\"pong\":true,\"version\":\"" ++ protocol.VERSION ++ "\"}") catch return;
     } else if (std.mem.eql(u8, req.method, "version")) {

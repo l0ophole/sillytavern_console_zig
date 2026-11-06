@@ -310,6 +310,22 @@ PYEOF
 ./zig-out/bin/st-client --port $PORT vectors.onnx '{"text":"hello","model":"/rpf/tmp/opencode/test.onnx"}' | grep -q '"onnx":true' && echo PASS
 echo "== browser frontend verify =="
 ./zig-out/bin/st-client --port $PORT frontend.browser_verify | grep -q '"browser_equivalent":true' && echo PASS
+echo "== chat end-to-end =="
+cat > /rpf/tmp/opencode/mock_openai.py <<'PYEOF'
+import json
+from http.server import BaseHTTPRequestHandler, HTTPServer
+class H(BaseHTTPRequestHandler):
+    def do_POST(self):
+        ln=int(self.headers.get('Content-Length',0)); self.rfile.read(ln)
+        data=json.dumps({"choices":[{"message":{"content":"Hi from OpenAI mock"}}]}).encode()
+        self.send_response(200); self.send_header('Content-Type','application/json'); self.send_header('Content-Length',str(len(data))); self.end_headers(); self.wfile.write(data)
+    def log_message(self,*a): pass
+HTTPServer(('127.0.0.1',18140),H).handle_request()
+PYEOF
+python3 /rpf/tmp/opencode/mock_openai.py > /rpf/tmp/opencode/o.log 2>&1 & echo $! > /rpf/tmp/opencode/o.pid
+sleep 1
+./zig-out/bin/st-client --port $PORT chat.generate_and_save '{"provider":"openai","model":"gpt-4","api_key":"k","base_url":"http://127.0.0.1:18140","path":"/v1/chat/completions","messages":[{"role":"user","content":"hi"}],"character":"Alice","chat":"main"}' | grep -q 'Hi from OpenAI' && echo PASS
+kill $(cat /rpf/tmp/opencode/o.pid) 2>/dev/null || true
 echo "== bad method =="
 ./zig-out/bin/st-client --port $PORT nope | grep -q '"ok":false' && echo PASS
 cat "$TMP/server.log"
