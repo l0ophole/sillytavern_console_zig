@@ -18,6 +18,16 @@ pub const MacroCtx = struct {
     date_str: []const u8 = "", // YYYY-MM-DD, empty = today
     weekday_str: []const u8 = "",
     input: []const u8 = "",
+    group: []const u8 = "",
+    group_not_muted: []const u8 = "",
+    not_char: []const u8 = "",
+    char_prompt: []const u8 = "",
+    char_instruction: []const u8 = "",
+    char_description: []const u8 = "",
+    char_personality: []const u8 = "",
+    char_scenario: []const u8 = "",
+    char_first_message: []const u8 = "",
+    mes_examples: []const u8 = "",
     max_prompt: u32 = 0,
     max_context: u32 = 0,
     max_response: u32 = 0,
@@ -272,6 +282,24 @@ fn expandOne(alloc: std.mem.Allocator, inner: []const u8, ctx: *MacroCtx) ?[]u8 
         while (k > 0) : (k -= 1) rev.append(alloc, v[k - 1]) catch return null;
         return rev.toOwnedSlice(alloc) catch null;
     }
+    if (std.mem.eql(u8, n, "group")) return alloc.dupe(u8, ctx.group) catch null;
+    if (std.mem.eql(u8, n, "groupNotMuted")) return alloc.dupe(u8, ctx.group_not_muted) catch null;
+    if (std.mem.eql(u8, n, "notChar")) return alloc.dupe(u8, ctx.not_char) catch null;
+    if (std.mem.eql(u8, n, "charPrompt")) return alloc.dupe(u8, ctx.char_prompt) catch null;
+    if (std.mem.eql(u8, n, "charInstruction")) return alloc.dupe(u8, ctx.char_instruction) catch null;
+    if (std.mem.eql(u8, n, "charDescription") or std.mem.eql(u8, n, "description")) return alloc.dupe(u8, ctx.char_description) catch null;
+    if (std.mem.eql(u8, n, "charPersonality") or std.mem.eql(u8, n, "personality")) return alloc.dupe(u8, ctx.char_personality) catch null;
+    if (std.mem.eql(u8, n, "charScenario") or std.mem.eql(u8, n, "scenario")) return alloc.dupe(u8, ctx.char_scenario) catch null;
+    if (std.mem.eql(u8, n, "charFirstMessage") or std.mem.eql(u8, n, "firstMessage")) return alloc.dupe(u8, ctx.char_first_message) catch null;
+    if (std.mem.eql(u8, n, "mesExamples") or std.mem.eql(u8, n, "mesExamplesRaw")) return alloc.dupe(u8, ctx.mes_examples) catch null;
+    if (std.mem.eql(u8, n, "outlet")) {
+        const key = arg(args, 0);
+        if (key.len == 0) return alloc.dupe(u8, "") catch null;
+        var buf: [128]u8 = undefined;
+        const prefixed = std.fmt.bufPrint(&buf, "outlet:{s}", .{key}) catch return alloc.dupe(u8, "") catch null;
+        if (ctx.vars.get(prefixed)) |v| return alloc.dupe(u8, v) catch null;
+        return alloc.dupe(u8, "") catch null;
+    }
     return null; // unknown macro: leave original text untouched
 }
 
@@ -340,6 +368,85 @@ pub fn worldInfoSelect(alloc: std.mem.Allocator, entries_json: []const u8, scan_
         }
     }
     return out.toOwnedSlice(alloc);
+}
+
+// World Info sticky effects: entries with sticky > 0, once matched, stay
+// included on later scans. sticky_uids is the persisted set (JSON array of
+// uids); returns selected text and the updated uid set as JSON array string.
+pub fn worldInfoSelectSticky(alloc: std.mem.Allocator, entries_json: []const u8, scan_text: []const u8, sticky_uids_json: []const u8) !struct { text: []u8, sticky: []u8 } {
+    const base = try worldInfoSelect(alloc, entries_json, scan_text);
+    errdefer alloc.free(base);
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, entries_json, .{});
+    var entries: []const std.json.Value = &.{};
+    if (parsed.value == .array) {
+        entries = parsed.value.array.items;
+    } else if (parsed.value == .object) {
+        if (parsed.value.object.get("entries")) |e| {
+            if (e == .array) entries = e.array.items;
+        }
+    }
+    var sticky_set = std.StringHashMap(void).init(alloc);
+    defer sticky_set.deinit();
+    if (std.json.parseFromSlice(std.json.Value, alloc, sticky_uids_json, .{})) |sp| {
+        if (sp.value == .array) {
+            for (sp.value.array.items) |it| {
+                if (it == .string) try sticky_set.put(it.string, {});
+            }
+        }
+    } else |_| {}
+    const scan_lower = try lowerCaseCopy(alloc, scan_text);
+    defer alloc.free(scan_lower);
+    var extra: std.ArrayListUnmanaged(u8) = .empty;
+    defer extra.deinit(alloc);
+    for (entries) |e| {
+        if (e != .object) continue;
+        const disable = if (e.object.get("disable")) |v| v == .bool and v.bool else false;
+        if (disable) continue;
+        const sticky_n: i64 = if (e.object.get("sticky")) |v| if (v == .integer) v.integer else 0 else 0;
+        if (sticky_n <= 0) continue;
+        const uid: []const u8 = if (e.object.get("uid")) |v| if (v == .string) v.string else "" else "";
+        const content = if (e.object.get("content")) |v| if (v == .string) v.string else "" else "";
+        if (content.len == 0) continue;
+        var matched = false;
+        if (e.object.get("key")) |k| {
+            if (k == .array) {
+                for (k.array.items) |kv| {
+                    if (kv != .string or kv.string.len == 0) continue;
+                    const kl = try lowerCaseCopy(alloc, kv.string);
+                    defer alloc.free(kl);
+                    if (std.mem.indexOf(u8, scan_lower, kl) != null) matched = true;
+                }
+            }
+        }
+        // Sticky: previously sticky entries stay included even without a match
+        const was_sticky = uid.len > 0 and sticky_set.contains(uid);
+        if (matched and uid.len > 0) try sticky_set.put(uid, {});
+        if (was_sticky and std.mem.indexOf(u8, base, content) == null) {
+            if (extra.items.len > 0) try extra.append(alloc, '\n');
+            try extra.appendSlice(alloc, content);
+        }
+    }
+    var text_out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer text_out.deinit(alloc);
+    try text_out.appendSlice(alloc, base);
+    if (extra.items.len > 0) {
+        if (base.len > 0) try text_out.append(alloc, '\n');
+        try text_out.appendSlice(alloc, extra.items);
+    }
+    var sticky_out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer sticky_out.deinit(alloc);
+    try sticky_out.append(alloc, '[');
+    var it = sticky_set.iterator();
+    var first = true;
+    while (it.next()) |kv| {
+        if (!first) try sticky_out.append(alloc, ',');
+        first = false;
+        const q = try quote(alloc, kv.key_ptr.*);
+        defer alloc.free(q);
+        try sticky_out.appendSlice(alloc, q);
+    }
+    try sticky_out.append(alloc, ']');
+    return .{ .text = try text_out.toOwnedSlice(alloc), .sticky = try sticky_out.toOwnedSlice(alloc) };
 }
 
 // Author's Note: insert note as a system message `depth` messages from the
@@ -597,4 +704,28 @@ test "worldinfo grouping" {
     try std.testing.expect(std.mem.indexOf(u8, out, "A1") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "A2") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "B1") != null);
+}
+
+test "worldinfo sticky persistence" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const entries = "[{\"uid\":\"s1\",\"key\":[\"dragon\"],\"content\":\"Sticky dragon.\",\"disable\":false,\"constant\":false,\"sticky\":5}]";
+    const r1 = try worldInfoSelectSticky(alloc, entries, "a dragon appears", "[]");
+    try std.testing.expect(std.mem.indexOf(u8, r1.text, "Sticky dragon.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r1.sticky, "s1") != null);
+    // Next scan without the key: sticky entry stays
+    const r2 = try worldInfoSelectSticky(alloc, entries, "nothing here", r1.sticky);
+    try std.testing.expect(std.mem.indexOf(u8, r2.text, "Sticky dragon.") != null);
+}
+
+test "group and card field macros" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const vars = std.StringHashMap([]const u8).init(alloc);
+    var ctx = MacroCtx{ .char = "Alice", .group = "Alice,Bob", .group_not_muted = "Alice", .not_char = "Bob", .char_description = "knight desc", .vars = vars };
+    const out = try expandMacros(alloc, "{{group}}|{{groupNotMuted}}|{{notChar}}|{{charDescription}}|{{outlet::ach}}", &ctx);
+    // outlet with no vars set -> empty
+    try std.testing.expectEqualStrings("Alice,Bob|Alice|Bob|knight desc|", out);
 }

@@ -3599,7 +3599,10 @@ fn handleClient(conn: posix.fd_t) void {
             }
         } else |_| {}
         const macro_vars = std.StringHashMap([]const u8).init(alloc);
-        var macro_ctx = prompt_mod.MacroCtx{ .char = display_name, .user = "User", .last_message = last_char_mes, .last_user_message = last_user_mes, .last_char_message = last_char_mes, .vars = macro_vars };
+        const group_members = getStr(req, "group") orelse display_name;
+        const muted_members = getStr(req, "muted") orelse "";
+        var macro_ctx = prompt_mod.MacroCtx{ .char = display_name, .user = "User", .last_message = last_char_mes, .last_user_message = last_user_mes, .last_char_message = last_char_mes, .group = group_members, .group_not_muted = group_members, .not_char = group_members, .char_description = card_get(card_obj, "description"), .char_personality = card_get(card_obj, "personality"), .char_scenario = card_get(card_obj, "scenario"), .char_first_message = card_get(card_obj, "first_mes"), .mes_examples = card_get(card_obj, "mes_example"), .vars = macro_vars };
+        _ = muted_members;
         const user_expanded = prompt_mod.expandMacros(alloc, user_msg2, &macro_ctx) catch return;
         defer alloc.free(user_expanded);
         const um_q = protocol.jsonQuote(alloc, user_expanded) catch return;
@@ -3632,6 +3635,35 @@ fn handleClient(conn: posix.fd_t) void {
                             alloc.free(msgs_json);
                             msgs_json = with_wi;
                         }
+                    }
+                }
+            }
+        }
+        // World Info sticky persistence: remember matched sticky uids per chat
+        if (getStr(req, "worldinfo")) |sticky_book| {
+            if (protocol.isSafeName(sticky_book)) {
+                const wdir2 = std.fs.path.join(alloc, &.{ udir, "worldinfo" }) catch return;
+                defer alloc.free(wdir2);
+                const wfname2 = std.fmt.allocPrint(alloc, "{s}.json", .{sticky_book}) catch return;
+                defer alloc.free(wfname2);
+                if (crud.loadFile(alloc, wdir2, wfname2) catch null) |book_content2| {
+                    defer alloc.free(book_content2);
+                    const sticky_path = std.fs.path.join(alloc, &.{ chat_dir, "sticky.json" }) catch return;
+                    defer alloc.free(sticky_path);
+                    const prev_sticky = store.readFileAlloc(alloc, sticky_path) catch alloc.dupe(u8, "[]") catch return;
+                    defer alloc.free(prev_sticky);
+                    const scan2 = std.fmt.allocPrint(alloc, "{s}\n{s}", .{ sys_macro, user_expanded }) catch return;
+                    defer alloc.free(scan2);
+                    if (prompt_mod.worldInfoSelectSticky(alloc, book_content2, scan2, prev_sticky) catch null) |sr| {
+                        store.writeAtomic(sticky_path, sr.sticky) catch {};
+                        alloc.free(sr.sticky);
+                        // Include sticky text (covers entries stuck from prior turns)
+                        if (sr.text.len > 0 and std.mem.indexOf(u8, msgs_json, sr.text) == null) {
+                            const with_sticky = prompt_mod.insertAuthorNote(alloc, msgs_json, sr.text, history_count + 1) catch return;
+                            alloc.free(msgs_json);
+                            msgs_json = with_sticky;
+                        }
+                        alloc.free(sr.text);
                     }
                 }
             }
