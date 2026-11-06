@@ -20,6 +20,7 @@ pub fn build(b: *std.Build) void {
     const model = b.addModule("model", .{ .root_source_file = b.path("src/common/model.zig") });
     const onnx = b.addModule("onnx", .{ .root_source_file = b.path("src/common/onnx.zig") });
     const minilm = b.addModule("minilm", .{ .root_source_file = b.path("src/common/minilm.zig") });
+    const prompt = b.addModule("prompt", .{ .root_source_file = b.path("src/common/prompt.zig") });
 
     const server_mod = b.createModule(.{ .root_source_file = b.path("src/server/main.zig"), .target = target, .optimize = optimize });
     server_mod.addImport("common", common);
@@ -35,6 +36,7 @@ pub fn build(b: *std.Build) void {
     server_mod.addImport("model", model);
     server_mod.addImport("onnx", onnx);
     server_mod.addImport("minilm", minilm);
+    server_mod.addImport("prompt", prompt);
     const server = b.addExecutable(.{ .name = "st-server", .root_module = server_mod });
     b.installArtifact(server);
 
@@ -82,6 +84,8 @@ pub fn build(b: *std.Build) void {
     const onnx_tests = b.addTest(.{ .root_module = onnx_test_mod });
     const minilm_test_mod = b.createModule(.{ .root_source_file = b.path("src/common/minilm.zig"), .target = target, .optimize = optimize });
     const minilm_tests = b.addTest(.{ .root_module = minilm_test_mod });
+    const prompt_test_mod = b.createModule(.{ .root_source_file = b.path("src/common/prompt.zig"), .target = target, .optimize = optimize });
+    const prompt_tests = b.addTest(.{ .root_module = prompt_test_mod });
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&b.addRunArtifact(unit_tests).step);
     test_step.dependOn(&b.addRunArtifact(store_tests).step);
@@ -96,4 +100,5 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(model_tests).step);
     test_step.dependOn(&b.addRunArtifact(onnx_tests).step);
     test_step.dependOn(&b.addRunArtifact(minilm_tests).step);
+    test_step.dependOn(&b.addRunArtifact(prompt_tests).step);
 }

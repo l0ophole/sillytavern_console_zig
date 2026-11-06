@@ -366,6 +366,12 @@ sleep 1
 ./zig-out/bin/st-client --port $PORT characters.create '{"name":"Alice","character":{"name":"Alice","description":"A brave knight.","personality":"Cheerful","scenario":"In a tavern"}}' | grep -q '"saved"' && echo PASS
 ./zig-out/bin/st-client --port $PORT chat.turn '{"character":"Alice","chat":"turnchat","user_message":"Greetings {{char}}!","provider":"openai","model":"gpt-4","base_url":"http://127.0.0.1:18141","path":"/v1/chat/completions","api_key":"k"}' | grep -q 'Hello there!' && echo PASS_TURN
 ./zig-out/bin/st-client --port $PORT chats.load '{"character":"Alice","chat":"turnchat"}' | grep -q 'Greetings Alice!' && echo PASS_TURN_RELOAD
+echo "== prompt engine: worldinfo + author note + macros =="
+./zig-out/bin/st-client --port $PORT worldinfo.save '{"name":"lore","value":{"entries":[{"key":["tavern"],"content":"WI-TAVERN-LORE","disable":false,"constant":false},{"key":[],"content":"WI-ALWAYS","disable":false,"constant":true}]}}' | grep -q '"saved"' && echo PASS
+./zig-out/bin/st-client --port $PORT prompt.preview '{"character":"Alice","chat":"turnchat","user_message":"I enter the tavern","worldinfo":"lore"}' | grep -q 'WI-TAVERN-LORE' && echo PASS_WI
+./zig-out/bin/st-client --port $PORT prompt.preview '{"character":"Alice","chat":"turnchat","user_message":"I enter the tavern","worldinfo":"lore"}' | grep -q 'WI-ALWAYS' && echo PASS_WI_CONST
+./zig-out/bin/st-client --port $PORT prompt.preview '{"character":"Alice","chat":"turnchat","user_message":"hi","author_note":"AN-TEXT","author_note_depth":1}' | grep -q 'AN-TEXT' && echo PASS_AN
+./zig-out/bin/st-client --port $PORT prompt.macros | grep -q 'lastUserMessage' && echo PASS_MACROS
 kill $(cat $TMP/opencode/turn.pid) 2>/dev/null || true
 if [ -n "${OPENROUTER_API_KEY:-}" ]; then
   ./zig-out/bin/st-client --port $PORT chat.turn '{"character":"Alice","chat":"realchat","user_message":"Reply with one short word.","provider":"openrouter","model":"openai/gpt-4o-mini"}' | grep -q '"saved":true' && echo PASS_TURN_REAL

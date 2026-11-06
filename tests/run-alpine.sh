@@ -15,7 +15,7 @@ cat > /rpf/tmp/opencode/alpine_build.sh <<'EOS'
 apk add --no-cache curl xz >/dev/null 2>&1
 curl -fsSL -o /tmp/zig.tar.xz https://ziglang.org/download/0.15.2/zig-x86_64-linux-0.15.2.tar.xz
 mkdir -p /opt/zig && tar -xJf /tmp/zig.tar.xz -C /opt/zig --strip-components=1
-cp -r /src /tmp/build && cd /tmp/build
+mkdir -p /tmp/build && cp -r /src/src /src/build.zig /tmp/build/ && cd /tmp/build
 /opt/zig/zig build test && echo UNIT_PASS
 /opt/zig/zig build && echo BUILD_PASS
 ./zig-out/bin/st-server --port 18081 --data-dir /tmp/data > /tmp/s.log 2>&1 &
