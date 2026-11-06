@@ -505,6 +505,96 @@ fn handleClient(conn: posix.fd_t) void {
         const inner = std.fmt.allocPrint(alloc, "{{\"status\":{d},\"body\":{s}}}", .{ split.status, q }) catch return;
         defer alloc.free(inner);
         resp = protocol.encodeOk(alloc, inner) catch return;
+    } else if (std.mem.eql(u8, req.method, "stats.summary")) {
+        const subs = [_][]const u8{ "characters", "presets", "worldinfo", "groups", "themes", "backups" };
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        defer out.deinit(alloc);
+        out.append(alloc, '{') catch return;
+        var first = true;
+        for (subs) |s| {
+            const d = std.fs.path.join(alloc, &.{ udir, s }) catch return;
+            defer alloc.free(d);
+            const names = crud.listNames(alloc, d) catch &[_][]u8{};
+            if (!first) out.append(alloc, ',') catch return;
+            first = false;
+            const key = protocol.jsonQuote(alloc, s) catch return;
+            defer alloc.free(key);
+            out.appendSlice(alloc, key) catch return;
+            out.append(alloc, ':') catch return;
+            const cnt_s = std.fmt.allocPrint(alloc, "{d}", .{names.len}) catch return;
+            defer alloc.free(cnt_s);
+            out.appendSlice(alloc, cnt_s) catch return;
+        }
+        // chats count
+        const chat_root = std.fs.path.join(alloc, &.{ udir, "chats" }) catch return;
+        defer alloc.free(chat_root);
+        var chat_count: usize = 0;
+        if (std.fs.cwd().openDir(chat_root, .{ .iterate = true })) |cd| {
+            var cdir = cd;
+            defer cdir.close();
+            var it = cdir.iterate();
+            while (it.next() catch null) |ch_entry| {
+                if (ch_entry.kind != .directory) continue;
+                const sub = std.fs.path.join(alloc, &.{ chat_root, ch_entry.name }) catch continue;
+                defer alloc.free(sub);
+                if (crud.listNames(alloc, sub)) |ns| {
+                    chat_count += ns.len;
+                    for (ns) |nm| alloc.free(nm);
+                    alloc.free(ns);
+                } else |_| {}
+            }
+        } else |_| {}
+        out.append(alloc, ',') catch return;
+        const ck = protocol.jsonQuote(alloc, "chats") catch return;
+        defer alloc.free(ck);
+        out.appendSlice(alloc, ck) catch return;
+        out.append(alloc, ':') catch return;
+        const cc_s = std.fmt.allocPrint(alloc, "{d}", .{chat_count}) catch return;
+        defer alloc.free(cc_s);
+        out.appendSlice(alloc, cc_s) catch return;
+        out.append(alloc, '}') catch return;
+        const s = out.toOwnedSlice(alloc) catch return;
+        defer alloc.free(s);
+        resp = protocol.encodeOk(alloc, s) catch return;
+    } else if (std.mem.eql(u8, req.method, "backups.create")) {
+        const bname = getStr(req, "name") orelse "backup";
+        if (!protocol.isSafeName(bname)) {
+            resp = protocol.encodeErr(alloc, "bad_name") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        }
+        const spath = std.fs.path.join(alloc, &.{ udir, "settings.json" }) catch return;
+        defer alloc.free(spath);
+        const content = store.readFileAlloc(alloc, spath) catch alloc.dupe(u8, "{}") catch return;
+        defer alloc.free(content);
+        const bdir = std.fs.path.join(alloc, &.{ udir, "backups" }) catch return;
+        defer alloc.free(bdir);
+        std.fs.cwd().makePath(bdir) catch {};
+        const fname = std.fmt.allocPrint(alloc, "{s}.json", .{bname}) catch return;
+        defer alloc.free(fname);
+        const bpath = std.fs.path.join(alloc, &.{ bdir, fname }) catch return;
+        defer alloc.free(bpath);
+        store.writeAtomic(bpath, content) catch {
+            resp = protocol.encodeErr(alloc, "io_error") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        resp = protocol.encodeOk(alloc, "{\"saved\":true}") catch return;
+    } else if (std.mem.eql(u8, req.method, "backups.list")) {
+        const bdir = std.fs.path.join(alloc, &.{ udir, "backups" }) catch return;
+        defer alloc.free(bdir);
+        const names = crud.listNames(alloc, bdir) catch {
+            resp = protocol.encodeOk(alloc, "[]") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        defer { for (names) |nm| alloc.free(nm); alloc.free(names); }
+        const arr = crud.jsonArrayOfNames(alloc, names) catch return;
+        defer alloc.free(arr);
+        resp = protocol.encodeOk(alloc, arr) catch return;
     } else if (std.mem.eql(u8, req.method, "ping")) {
         resp = protocol.encodeOk(alloc, "{\"pong\":true,\"version\":\"" ++ protocol.VERSION ++ "\"}") catch return;
     } else if (std.mem.eql(u8, req.method, "version")) {

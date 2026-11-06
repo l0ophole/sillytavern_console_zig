@@ -14,8 +14,8 @@ Status legend: DONE = implemented in Zig + tested (`zig build test` / `tests/run
 | secrets | `secrets.set/get(list masked)` | DONE Task 6 |
 | groups | `groups.list/save/delete` | DONE Task 6 |
 | themes / moving-ui / quick-replies | `themes.*` generic | DONE Task 6 (themes) |
-| backgrounds / avatars / sprites / images / thumbnails / files / assets / backups / data-maid | `files.*`, `backups.create/list` (generic binary store) | TODO Task 6/8 |
-| stats | `stats.summary` | TODO Task 8 |
+| backgrounds / avatars / sprites / images / thumbnails / files / assets / backups / data-maid | `backups.create/list` | DONE Task 8 (backups; binary files TODO) |
+| stats | `stats.summary` | DONE Task 8 |
 | tokenizers | `tokenizer.estimate` (chars/4 heuristic; tiktoken TODO) | DONE Task 7 (estimate) |
 | backends/chat-completions, openai, anthropic, google, azure, openrouter, novelai, horde, kobold, text-completions | `backend.chat` (OpenAI-compatible HTTP proxy; native SDKs TODO) | DONE Task 7 (HTTP proxy) |
 | speech, caption, classify, translate, search, vectors, extensions, content-manager, users-*, stable-diffusion, image-metadata, byaf/charx | — | TODO (listed, not claimed) |

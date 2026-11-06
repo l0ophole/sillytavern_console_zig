@@ -42,6 +42,10 @@ echo "== secrets =="
 echo "== tokenizer/backend =="
 ./zig-out/bin/st-client --port $PORT tokenizer.estimate '{"text":"hello world"}' | grep -q '"tokens"' && echo PASS
 ./zig-out/bin/st-client --port $PORT backend.chat '{"host":"127.0.0.1","port":9,"path":"/v1/chat/completions","body":{}}' | grep -q 'backend_unreachable' && echo PASS
+echo "== stats/backups =="
+./zig-out/bin/st-client --port $PORT stats.summary | grep -q 'characters' && echo PASS
+./zig-out/bin/st-client --port $PORT backups.create '{"name":"b1"}' | grep -q '"saved"' && echo PASS
+./zig-out/bin/st-client --port $PORT backups.list | grep -q 'b1' && echo PASS
 echo "== bad method =="
 ./zig-out/bin/st-client --port $PORT nope | grep -q '"ok":false' && echo PASS
 cat "$TMP/server.log"
