@@ -9,6 +9,7 @@ const users_mod = @import("users");
 const vectors_mod = @import("vectors");
 const zipm = @import("zipm");
 const providers_mod = @import("providers");
+const model_mod = @import("model");
 const posix = std.posix;
 
 var data_root: []const u8 = "data";
@@ -1201,6 +1202,45 @@ fn handleClient(conn: posix.fd_t) void {
             defer alloc.free(inner);
             resp = protocol.encodeOk(alloc, inner) catch return;
         }
+    } else if (std.mem.eql(u8, req.method, "vectors.model")) {
+        const text = getStr(req, "text") orelse {
+            resp = protocol.encodeErr(alloc, "bad_request") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        const model_path = getStr(req, "model") orelse "data/models/embed.json";
+        var mlp = model_mod.loadModel(alloc, model_path) catch {
+            resp = protocol.encodeErr(alloc, "model_not_found") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        defer mlp.deinit();
+        const inp = vectors_mod.localEmbed(alloc, text, mlp.input_dim) catch return;
+        defer alloc.free(inp);
+        const outv = mlp.forward(alloc, inp) catch {
+            resp = protocol.encodeErr(alloc, "model_failed") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        defer alloc.free(outv);
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        defer out.deinit(alloc);
+        out.append(alloc, '[') catch return;
+        for (outv, 0..) |v, idx| {
+            if (idx > 0) out.append(alloc, ',') catch return;
+            const vs = std.fmt.allocPrint(alloc, "{d}", .{v}) catch return;
+            defer alloc.free(vs);
+            out.appendSlice(alloc, vs) catch return;
+        }
+        out.append(alloc, ']') catch return;
+        const arr = out.toOwnedSlice(alloc) catch return;
+        defer alloc.free(arr);
+        const inner = std.fmt.allocPrint(alloc, "{{\"vector\":{s},\"neural\":true}}", .{arr}) catch return;
+        defer alloc.free(inner);
+        resp = protocol.encodeOk(alloc, inner) catch return;
     } else if (std.mem.startsWith(u8, req.method, "vectors.")) {
         const dot = std.mem.indexOfScalar(u8, req.method, '.') orelse {
             resp = protocol.encodeErr(alloc, "unknown_method") catch return;
