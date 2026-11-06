@@ -1741,6 +1741,46 @@ fn handleClient(conn: posix.fd_t) void {
         const inner = std.fmt.allocPrint(alloc, "{{\"status\":{d},\"body\":{s}}}", .{ fetched.status, q }) catch return;
         defer alloc.free(inner);
         resp = protocol.encodeOk(alloc, inner) catch return;
+    } else if (std.mem.eql(u8, req.method, "tokenizer.encode")) {
+        const text = getStr(req, "text") orelse {
+            resp = protocol.encodeErr(alloc, "bad_request") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        const vocab_path = getStr(req, "vocab") orelse "data/tokenizers/cl100k_base.tiktoken";
+        var vocab = tokenizer.loadVocab(alloc, vocab_path) catch {
+            const nest = tokenizer.estimateTokens(text);
+            const inner = std.fmt.allocPrint(alloc, "{{\"tokens\":{d},\"exact\":false}}", .{nest}) catch return;
+            defer alloc.free(inner);
+            resp = protocol.encodeOk(alloc, inner) catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        defer vocab.deinit();
+        const ids = tokenizer.bpeEncode(alloc, &vocab, text) catch {
+            resp = protocol.encodeErr(alloc, "tokenize_failed") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        defer alloc.free(ids);
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        defer out.deinit(alloc);
+        out.append(alloc, '[') catch return;
+        for (ids, 0..) |id, idx| {
+            if (idx > 0) out.append(alloc, ',') catch return;
+            const s = std.fmt.allocPrint(alloc, "{d}", .{id}) catch return;
+            defer alloc.free(s);
+            out.appendSlice(alloc, s) catch return;
+        }
+        out.append(alloc, ']') catch return;
+        const arr = out.toOwnedSlice(alloc) catch return;
+        defer alloc.free(arr);
+        const inner = std.fmt.allocPrint(alloc, "{{\"ids\":{s},\"count\":{d},\"exact\":true}}", .{ arr, ids.len }) catch return;
+        defer alloc.free(inner);
+        resp = protocol.encodeOk(alloc, inner) catch return;
     } else if (std.mem.eql(u8, req.method, "ping")) {
         resp = protocol.encodeOk(alloc, "{\"pong\":true,\"version\":\"" ++ protocol.VERSION ++ "\"}") catch return;
     } else if (std.mem.eql(u8, req.method, "version")) {

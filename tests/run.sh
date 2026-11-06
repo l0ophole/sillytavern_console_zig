@@ -118,6 +118,13 @@ echo "== embedding generation =="
 ./zig-out/bin/st-client --port $PORT vectors.save '{"collection":"cg","id":"g1","value":{"text":"hello"}}' | grep -q '"saved"' && echo PASS
 echo "== extension execution =="
 ./zig-out/bin/st-client --port $PORT extensions.execute '{"code":"console.log(1+2)"}' | grep -q '"stdout":"3' && echo PASS || echo SKIP_NO_NODE
+echo "== exact tokenizer =="
+curl -sL -o /tmp/cl100k.tiktoken https://openaipublic.blob.core.windows.net/encodings/cl100k_base.tiktoken 2>/dev/null || true
+if [ -s /tmp/cl100k.tiktoken ]; then
+  ./zig-out/bin/st-client --port $PORT tokenizer.encode '{"text":"hello world","vocab":"/tmp/cl100k.tiktoken"}' | grep -q '15339,1917' && echo PASS_EXACT || echo FAIL_EXACT
+else
+  echo SKIP_NO_VOCAB
+fi
 echo "== bad method =="
 ./zig-out/bin/st-client --port $PORT nope | grep -q '"ok":false' && echo PASS
 cat "$TMP/server.log"
