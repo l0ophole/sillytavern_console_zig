@@ -1,11 +1,13 @@
 const std = @import("std");
 
 pub const VERSION = "0.1.0";
+pub const API_VERSION: u32 = 1; // versioned JSON API: requests may carry "version", responses always include it
 pub const MAX_LINE: usize = 16 << 20; // 16 MiB (long chats exceed 1 MiB)
 
 pub const Request = struct {
     method: []const u8,
     params: ?std.json.Value = null,
+    version: u32 = API_VERSION,
 };
 
 pub fn parseRequest(alloc: std.mem.Allocator, line: []const u8) !Request {
@@ -23,7 +25,14 @@ pub fn parseRequest(alloc: std.mem.Allocator, line: []const u8) !Request {
         else => return error.BadRequest,
     };
     if (method.len == 0 or method.len > 128) return error.BadRequest;
-    return .{ .method = method, .params = obj.get("params") };
+    var version: u32 = API_VERSION;
+    if (obj.get("version")) |vv| {
+        if (vv == .integer) {
+            if (vv.integer != API_VERSION) return error.UnsupportedVersion;
+            version = API_VERSION;
+        } else return error.BadRequest;
+    }
+    return .{ .method = method, .params = obj.get("params"), .version = version };
 }
 
 pub fn isSafeName(name: []const u8) bool {
@@ -65,7 +74,7 @@ pub fn encodeOk(alloc: std.mem.Allocator, result_json: []const u8) ![]u8 {
     // result_json is raw JSON text (or "null").
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(alloc);
-    try out.appendSlice(alloc, "{\"ok\":true,\"result\":");
+    try out.appendSlice(alloc, "{\"ok\":true,\"version\":1,\"result\":");
     try out.appendSlice(alloc, result_json);
     try out.appendSlice(alloc, "}\n");
     return out.toOwnedSlice(alloc);
@@ -74,7 +83,7 @@ pub fn encodeOk(alloc: std.mem.Allocator, result_json: []const u8) ![]u8 {
 pub fn encodeErr(alloc: std.mem.Allocator, msg: []const u8) ![]u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(alloc);
-    try out.appendSlice(alloc, "{\"ok\":false,\"error\":");
+    try out.appendSlice(alloc, "{\"ok\":false,\"version\":1,\"error\":");
     try out.append(alloc, '"');
     for (msg) |c| {
         if (c == '"' or c == '\\') try out.append(alloc, '\\');

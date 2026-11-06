@@ -610,7 +610,7 @@ fn handleHttp(conn: posix.fd_t, cbuf: *ConnBuf, first_line: []const u8) void {
         // Bridge to TCP dispatch via loopback self-connection
         const mq = protocol.jsonQuote(alloc, mapped_method) catch return;
         defer alloc.free(mq);
-        const line = std.fmt.allocPrint(alloc, "{{\"method\":{s},\"params\":{s}}}\n", .{ mq, params_json }) catch return;
+        const line = std.fmt.allocPrint(alloc, "{{\"method\":{s},\"version\":1,\"params\":{s}}}\n", .{ mq, params_json }) catch return;
         defer alloc.free(line);
         const addr_str = std.fmt.allocPrint(alloc, "127.0.0.1:{d}", .{port}) catch return;
         defer alloc.free(addr_str);
@@ -628,8 +628,8 @@ fn handleHttp(conn: posix.fd_t, cbuf: *ConnBuf, first_line: []const u8) void {
         // {"ok":false,"error":"m"} -> HTTP 400 {"error":"m"} (JS endpoints send error bodies).
         var body_out: []const u8 = resp_body;
         var status: []const u8 = "200 OK";
-        const ok_prefix = "{\"ok\":true,\"result\":";
-        const err_prefix = "{\"ok\":false,\"error\":\"";
+        const ok_prefix = "{\"ok\":true,\"version\":1,\"result\":";
+        const err_prefix = "{\"ok\":false,\"version\":1,\"error\":\"";
         if (std.mem.startsWith(u8, resp_body, ok_prefix) and std.mem.endsWith(u8, std.mem.trim(u8, resp_body, " \t\r\n"), "}")) {
             const t = std.mem.trim(u8, resp_body, " \t\r\n");
             body_out = t[ok_prefix.len .. t.len - 1];
@@ -654,7 +654,7 @@ fn handleHttp(conn: posix.fd_t, cbuf: *ConnBuf, first_line: []const u8) void {
         return;
     }
     if (std.mem.eql(u8, clean_path, "/api/health") or std.mem.eql(u8, clean_path, "/api/ping")) {
-        const body = "{\"ok\":true,\"result\":{\"pong\":true}}";
+        const body = "{\"ok\":true,\"version\":1,\"result\":{\"pong\":true}}";
         const hdr = std.fmt.allocPrint(alloc, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{body.len}) catch return;
         defer alloc.free(hdr);
         _ = posix.write(conn, hdr) catch {};
@@ -685,6 +685,78 @@ fn handleHttp(conn: posix.fd_t, cbuf: *ConnBuf, first_line: []const u8) void {
     defer alloc.free(hdr);
     _ = posix.write(conn, hdr) catch {};
     _ = posix.write(conn, content) catch {};
+}
+
+// Server-owned generation jobs: the job thread talks to the server itself
+// over loopback, so a client disconnect never cancels generation. Results
+// are persisted under <data_root>/jobs/<id>.json for later pickup.
+const JobCtx = struct {
+    job_id: []u8,
+    params_json: []u8, // chat.turn params (without token; added by thread)
+    port: u16,
+    token: []u8,
+    data_root: []u8,
+};
+
+fn jobThread(ctx: *JobCtx) void {
+    defer {
+        const alloc = std.heap.page_allocator;
+        alloc.free(ctx.job_id);
+        alloc.free(ctx.params_json);
+        alloc.free(ctx.token);
+        alloc.free(ctx.data_root);
+        alloc.destroy(ctx);
+    }
+    const alloc = std.heap.page_allocator;
+    // Build loopback request: {"method":"chat.turn","version":1,"params":{...,"token":...}}
+    const tq = protocol.jsonQuote(alloc, ctx.token) catch return;
+    defer alloc.free(tq);
+    const params = if (ctx.params_json.len > 2 and std.mem.startsWith(u8, std.mem.trim(u8, ctx.params_json, " \t\r\n"), "{"))
+        std.fmt.allocPrint(alloc, "{s},\"token\":{s}}}", .{ ctx.params_json[0 .. ctx.params_json.len - 1], tq }) catch return
+    else
+        std.fmt.allocPrint(alloc, "{{\"token\":{s}}}", .{tq}) catch return;
+    defer alloc.free(params);
+    const line = std.fmt.allocPrint(alloc, "{{\"method\":\"chat.turn\",\"version\":1,\"params\":{s}}}\n", .{params}) catch return;
+    defer alloc.free(line);
+    const addr_str = std.fmt.allocPrint(alloc, "127.0.0.1:{d}", .{ctx.port}) catch return;
+    defer alloc.free(addr_str);
+    const addr = std.net.Address.parseIpAndPort(addr_str) catch {
+        writeJobFile(alloc, ctx, "{\"status\":\"error\",\"error\":\"connect\"}");
+        return;
+    };
+    const sock = posix.socket(addr.any.family, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP) catch {
+        writeJobFile(alloc, ctx, "{\"status\":\"error\",\"error\":\"connect\"}");
+        return;
+    };
+    defer posix.close(sock);
+    posix.connect(sock, &addr.any, addr.getOsSockLen()) catch {
+        writeJobFile(alloc, ctx, "{\"status\":\"error\",\"error\":\"connect\"}");
+        return;
+    };
+    writeAll(sock, line);
+    const resp = readAllAlloc(alloc, sock);
+    defer alloc.free(resp);
+    // resp is {"ok":true,"version":1,"result":...} -> store inner result
+    const trimmed = std.mem.trim(u8, resp, " \t\r\n");
+    var result_json: []const u8 = trimmed;
+    if (std.mem.indexOf(u8, trimmed, "\"result\":")) |ri| {
+        const start = ri + 9;
+        if (start < trimmed.len) result_json = trimmed[start .. trimmed.len - 1];
+    }
+    const out = std.fmt.allocPrint(alloc, "{{\"status\":\"done\",\"result\":{s}}}", .{result_json}) catch return;
+    defer alloc.free(out);
+    writeJobFile(alloc, ctx, out);
+}
+
+fn writeJobFile(alloc: std.mem.Allocator, ctx: *JobCtx, content: []const u8) void {
+    const jobs_dir = std.fs.path.join(alloc, &.{ ctx.data_root, "jobs" }) catch return;
+    defer alloc.free(jobs_dir);
+    std.fs.cwd().makePath(jobs_dir) catch return;
+    const fname = std.fmt.allocPrint(alloc, "{s}.json", .{ctx.job_id}) catch return;
+    defer alloc.free(fname);
+    const fpath = std.fs.path.join(alloc, &.{ jobs_dir, fname }) catch return;
+    defer alloc.free(fpath);
+    store.writeAtomic(fpath, content) catch {};
 }
 
 fn handleClient(conn: posix.fd_t) void {
@@ -1108,6 +1180,106 @@ fn handleClient(conn: posix.fd_t) void {
         const s = out.toOwnedSlice(alloc) catch return;
         defer alloc.free(s);
         resp = protocol.encodeOk(alloc, s) catch return;
+    } else if (std.mem.eql(u8, req.method, "groups.chat_add")) {
+        // Group chats: append chat id to group's chats[] array.
+        const group = getStr(req, "group") orelse getStr(req, "id") orelse {
+            resp = protocol.encodeErr(alloc, "bad_request") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        const chat_id = getStr(req, "chat") orelse getStr(req, "chat_id") orelse {
+            resp = protocol.encodeErr(alloc, "bad_request") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        if (!protocol.isSafeName(group) or !protocol.isSafeName(chat_id)) {
+            resp = protocol.encodeErr(alloc, "bad_name") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        }
+        const gdir = std.fs.path.join(alloc, &.{ udir, "groups" }) catch return;
+        defer alloc.free(gdir);
+        const gfname = std.fmt.allocPrint(alloc, "{s}.json", .{group}) catch return;
+        defer alloc.free(gfname);
+        const existing = crud.loadFile(alloc, gdir, gfname) catch {
+            resp = protocol.encodeErr(alloc, "not_found") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        defer alloc.free(existing);
+        const parsed = std.json.parseFromSlice(std.json.Value, alloc, existing, .{}) catch {
+            resp = protocol.encodeErr(alloc, "bad_card") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        var obj = if (parsed.value == .object) parsed.value.object else std.json.ObjectMap.init(alloc);
+        var chats_list: std.ArrayListUnmanaged(std.json.Value) = .empty;
+        defer chats_list.deinit(alloc);
+        if (obj.get("chats")) |c| {
+            if (c == .array) {
+                for (c.array.items) |it| chats_list.append(alloc, it) catch return;
+            }
+        }
+        chats_list.append(alloc, .{ .string = chat_id }) catch return;
+        const owned_items = chats_list.toOwnedSlice(alloc) catch return;
+        obj.put("chats", .{ .array = .{ .items = owned_items, .capacity = owned_items.len, .allocator = alloc } }) catch return;
+        const tmp_val: std.json.Value = .{ .object = obj };
+        const s = store.stringifyValue(alloc, tmp_val) catch return;
+        defer alloc.free(s);
+        const gpath = std.fs.path.join(alloc, &.{ gdir, gfname }) catch return;
+        defer alloc.free(gpath);
+        store.writeAtomic(gpath, s) catch {
+            resp = protocol.encodeErr(alloc, "io_error") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        resp = protocol.encodeOk(alloc, "{\"saved\":true}") catch return;
+    } else if (std.mem.eql(u8, req.method, "groups.chats")) {
+        const group = getStr(req, "group") orelse getStr(req, "id") orelse {
+            resp = protocol.encodeErr(alloc, "bad_request") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        if (!protocol.isSafeName(group)) {
+            resp = protocol.encodeErr(alloc, "bad_name") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        }
+        const gdir = std.fs.path.join(alloc, &.{ udir, "groups" }) catch return;
+        defer alloc.free(gdir);
+        const gfname = std.fmt.allocPrint(alloc, "{s}.json", .{group}) catch return;
+        defer alloc.free(gfname);
+        const existing = crud.loadFile(alloc, gdir, gfname) catch {
+            resp = protocol.encodeOk(alloc, "[]") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        defer alloc.free(existing);
+        const parsed = std.json.parseFromSlice(std.json.Value, alloc, existing, .{}) catch {
+            resp = protocol.encodeOk(alloc, "[]") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        var out: []u8 = alloc.dupe(u8, "[]") catch return;
+        defer alloc.free(out);
+        if (parsed.value == .object) {
+            if (parsed.value.object.get("chats")) |c| {
+                if (c == .array) {
+                    out = store.stringifyValue(alloc, c) catch return;
+                }
+            }
+        }
+        resp = protocol.encodeOk(alloc, out) catch return;
     } else if (std.mem.startsWith(u8, req.method, "presets.") or std.mem.startsWith(u8, req.method, "worldinfo.") or std.mem.startsWith(u8, req.method, "groups.") or std.mem.startsWith(u8, req.method, "themes.") or std.mem.startsWith(u8, req.method, "moving-ui.") or std.mem.startsWith(u8, req.method, "quick-replies.")) {
         const dot = std.mem.indexOfScalar(u8, req.method, '.') orelse {
             resp = protocol.encodeErr(alloc, "unknown_method") catch return;
@@ -2631,101 +2803,18 @@ fn handleClient(conn: posix.fd_t) void {
         defer alloc.free(inner);
         resp = protocol.encodeOk(alloc, inner) catch return;
     } else if (std.mem.eql(u8, req.method, "extensions.execute")) {
-        if (!allow_execute) {
-            resp = protocol.encodeErr(alloc, "execute_disabled") catch return;
-            defer alloc.free(resp);
-            _ = posix.write(conn, resp) catch {};
-            return;
-        }
-        // Execute JS via node subprocess (if available). Params: {code} or {name}
-        var code: []const u8 = getStr(req, "code") orelse "";
-        var code_owned: ?[]u8 = null;
-        if (code.len == 0) {
-            if (getStr(req, "name")) |nm| {
-                if (!protocol.isSafeName(nm)) {
-                    resp = protocol.encodeErr(alloc, "bad_name") catch return;
-                    defer alloc.free(resp);
-                    _ = posix.write(conn, resp) catch {};
-                    return;
-                }
-                const edir = std.fs.path.join(alloc, &.{ udir, "extensions" }) catch return;
-                defer alloc.free(edir);
-                code_owned = crud.loadFile(alloc, edir, nm) catch {
-                    resp = protocol.encodeErr(alloc, "not_found") catch return;
-                    defer alloc.free(resp);
-                    _ = posix.write(conn, resp) catch {};
-                    return;
-                };
-                code = code_owned.?;
-            }
-        }
-        if (code.len == 0) {
-            resp = protocol.encodeErr(alloc, "bad_request") catch return;
-            defer alloc.free(resp);
-            _ = posix.write(conn, resp) catch {};
-            return;
-        }
-        const result = std.process.Child.run(.{
-            .allocator = alloc,
-            .argv = &.{ "node", "-e", code },
-            .max_output_bytes = 1 << 20,
-        }) catch {
-            resp = protocol.encodeErr(alloc, "extension_runtime_unavailable") catch return;
-            defer alloc.free(resp);
-            _ = posix.write(conn, resp) catch {};
-            return;
-        };
-        defer alloc.free(result.stdout);
-        defer alloc.free(result.stderr);
-        const oq = protocol.jsonQuote(alloc, result.stdout) catch return;
-        defer alloc.free(oq);
-        const eq = protocol.jsonQuote(alloc, result.stderr) catch return;
-        defer alloc.free(eq);
-        const inner = std.fmt.allocPrint(alloc, "{{\"stdout\":{s},\"stderr\":{s},\"exit_code\":{d}}}", .{ oq, eq, result.term.Exited }) catch return;
-        defer alloc.free(inner);
-        resp = protocol.encodeOk(alloc, inner) catch return;
+        // Stage 3: extensions are never executed through Node/JS. Zig-native
+        // extensions are file-based + slash commands (slash.*). JS extensions
+        // from upstream are stored but not run (deliberate difference).
+        resp = protocol.encodeErr(alloc, "execute_disabled") catch return;
+        defer alloc.free(resp);
+        _ = posix.write(conn, resp) catch {};
+        return;
     } else if (std.mem.eql(u8, req.method, "extensions.execute_browser")) {
-        if (!allow_execute) {
-            resp = protocol.encodeErr(alloc, "execute_disabled") catch return;
-            defer alloc.free(resp);
-            _ = posix.write(conn, resp) catch {};
-            return;
-        }
-        // Browser-equivalent shim: document/window/SillyTavern stubs, slash-command registry.
-        const code = getStr(req, "code") orelse {
-            resp = protocol.encodeErr(alloc, "bad_request") catch return;
-            defer alloc.free(resp);
-            _ = posix.write(conn, resp) catch {};
-            return;
-        };
-        if (code.len == 0) {
-            resp = protocol.encodeErr(alloc, "bad_request") catch return;
-            defer alloc.free(resp);
-            _ = posix.write(conn, resp) catch {};
-            return;
-        }
-        const shim = "const __commands=[];const __mkEl=()=>({style:{},children:[],appendChild(c){this.children.push(c)},addEventListener(){},setAttribute(){},querySelector(){return null},querySelectorAll(){return []}});globalThis.document={createElement:()=>__mkEl(),querySelector:()=>null,querySelectorAll:()=>[],body:__mkEl(),addEventListener(){}};globalThis.window=globalThis;globalThis.SillyTavern={getContext:()=>({registerSlashCommand:(n,f)=>__commands.push(n),generate:m=>Promise.resolve({completion:'ok'})})};globalThis.registerSlashCommand=(n,f)=>__commands.push(n);globalThis.SlashCommandParser={addCommand:(n,f)=>__commands.push(n)};";
-        const wrapper = std.fmt.allocPrint(alloc, "{s}{s};console.log(JSON.stringify({{commands:__commands}}));", .{ shim, code }) catch return;
-        defer alloc.free(wrapper);
-        const result = std.process.Child.run(.{
-            .allocator = alloc,
-            .argv = &.{ "node", "-e", wrapper },
-            .max_output_bytes = 1 << 20,
-        }) catch {
-            resp = protocol.encodeErr(alloc, "extension_runtime_unavailable") catch return;
-            defer alloc.free(resp);
-            _ = posix.write(conn, resp) catch {};
-            return;
-        };
-        defer alloc.free(result.stdout);
-        defer alloc.free(result.stderr);
-        const oq = protocol.jsonQuote(alloc, result.stdout) catch return;
-        defer alloc.free(oq);
-        const eq = protocol.jsonQuote(alloc, result.stderr) catch return;
-        defer alloc.free(eq);
-        const inner = std.fmt.allocPrint(alloc, "{{\"stdout\":{s},\"stderr\":{s},\"exit_code\":{d}}}", .{ oq, eq, result.term.Exited }) catch return;
-        defer alloc.free(inner);
-        resp = protocol.encodeOk(alloc, inner) catch return;
+        resp = protocol.encodeErr(alloc, "execute_disabled") catch return;
+        defer alloc.free(resp);
+        _ = posix.write(conn, resp) catch {};
+        return;
     } else if (std.mem.startsWith(u8, req.method, "extensions.") or std.mem.startsWith(u8, req.method, "content-manager.")) {
         const dot = std.mem.indexOfScalar(u8, req.method, '.') orelse {
             resp = protocol.encodeErr(alloc, "unknown_method") catch return;
@@ -3684,6 +3773,107 @@ fn handleClient(conn: posix.fd_t) void {
         const inner = std.fmt.allocPrint(alloc, "{{\"text\":{s},\"provider\":\"{s}\",\"model\":\"{s}\",\"saved\":true,\"history\":{d},\"messages\":{s}}}", .{ tq, prov.name, model_name, history_count, arr }) catch return;
         defer alloc.free(inner);
         resp = protocol.encodeOk(alloc, inner) catch return;
+    } else if (std.mem.eql(u8, req.method, "chat.job_start")) {
+        // Start server-owned generation. Params: {params: {<chat.turn params>}} or flat chat.turn params.
+        const inner_params = getObjValue(req, "params") orelse req.params orelse {
+            resp = protocol.encodeErr(alloc, "bad_request") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        const params_json = store.stringifyValue(alloc, inner_params) catch return;
+        defer alloc.free(params_json);
+        var rand_bytes: [8]u8 = undefined;
+        std.crypto.random.bytes(&rand_bytes);
+        const job_id = std.fmt.allocPrint(alloc, "job-{d}-{x}", .{ std.time.milliTimestamp(), rand_bytes[0..4] }) catch return;
+        const page_alloc = std.heap.page_allocator;
+        const ctx = page_alloc.create(JobCtx) catch return;
+        ctx.* = .{
+            .job_id = page_alloc.dupe(u8, job_id) catch return,
+            .params_json = page_alloc.dupe(u8, params_json) catch return,
+            .port = port,
+            .token = page_alloc.dupe(u8, auth_token orelse "") catch return,
+            .data_root = page_alloc.dupe(u8, data_root) catch return,
+        };
+        alloc.free(job_id);
+        const th = std.Thread.spawn(.{}, jobThread, .{ctx}) catch {
+            resp = protocol.encodeErr(alloc, "io_error") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        th.detach();
+        const inner = std.fmt.allocPrint(alloc, "{{\"job_id\":\"{s}\",\"status\":\"running\"}}", .{ctx.job_id}) catch return;
+        defer alloc.free(inner);
+        resp = protocol.encodeOk(alloc, inner) catch return;
+    } else if (std.mem.eql(u8, req.method, "chat.job_status") or std.mem.eql(u8, req.method, "chat.job_result")) {
+        const job_id = getStr(req, "job_id") orelse getStr(req, "id") orelse {
+            resp = protocol.encodeErr(alloc, "bad_request") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        if (!protocol.isSafeName(job_id)) {
+            resp = protocol.encodeErr(alloc, "bad_name") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        }
+        const jobs_dir = std.fs.path.join(alloc, &.{ data_root, "jobs" }) catch return;
+        defer alloc.free(jobs_dir);
+        const fname = std.fmt.allocPrint(alloc, "{s}.json", .{job_id}) catch return;
+        defer alloc.free(fname);
+        const content = crud.loadFile(alloc, jobs_dir, fname) catch {
+            const inner = std.fmt.allocPrint(alloc, "{{\"job_id\":\"{s}\",\"status\":\"running\"}}", .{job_id}) catch return;
+            defer alloc.free(inner);
+            resp = protocol.encodeOk(alloc, inner) catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        defer alloc.free(content);
+        resp = protocol.encodeOk(alloc, content) catch return;
+    } else if (std.mem.eql(u8, req.method, "slash.exec")) {
+        // Zig-native slash commands (no JS execution). Built-ins only.
+        const cmd_raw = getStr(req, "command") orelse getStr(req, "name") orelse {
+            resp = protocol.encodeErr(alloc, "bad_request") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        const args = getStr(req, "args") orelse getStr(req, "text") orelse "";
+        const cmd = std.mem.trim(u8, cmd_raw, "/ ");
+        var result_text: []u8 = undefined;
+        if (std.mem.eql(u8, cmd, "echo")) {
+            result_text = alloc.dupe(u8, args) catch return;
+        } else if (std.mem.eql(u8, cmd, "upper")) {
+            result_text = alloc.alloc(u8, args.len) catch return;
+            for (args, 0..) |c, i| result_text[i] = std.ascii.toUpper(c);
+        } else if (std.mem.eql(u8, cmd, "time")) {
+            const ts = std.time.milliTimestamp();
+            result_text = std.fmt.allocPrint(alloc, "{d}", .{ts}) catch return;
+        } else if (std.mem.eql(u8, cmd, "roll")) {
+            const m = std.fmt.parseInt(i64, args, 10) catch 20;
+            var rb: [8]u8 = undefined;
+            std.crypto.random.bytes(&rb);
+            const v = std.mem.readInt(u64, &rb, .little);
+            result_text = std.fmt.allocPrint(alloc, "{d}", .{v % @as(u64, @intCast(m)) + 1}) catch return;
+        } else if (std.mem.eql(u8, cmd, "help")) {
+            result_text = alloc.dupe(u8, "commands: echo upper time roll (Zig-native; JS slash commands are not executed)") catch return;
+        } else {
+            resp = protocol.encodeErr(alloc, "unknown_command") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        }
+        defer alloc.free(result_text);
+        const tq = protocol.jsonQuote(alloc, result_text) catch return;
+        defer alloc.free(tq);
+        const inner = std.fmt.allocPrint(alloc, "{{\"command\":\"{s}\",\"result\":{s}}}", .{ cmd, tq }) catch return;
+        defer alloc.free(inner);
+        resp = protocol.encodeOk(alloc, inner) catch return;
+    } else if (std.mem.eql(u8, req.method, "slash.list")) {
+        resp = protocol.encodeOk(alloc, "{\"commands\":[\"echo\",\"upper\",\"time\",\"roll\",\"help\"]}") catch return;
     } else if (std.mem.eql(u8, req.method, "prompt.macros")) {
         resp = protocol.encodeOk(alloc, "{\"macros\":[\"char\",\"user\",\"time\",\"date\",\"weekday\",\"lastMessage\",\"lastUserMessage\",\"lastCharMessage\",\"space\",\"newline\",\"trim\",\"noop\",\"//\",\"random\",\"pick\",\"roll\",\"setvar\",\"getvar\",\"addvar\",\"incvar\",\"decvar\",\"hasvar\",\"deletevar\"],\"note\":\"Full upstream macro registry (26 definition sets) is larger; this is the implemented core subset. Unknown macros pass through unchanged.\"}") catch return;
     } else if (std.mem.eql(u8, req.method, "prompt.preview")) {

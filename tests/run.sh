@@ -372,6 +372,30 @@ echo "== prompt engine: worldinfo + author note + macros =="
 ./zig-out/bin/st-client --port $PORT prompt.preview '{"character":"Alice","chat":"turnchat","user_message":"I enter the tavern","worldinfo":"lore"}' | grep -q 'WI-ALWAYS' && echo PASS_WI_CONST
 ./zig-out/bin/st-client --port $PORT prompt.preview '{"character":"Alice","chat":"turnchat","user_message":"hi","author_note":"AN-TEXT","author_note_depth":1}' | grep -q 'AN-TEXT' && echo PASS_AN
 ./zig-out/bin/st-client --port $PORT prompt.macros | grep -q 'lastUserMessage' && echo PASS_MACROS
+echo "== stage3: version, slash, groups, jobs =="
+./zig-out/bin/st-client --port $PORT ping | grep -q '"version":1' && echo PASS_API_VERSION
+./zig-out/bin/st-client --port $PORT slash.exec '{"command":"/echo","args":"hello zig"}' | grep -q 'hello zig' && echo PASS_SLASH
+./zig-out/bin/st-client --port $PORT groups.save '{"name":"g1","value":{"name":"Party","members":["Alice"]}}' | grep -q '"saved"' && echo PASS
+./zig-out/bin/st-client --port $PORT groups.chat_add '{"group":"g1","chat":"chat1"}' | grep -q '"saved"' && echo PASS_GROUP_CHAT
+./zig-out/bin/st-client --port $PORT groups.chats '{"group":"g1"}' | grep -q 'chat1' && echo PASS_GROUPS
+./zig-out/bin/st-client --port $PORT extensions.execute '{"code":"console.log(1)"}' | grep -q 'execute_disabled' && echo PASS_NO_EXEC
+cat > $TMP/opencode/mock_job.py <<'PYEOF'
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import json
+class H(BaseHTTPRequestHandler):
+    def do_POST(self):
+        ln=int(self.headers.get('Content-Length',0)); self.rfile.read(ln)
+        out=b"data: "+json.dumps({"choices":[{"delta":{"content":"job-reply"}}]}).encode()+b"\n\ndata: [DONE]\n\n"
+        self.send_response(200); self.send_header('Content-Type','text/event-stream'); self.send_header('Content-Length',str(len(out))); self.end_headers(); self.wfile.write(out)
+    def log_message(self,*a): pass
+HTTPServer(('127.0.0.1',18142),H).handle_request()
+PYEOF
+python3 $TMP/opencode/mock_job.py > $TMP/opencode/job.log 2>&1 & echo $! > $TMP/opencode/job.pid
+sleep 1
+JOBID=$(./zig-out/bin/st-client --port $PORT chat.job_start '{"params":{"character":"Alice","chat":"jobchat","user_message":"hi","provider":"openai","model":"gpt-4","base_url":"http://127.0.0.1:18142","path":"/v1/chat/completions","api_key":"k"}}' | python3 -c "import json,sys; print(json.load(sys.stdin)['result']['job_id'])")
+sleep 2
+./zig-out/bin/st-client --port $PORT chat.job_result "{\"job_id\":\"$JOBID\"}" | grep -q 'job-reply' && echo PASS_JOB
+kill $(cat $TMP/opencode/job.pid) 2>/dev/null || true
 kill $(cat $TMP/opencode/turn.pid) 2>/dev/null || true
 if [ -n "${OPENROUTER_API_KEY:-}" ]; then
   ./zig-out/bin/st-client --port $PORT chat.turn '{"character":"Alice","chat":"realchat","user_message":"Reply with one short word.","provider":"openrouter","model":"openai/gpt-4o-mini"}' | grep -q '"saved":true' && echo PASS_TURN_REAL

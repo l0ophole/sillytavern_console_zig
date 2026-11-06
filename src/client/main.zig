@@ -67,7 +67,7 @@ fn sendRequest(alloc: std.mem.Allocator, host: []const u8, port: u16, method: []
     defer posix.close(sock);
     const mq = try protocol.jsonQuote(alloc, method);
     defer alloc.free(mq);
-    const req_line = try std.fmt.allocPrint(alloc, "{{\"method\":{s},\"params\":{s}}}\n", .{ mq, params });
+    const req_line = try std.fmt.allocPrint(alloc, "{{\"method\":{s},\"version\":1,\"params\":{s}}}\n", .{ mq, params });
     defer alloc.free(req_line);
     var off: usize = 0;
     while (off < req_line.len) {
