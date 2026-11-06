@@ -11,6 +11,7 @@ const zipm = @import("zipm");
 const providers_mod = @import("providers");
 const model_mod = @import("model");
 const onnx_mod = @import("onnx");
+const minilm_mod = @import("minilm");
 const posix = std.posix;
 
 var data_root: []const u8 = "data";
@@ -1511,6 +1512,76 @@ fn handleClient(conn: posix.fd_t) void {
             return;
         }
         resp = protocol.encodeOk(alloc, result.stdout) catch return;
+    } else if (std.mem.eql(u8, req.method, "vectors.pure_minilm")) {
+        const text = getStr(req, "text") orelse {
+            resp = protocol.encodeErr(alloc, "bad_request") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        const model_path = getStr(req, "model") orelse {
+            resp = protocol.encodeErr(alloc, "bad_request") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        const vocab_path = getStr(req, "vocab") orelse {
+            resp = protocol.encodeErr(alloc, "bad_request") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        var weights = minilm_mod.loadWeights(alloc, model_path) catch {
+            resp = protocol.encodeErr(alloc, "model_not_found") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        defer weights.deinit();
+        // Load vocab.txt
+        const vf = std.fs.cwd().openFile(vocab_path, .{}) catch {
+            resp = protocol.encodeErr(alloc, "model_not_found") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        defer vf.close();
+        const vcontent = vf.readToEndAlloc(alloc, 5 << 20) catch return;
+        defer alloc.free(vcontent);
+        var vocab = std.StringHashMap(u32).init(alloc);
+        defer vocab.deinit();
+        var vlines = std.mem.splitScalar(u8, vcontent, '\n');
+        var vid: u32 = 0;
+        while (vlines.next()) |line| {
+            if (line.len == 0) continue;
+            vocab.put(alloc.dupe(u8, line) catch return, vid) catch return;
+            vid += 1;
+        }
+        var ids: std.ArrayListUnmanaged(i64) = .empty;
+        defer ids.deinit(alloc);
+        minilm_mod.wordPieceTokenize(alloc, text, &vocab, &ids) catch return;
+        const vec = minilm_mod.embed(alloc, &weights, ids.items) catch {
+            resp = protocol.encodeErr(alloc, "model_failed") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        defer alloc.free(vec);
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        defer out.deinit(alloc);
+        out.append(alloc, '[') catch return;
+        for (vec, 0..) |v, idx| {
+            if (idx > 0) out.append(alloc, ',') catch return;
+            const vs = std.fmt.allocPrint(alloc, "{d}", .{v}) catch return;
+            defer alloc.free(vs);
+            out.appendSlice(alloc, vs) catch return;
+        }
+        out.append(alloc, ']') catch return;
+        const arr = out.toOwnedSlice(alloc) catch return;
+        defer alloc.free(arr);
+        const inner = std.fmt.allocPrint(alloc, "{{\"vector\":{s},\"pure_zig\":true,\"dim\":{d}}}", .{ arr, vec.len }) catch return;
+        defer alloc.free(inner);
+        resp = protocol.encodeOk(alloc, inner) catch return;
     } else if (std.mem.startsWith(u8, req.method, "vectors.")) {
         const dot = std.mem.indexOfScalar(u8, req.method, '.') orelse {
             resp = protocol.encodeErr(alloc, "unknown_method") catch return;

@@ -396,6 +396,7 @@ echo "== real neural MiniLM =="
 SNAP=$(echo ~/.cache/huggingface/hub/models--sentence-transformers--all-MiniLM-L6-v2/snapshots/1110a243fdf4706b3f48f1d95db1a4f5529b4d41)
 if [ -f "$SNAP/onnx/model.onnx" ]; then
   timeout 120 ./zig-out/bin/st-client --port $PORT vectors.neural_real "{\"text\":\"hello world\",\"model\":\"$SNAP/onnx/model.onnx\",\"vocab\":\"$SNAP/vocab.txt\"}" | grep -q "384" && echo PASS_MINILM || echo FAIL_MINILM
+  timeout 120 ./zig-out/bin/st-client --port $PORT vectors.pure_minilm "{\"text\":\"hello world\",\"model\":\"$SNAP/model.safetensors\",\"vocab\":\"$SNAP/vocab.txt\"}" | grep -q '"pure_zig":true' && echo PASS_PURE_MINILM || echo FAIL_PURE_MINILM
 else
   echo SKIP_NO_MINILM
 fi
