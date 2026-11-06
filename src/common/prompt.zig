@@ -17,6 +17,10 @@ pub const MacroCtx = struct {
     time_str: []const u8 = "", // HH:MM, empty = use current time
     date_str: []const u8 = "", // YYYY-MM-DD, empty = today
     weekday_str: []const u8 = "",
+    input: []const u8 = "",
+    max_prompt: u32 = 0,
+    max_context: u32 = 0,
+    max_response: u32 = 0,
     vars: std.StringHashMap([]const u8),
 };
 
@@ -73,6 +77,68 @@ pub fn expandMacros(alloc: std.mem.Allocator, text: []const u8, ctx: *MacroCtx) 
     errdefer out.deinit(alloc);
     var i: usize = 0;
     while (i < text.len) {
+        // Scoped conditional: {{if cond}}then{{else}}other{{/if}} (upstream core-macros)
+        if (i + 2 < text.len and text[i] == '{' and text[i + 1] == '{' and text[i + 2] == 'i') {
+            if (std.mem.indexOf(u8, text[i + 2 ..], "}}")) |rel| {
+                const inner = std.mem.trim(u8, text[i + 2 .. i + 2 + rel], " \t");
+                if (std.mem.startsWith(u8, inner, "if ") or std.mem.startsWith(u8, inner, "if\t")) {
+                    const cond = std.mem.trim(u8, inner[2..], " \t");
+                    const content_start = i + 2 + rel + 2;
+                    // Find matching {{/if}} with nesting
+                    var depth: usize = 1;
+                    var scan = content_start;
+                    var end_pos: ?usize = null;
+                    var else_pos: ?usize = null;
+                    while (scan < text.len) {
+                        if (std.mem.indexOf(u8, text[scan..], "{{")) |o| {
+                            const open = scan + o;
+                            if (std.mem.indexOf(u8, text[open + 2 ..], "}}")) |cl| {
+                                const in2 = std.mem.trim(u8, text[open + 2 .. open + 2 + cl], " \t");
+                                if (std.mem.startsWith(u8, in2, "if ") or std.mem.eql(u8, in2, "if")) depth += 1;
+                                if (std.mem.eql(u8, in2, "/if")) {
+                                    depth -= 1;
+                                    if (depth == 0) {
+                                        end_pos = open;
+                                        break;
+                                    }
+                                }
+                                if (depth == 1 and std.mem.eql(u8, in2, "else") and else_pos == null) else_pos = open;
+                                scan = open + 2 + cl + 2;
+                                continue;
+                            }
+                        }
+                        break;
+                    }
+                    if (end_pos) |ep| {
+                        const content_end = ep;
+                        var then_branch = text[content_start..content_end];
+                        var else_branch: []const u8 = "";
+                        if (else_pos) |elp| {
+                            then_branch = text[content_start..elp];
+                            const else_inner_end = std.mem.indexOf(u8, text[elp + 2 ..], "}}") orelse 0;
+                            else_branch = text[elp + 2 + else_inner_end + 2 .. content_end];
+                        }
+                        // Evaluate condition: resolve nested macros first
+                        const cond_expanded = expandMacros(alloc, cond, ctx) catch cond;
+                        defer if (cond_expanded.ptr != cond.ptr) alloc.free(cond_expanded);
+                        var c = std.mem.trim(u8, cond_expanded, " \t");
+                        var inverted = false;
+                        if (std.mem.startsWith(u8, c, "!")) {
+                            inverted = true;
+                            c = std.mem.trim(u8, c[1..], " \t");
+                        }
+                        const falsy = c.len == 0 or std.ascii.eqlIgnoreCase(c, "false") or std.ascii.eqlIgnoreCase(c, "off") or std.mem.eql(u8, c, "0");
+                        const truthy = if (inverted) falsy else !falsy;
+                        const chosen = if (truthy) then_branch else else_branch;
+                        const chosen_expanded = expandMacros(alloc, chosen, ctx) catch chosen;
+                        defer if (chosen_expanded.ptr != chosen.ptr) alloc.free(chosen_expanded);
+                        try out.appendSlice(alloc, std.mem.trim(u8, chosen_expanded, " \t"));
+                        i = ep + 5; // past {{/if}} (2+3)
+                        continue;
+                    }
+                }
+            }
+        }
         if (i + 1 < text.len and text[i] == '{' and text[i + 1] == '{') {
             if (std.mem.indexOf(u8, text[i + 2 ..], "}}")) |rel| {
                 const inner = std.mem.trim(u8, text[i + 2 .. i + 2 + rel], " \t");
@@ -194,6 +260,18 @@ fn expandOne(alloc: std.mem.Allocator, inner: []const u8, ctx: *MacroCtx) ?[]u8 
         _ = ctx.vars.remove(k);
         return alloc.dupe(u8, "") catch null;
     }
+    if (std.mem.eql(u8, n, "input")) return alloc.dupe(u8, ctx.input) catch null;
+    if (std.mem.eql(u8, n, "maxPrompt") or std.mem.eql(u8, n, "maxPromptTokens")) return std.fmt.allocPrint(alloc, "{d}", .{ctx.max_prompt}) catch null;
+    if (std.mem.eql(u8, n, "maxContext") or std.mem.eql(u8, n, "maxContextTokens")) return std.fmt.allocPrint(alloc, "{d}", .{ctx.max_context}) catch null;
+    if (std.mem.eql(u8, n, "maxResponse") or std.mem.eql(u8, n, "maxResponseTokens")) return std.fmt.allocPrint(alloc, "{d}", .{ctx.max_response}) catch null;
+    if (std.mem.eql(u8, n, "reverse")) {
+        const v = arg(args, 0);
+        var rev: std.ArrayListUnmanaged(u8) = .empty;
+        defer rev.deinit(alloc);
+        var k: usize = v.len;
+        while (k > 0) : (k -= 1) rev.append(alloc, v[k - 1]) catch return null;
+        return rev.toOwnedSlice(alloc) catch null;
+    }
     return null; // unknown macro: leave original text untouched
 }
 
@@ -219,6 +297,10 @@ pub fn worldInfoSelect(alloc: std.mem.Allocator, entries_json: []const u8, scan_
     defer alloc.free(scan_lower);
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(alloc);
+    // Grouping (upstream filterGroupsByScoring, simplified): only the first
+    // matched entry per group is included.
+    var seen_groups = std.StringHashMap(void).init(alloc);
+    defer seen_groups.deinit();
     // Two passes: constant (0) then normal (1); disabled (2) skipped.
     for ([_]u8{ 0, 1 }) |pass| {
         for (entries) |e| {
@@ -247,6 +329,12 @@ pub fn worldInfoSelect(alloc: std.mem.Allocator, entries_json: []const u8, scan_
                 }
             }
             if (!matched) continue;
+            if (e.object.get("group")) |gv| {
+                if (gv == .string and gv.string.len > 0) {
+                    if (seen_groups.contains(gv.string)) continue;
+                    try seen_groups.put(gv.string, {});
+                }
+            }
             if (out.items.len > 0) try out.append(alloc, '\n');
             try out.appendSlice(alloc, content);
         }
@@ -484,4 +572,29 @@ test "instruct template rendering" {
     const msgs = "[{\"role\":\"system\",\"content\":\"card\"},{\"role\":\"user\",\"content\":\"hi\"},{\"role\":\"assistant\",\"content\":\"hello\"}]";
     const out = try renderInstructTemplate(alloc, preset, msgs, "Alice");
     try std.testing.expectEqualStrings("SYS System: card\nUSER User: hi\nCHAR Alice: hello\n", out);
+}
+
+test "scoped if/else macros" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const vars = std.StringHashMap([]const u8).init(alloc);
+    var ctx = MacroCtx{ .char = "Alice", .vars = vars, .max_prompt = 8192, .input = "typed text" };
+    const out = try expandMacros(alloc, "{{if char}}has char{{else}}none{{/if}}|{{if !char}}no{{/if}}|{{input}}|{{maxPrompt}}|{{reverse::abc}}", &ctx);
+    // Note: reverse arg splits on :: so "abc" is arg0? Actually reverse uses args[0]="abc"
+    try std.testing.expect(std.mem.indexOf(u8, out, "has char") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "typed text") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "8192") != null);
+}
+
+test "worldinfo grouping" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const entries = "[{\"key\":[\"a\"],\"content\":\"A1\",\"disable\":false,\"constant\":false,\"group\":\"g\"},{\"key\":[\"a\"],\"content\":\"A2\",\"disable\":false,\"constant\":false,\"group\":\"g\"},{\"key\":[\"b\"],\"content\":\"B1\",\"disable\":false,\"constant\":false}]";
+    const out = try worldInfoSelect(alloc, entries, "a b");
+    // Only first entry per group included
+    try std.testing.expect(std.mem.indexOf(u8, out, "A1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "A2") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "B1") != null);
 }

@@ -734,7 +734,20 @@ fn jobThread(ctx: *JobCtx) void {
         return;
     };
     writeAll(sock, line);
-    const resp = readAllAlloc(alloc, sock);
+    // Stream pickup: write partial progress as chunks arrive so a reconnected
+    // client can poll job_status and see bytes received so far.
+    var resp_list: std.ArrayListUnmanaged(u8) = .empty;
+    defer resp_list.deinit(alloc);
+    var rchunk: [8192]u8 = undefined;
+    while (true) {
+        const rn = posix.read(sock, &rchunk) catch break;
+        if (rn == 0) break;
+        resp_list.appendSlice(alloc, rchunk[0..rn]) catch break;
+        const partial = std.fmt.allocPrint(alloc, "{{\"status\":\"running\",\"partial_bytes\":{d}}}", .{resp_list.items.len}) catch continue;
+        defer alloc.free(partial);
+        writeJobFile(alloc, ctx, partial);
+    }
+    const resp = resp_list.toOwnedSlice(alloc) catch return;
     defer alloc.free(resp);
     // resp is {"ok":true,"version":1,"result":...} -> store inner result
     const trimmed = std.mem.trim(u8, resp, " \t\r\n");
