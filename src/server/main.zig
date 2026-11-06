@@ -5,6 +5,7 @@ const crud = @import("crud");
 const tokenizer = @import("tokenizer");
 const backend = @import("backend");
 const png = @import("png");
+const users_mod = @import("users");
 const posix = std.posix;
 
 var data_root: []const u8 = "data";
@@ -838,6 +839,152 @@ fn handleClient(conn: posix.fd_t) void {
         const inner = std.fmt.allocPrint(alloc, "{{\"format\":\"{s}\",\"width\":{d},\"height\":{d},\"bytes\":{d}}}", .{ fmt, w, h, raw.len }) catch return;
         defer alloc.free(inner);
         resp = protocol.encodeOk(alloc, inner) catch return;
+    } else if (std.mem.startsWith(u8, req.method, "users.") or std.mem.startsWith(u8, req.method, "users-admin.") or std.mem.startsWith(u8, req.method, "users-private.") or std.mem.startsWith(u8, req.method, "users-public.")) {
+        const dot = std.mem.indexOfScalar(u8, req.method, '.') orelse {
+            resp = protocol.encodeErr(alloc, "unknown_method") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        const action = req.method[dot + 1 ..];
+        const upath = std.fs.path.join(alloc, &.{ data_root, "users.json" }) catch return;
+        defer alloc.free(upath);
+        var umap = std.json.ObjectMap.init(alloc);
+        if (store.readFileAlloc(alloc, upath)) |existing| {
+            if (std.json.parseFromSlice(std.json.Value, alloc, existing, .{})) |parsed| {
+                if (parsed.value == .object) umap = parsed.value.object;
+            } else |_| {}
+        } else |_| {}
+        if (std.mem.eql(u8, action, "create")) {
+            const handle_s = getStr(req, "handle") orelse {
+                resp = protocol.encodeErr(alloc, "bad_request") catch return;
+                defer alloc.free(resp);
+                _ = posix.write(conn, resp) catch {};
+                return;
+            };
+            const pw = getStr(req, "password") orelse {
+                resp = protocol.encodeErr(alloc, "bad_request") catch return;
+                defer alloc.free(resp);
+                _ = posix.write(conn, resp) catch {};
+                return;
+            };
+            if (!protocol.isSafeName(handle_s)) {
+                resp = protocol.encodeErr(alloc, "bad_name") catch return;
+                defer alloc.free(resp);
+                _ = posix.write(conn, resp) catch {};
+                return;
+            }
+            const h = users_mod.hashPassword(alloc, pw) catch return;
+            defer alloc.free(h);
+            const nm = getStr(req, "name") orelse handle_s;
+            var inner = std.json.ObjectMap.init(alloc);
+            inner.put("name", .{ .string = nm }) catch return;
+            inner.put("password_hash", .{ .string = h }) catch return;
+            var is_admin = false;
+            if (getObjValue(req, "admin")) |av| {
+                if (av == .bool) is_admin = av.bool;
+            }
+            inner.put("admin", .{ .bool = is_admin }) catch return;
+            umap.put(handle_s, .{ .object = inner }) catch return;
+            const uv: std.json.Value = .{ .object = umap };
+            const s = store.stringifyValue(alloc, uv) catch return;
+            defer alloc.free(s);
+            store.writeAtomic(upath, s) catch {
+                resp = protocol.encodeErr(alloc, "io_error") catch return;
+                defer alloc.free(resp);
+                _ = posix.write(conn, resp) catch {};
+                return;
+            };
+            // Ensure user data dir exists
+            const ndir = std.fs.path.join(alloc, &.{ data_root, handle_s }) catch return;
+            defer alloc.free(ndir);
+            store.ensureUserDirs(ndir) catch {};
+            resp = protocol.encodeOk(alloc, "{\"saved\":true}") catch return;
+        } else if (std.mem.eql(u8, action, "list")) {
+            var out: std.ArrayListUnmanaged(u8) = .empty;
+            defer out.deinit(alloc);
+            out.append(alloc, '[') catch return;
+            var it = umap.iterator();
+            var first = true;
+            while (it.next()) |kv| {
+                if (!first) out.append(alloc, ',') catch return;
+                first = false;
+                const q = protocol.jsonQuote(alloc, kv.key_ptr.*) catch return;
+                defer alloc.free(q);
+                out.appendSlice(alloc, q) catch return;
+            }
+            out.append(alloc, ']') catch return;
+            const s = out.toOwnedSlice(alloc) catch return;
+            defer alloc.free(s);
+            resp = protocol.encodeOk(alloc, s) catch return;
+        } else if (std.mem.eql(u8, action, "delete")) {
+            const handle_s = getStr(req, "handle") orelse {
+                resp = protocol.encodeErr(alloc, "bad_request") catch return;
+                defer alloc.free(resp);
+                _ = posix.write(conn, resp) catch {};
+                return;
+            };
+            _ = umap.orderedRemove(handle_s);
+            const uv: std.json.Value = .{ .object = umap };
+            const s = store.stringifyValue(alloc, uv) catch return;
+            defer alloc.free(s);
+            store.writeAtomic(upath, s) catch {
+                resp = protocol.encodeErr(alloc, "io_error") catch return;
+                defer alloc.free(resp);
+                _ = posix.write(conn, resp) catch {};
+                return;
+            };
+            resp = protocol.encodeOk(alloc, "{\"deleted\":true}") catch return;
+        } else if (std.mem.eql(u8, action, "login")) {
+            const handle_s = getStr(req, "handle") orelse {
+                resp = protocol.encodeErr(alloc, "bad_request") catch return;
+                defer alloc.free(resp);
+                _ = posix.write(conn, resp) catch {};
+                return;
+            };
+            const pw = getStr(req, "password") orelse {
+                resp = protocol.encodeErr(alloc, "bad_request") catch return;
+                defer alloc.free(resp);
+                _ = posix.write(conn, resp) catch {};
+                return;
+            };
+            const entry = umap.get(handle_s) orelse {
+                resp = protocol.encodeErr(alloc, "bad_credentials") catch return;
+                defer alloc.free(resp);
+                _ = posix.write(conn, resp) catch {};
+                return;
+            };
+            if (entry != .object) {
+                resp = protocol.encodeErr(alloc, "bad_credentials") catch return;
+                defer alloc.free(resp);
+                _ = posix.write(conn, resp) catch {};
+                return;
+            }
+            const stored = entry.object.get("password_hash") orelse {
+                resp = protocol.encodeErr(alloc, "bad_credentials") catch return;
+                defer alloc.free(resp);
+                _ = posix.write(conn, resp) catch {};
+                return;
+            };
+            if (stored != .string) {
+                resp = protocol.encodeErr(alloc, "bad_credentials") catch return;
+                defer alloc.free(resp);
+                _ = posix.write(conn, resp) catch {};
+                return;
+            }
+            const ok = users_mod.verifyPassword(alloc, pw, stored.string) catch false;
+            if (!ok) {
+                resp = protocol.encodeErr(alloc, "bad_credentials") catch return;
+                defer alloc.free(resp);
+                _ = posix.write(conn, resp) catch {};
+                return;
+            }
+            const inner = std.fmt.allocPrint(alloc, "{{\"token\":\"{s}\",\"handle\":\"{s}\"}}", .{ stored.string, handle_s }) catch return;
+            defer alloc.free(inner);
+            resp = protocol.encodeOk(alloc, inner) catch return;
+        } else {
+            resp = protocol.encodeErr(alloc, "unknown_method") catch return;
+        }
     } else if (std.mem.eql(u8, req.method, "ping")) {
         resp = protocol.encodeOk(alloc, "{\"pong\":true,\"version\":\"" ++ protocol.VERSION ++ "\"}") catch return;
     } else if (std.mem.eql(u8, req.method, "version")) {

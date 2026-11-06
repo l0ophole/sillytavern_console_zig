@@ -13,6 +13,7 @@ pub fn build(b: *std.Build) void {
     const tokenizer = b.addModule("tokenizer", .{ .root_source_file = b.path("src/common/tokenizer.zig") });
     const backend = b.addModule("backend", .{ .root_source_file = b.path("src/common/backend.zig") });
     const png = b.addModule("png", .{ .root_source_file = b.path("src/common/png.zig") });
+    const users = b.addModule("users", .{ .root_source_file = b.path("src/common/users.zig") });
 
     const server_mod = b.createModule(.{ .root_source_file = b.path("src/server/main.zig"), .target = target, .optimize = optimize });
     server_mod.addImport("common", common);
@@ -21,6 +22,7 @@ pub fn build(b: *std.Build) void {
     server_mod.addImport("tokenizer", tokenizer);
     server_mod.addImport("backend", backend);
     server_mod.addImport("png", png);
+    server_mod.addImport("users", users);
     const server = b.addExecutable(.{ .name = "st-server", .root_module = server_mod });
     b.installArtifact(server);
 
@@ -54,6 +56,8 @@ pub fn build(b: *std.Build) void {
     const be_tests = b.addTest(.{ .root_module = be_test_mod });
     const png_test_mod = b.createModule(.{ .root_source_file = b.path("src/common/png.zig"), .target = target, .optimize = optimize });
     const png_tests = b.addTest(.{ .root_module = png_test_mod });
+    const users_test_mod = b.createModule(.{ .root_source_file = b.path("src/common/users.zig"), .target = target, .optimize = optimize });
+    const users_tests = b.addTest(.{ .root_module = users_test_mod });
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&b.addRunArtifact(unit_tests).step);
     test_step.dependOn(&b.addRunArtifact(store_tests).step);
@@ -61,4 +65,5 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(tok_tests).step);
     test_step.dependOn(&b.addRunArtifact(be_tests).step);
     test_step.dependOn(&b.addRunArtifact(png_tests).step);
+    test_step.dependOn(&b.addRunArtifact(users_tests).step);
 }
