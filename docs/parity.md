@@ -13,8 +13,8 @@ Status legend: DONE = implemented in Zig + tested (`zig build test` / `tests/run
 | worldinfo | `worldinfo.list/save/load/delete` | DONE Task 5 |
 | secrets | `secrets.set/get(list masked)` | DONE Task 6 |
 | groups | `groups.list/save/delete` | DONE Task 6 |
-| themes / moving-ui / quick-replies | `themes.*` generic | DONE Task 6 (themes) |
-| backgrounds / avatars / sprites / images / thumbnails / files / assets / backups / data-maid | `backups.create/list` | DONE Task 8 (backups; binary files TODO) |
+| themes / moving-ui / quick-replies | `themes.*`/`moving-ui.*`/`quick-replies.*` | DONE |
+| backgrounds / avatars / sprites / images / thumbnails / files / assets / backups / data-maid | `files.*`/`backgrounds.*`/`avatars.*`/`sprites.*`/`images.*`/`assets.*`/`thumbnails.*`/`data-maid.scan`/`backups.*` | DONE |
 | stats | `stats.summary` | DONE Task 8 |
 | tokenizers | `tokenizer.estimate` (chars/4 heuristic; tiktoken TODO) | DONE Task 7 (estimate) |
 | backends/chat-completions, openai, anthropic, google, azure, openrouter, novelai, horde, kobold, text-completions | `backend.chat` (OpenAI-compatible HTTP proxy; native SDKs TODO) | DONE Task 7 (HTTP proxy) |

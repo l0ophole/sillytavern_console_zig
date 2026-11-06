@@ -73,6 +73,73 @@ fn genericCollection(alloc: std.mem.Allocator, udir: []const u8, subdir: []const
     return protocol.encodeErr(alloc, "unknown_method");
 }
 
+// Generic text/binary file handler for files/backgrounds/avatars/sprites/images/assets/thumbnails.
+fn genericFiles(alloc: std.mem.Allocator, udir: []const u8, subdir: []const u8, action: []const u8, req: protocol.Request) ![]u8 {
+    const dir = try std.fs.path.join(alloc, &.{ udir, subdir });
+    defer alloc.free(dir);
+    std.fs.cwd().makePath(dir) catch {};
+    if (std.mem.eql(u8, action, "list")) {
+        const names = crud.listNames(alloc, dir) catch return protocol.encodeOk(alloc, "[]");
+        defer { for (names) |nm| alloc.free(nm); alloc.free(names); }
+        const arr = try crud.jsonArrayOfNames(alloc, names);
+        defer alloc.free(arr);
+        return protocol.encodeOk(alloc, arr);
+    } else if (std.mem.eql(u8, action, "save") or std.mem.eql(u8, action, "upload") or std.mem.eql(u8, action, "create")) {
+        const name = getStr(req, "name") orelse return protocol.encodeErr(alloc, "bad_request");
+        if (!protocol.isSafeName(name)) return protocol.encodeErr(alloc, "bad_name");
+        const content = getStr(req, "content") orelse getStr(req, "data") orelse return protocol.encodeErr(alloc, "bad_request");
+        const path = try std.fs.path.join(alloc, &.{ dir, name });
+        defer alloc.free(path);
+        try store.writeAtomic(path, content);
+        return protocol.encodeOk(alloc, "{\"saved\":true}");
+    } else if (std.mem.eql(u8, action, "get") or std.mem.eql(u8, action, "load")) {
+        const name = getStr(req, "name") orelse return protocol.encodeErr(alloc, "bad_request");
+        if (!protocol.isSafeName(name)) return protocol.encodeErr(alloc, "bad_name");
+        const content = crud.loadFile(alloc, dir, name) catch return protocol.encodeErr(alloc, "not_found");
+        defer alloc.free(content);
+        const q = try protocol.jsonQuote(alloc, content);
+        defer alloc.free(q);
+        const inner = try std.fmt.allocPrint(alloc, "{{\"content\":{s}}}", .{q});
+        defer alloc.free(inner);
+        return protocol.encodeOk(alloc, inner);
+    } else if (std.mem.eql(u8, action, "delete")) {
+        const name = getStr(req, "name") orelse return protocol.encodeErr(alloc, "bad_request");
+        if (!protocol.isSafeName(name)) return protocol.encodeErr(alloc, "bad_name");
+        crud.deleteFile(alloc, dir, name) catch return protocol.encodeErr(alloc, "not_found");
+        return protocol.encodeOk(alloc, "{\"deleted\":true}");
+    } else if (std.mem.eql(u8, action, "verify")) {
+        // verify {urls:[...]} -> {url:exists}
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        defer out.deinit(alloc);
+        try out.append(alloc, '{');
+        if (getObjValue(req, "urls")) |uv| {
+            if (uv == .array) {
+                for (uv.array.items, 0..) |item, idx| {
+                    if (idx > 0) try out.append(alloc, ',');
+                    if (item == .string) {
+                        const exists = blk: {
+                            const p = std.fs.path.join(alloc, &.{ dir, item.string }) catch break :blk false;
+                            defer alloc.free(p);
+                            std.fs.cwd().access(p, .{}) catch break :blk false;
+                            break :blk true;
+                        };
+                        const kq = try protocol.jsonQuote(alloc, item.string);
+                        defer alloc.free(kq);
+                        try out.appendSlice(alloc, kq);
+                        try out.append(alloc, ':');
+                        try out.appendSlice(alloc, if (exists) "true" else "false");
+                    }
+                }
+            }
+        }
+        try out.append(alloc, '}');
+        const s = try out.toOwnedSlice(alloc);
+        defer alloc.free(s);
+        return protocol.encodeOk(alloc, s);
+    }
+    return protocol.encodeErr(alloc, "unknown_method");
+}
+
 fn readLine(stream: posix.fd_t, buf: []u8) !usize {
     var n: usize = 0;
     while (n < buf.len) {
@@ -377,7 +444,55 @@ fn handleClient(conn: posix.fd_t) void {
             return;
         };
         resp = protocol.encodeOk(alloc, "{\"deleted\":true}") catch return;
-    } else if (std.mem.startsWith(u8, req.method, "presets.") or std.mem.startsWith(u8, req.method, "worldinfo.") or std.mem.startsWith(u8, req.method, "groups.") or std.mem.startsWith(u8, req.method, "themes.")) {
+    } else if (std.mem.startsWith(u8, req.method, "files.") or std.mem.startsWith(u8, req.method, "backgrounds.") or std.mem.startsWith(u8, req.method, "avatars.") or std.mem.startsWith(u8, req.method, "sprites.") or std.mem.startsWith(u8, req.method, "images.") or std.mem.startsWith(u8, req.method, "assets.") or std.mem.startsWith(u8, req.method, "thumbnails.")) {
+        const dot = std.mem.indexOfScalar(u8, req.method, '.') orelse {
+            resp = protocol.encodeErr(alloc, "unknown_method") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        const prefix = req.method[0..dot];
+        const action = req.method[dot + 1 ..];
+        resp = genericFiles(alloc, udir, prefix, action, req) catch {
+            resp = protocol.encodeErr(alloc, "io_error") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+    } else if (std.mem.eql(u8, req.method, "data-maid.scan")) {
+        // Walk one level under user dir, return file count per subdir.
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        defer out.deinit(alloc);
+        out.append(alloc, '{') catch return;
+        var first = true;
+        var root = std.fs.cwd().openDir(udir, .{ .iterate = true }) catch {
+            resp = protocol.encodeOk(alloc, "{}") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        defer root.close();
+        var it = root.iterate();
+        while (it.next() catch null) |e| {
+            if (e.kind != .directory) continue;
+            const sub = std.fs.path.join(alloc, &.{ udir, e.name }) catch continue;
+            defer alloc.free(sub);
+            const names = crud.listNames(alloc, sub) catch &[_][]u8{};
+            if (!first) out.append(alloc, ',') catch return;
+            first = false;
+            const kq = protocol.jsonQuote(alloc, e.name) catch return;
+            defer alloc.free(kq);
+            out.appendSlice(alloc, kq) catch return;
+            out.append(alloc, ':') catch return;
+            const cs = std.fmt.allocPrint(alloc, "{d}", .{names.len}) catch return;
+            defer alloc.free(cs);
+            out.appendSlice(alloc, cs) catch return;
+        }
+        out.append(alloc, '}') catch return;
+        const s = out.toOwnedSlice(alloc) catch return;
+        defer alloc.free(s);
+        resp = protocol.encodeOk(alloc, s) catch return;
+    } else if (std.mem.startsWith(u8, req.method, "presets.") or std.mem.startsWith(u8, req.method, "worldinfo.") or std.mem.startsWith(u8, req.method, "groups.") or std.mem.startsWith(u8, req.method, "themes.") or std.mem.startsWith(u8, req.method, "moving-ui.") or std.mem.startsWith(u8, req.method, "quick-replies.")) {
         const dot = std.mem.indexOfScalar(u8, req.method, '.') orelse {
             resp = protocol.encodeErr(alloc, "unknown_method") catch return;
             defer alloc.free(resp);
@@ -391,6 +506,8 @@ fn handleClient(conn: posix.fd_t) void {
         if (std.mem.eql(u8, prefix, "worldinfo")) subdir = "worldinfo";
         if (std.mem.eql(u8, prefix, "groups")) subdir = "groups";
         if (std.mem.eql(u8, prefix, "themes")) subdir = "themes";
+        if (std.mem.eql(u8, prefix, "moving-ui")) subdir = "moving-ui";
+        if (std.mem.eql(u8, prefix, "quick-replies")) subdir = "quick-replies";
         resp = genericCollection(alloc, udir, subdir, action, req) catch {
             resp = protocol.encodeErr(alloc, "io_error") catch return;
             defer alloc.free(resp);

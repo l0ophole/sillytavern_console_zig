@@ -9,7 +9,7 @@ pub fn userDir(alloc: std.mem.Allocator, data_root: []const u8, user: []const u8
 pub fn ensureUserDirs(dir_path: []const u8) !void {
     const cwd = std.fs.cwd();
     try cwd.makePath(dir_path);
-    const subs = [_][]const u8{ "characters", "chats", "presets", "worldinfo", "groups", "themes", "backups", "backgrounds", "avatars" };
+    const subs = [_][]const u8{ "characters", "chats", "presets", "worldinfo", "groups", "themes", "backups", "backgrounds", "avatars", "files", "assets", "sprites", "images", "thumbnails", "extensions", "vectors", "moving-ui", "quick-replies" };
     for (subs) |s| {
         const p = try std.fs.path.join(std.heap.page_allocator, &.{ dir_path, s });
         defer std.heap.page_allocator.free(p);
