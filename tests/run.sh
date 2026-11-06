@@ -136,10 +136,21 @@ python3 -c "import json; m={'input_dim':32,'hidden_dim':4,'output_dim':2,'W1':[0
 echo "== browser extension runtime =="
 ./zig-out/bin/st-client --port $PORT extensions.execute_browser '{"code":"registerSlashCommand(\"hello\", ()=>{});"}' | grep -q 'hello' && echo PASS
 echo "== native provider =="
-python3 -c "import json; from http.server import BaseHTTPRequestHandler,HTTPServer; H=type('H',(BaseHTTPRequestHandler,),{'do_POST':lambda s: (s.send_response(200), s.send_header('Content-Type','application/json'), s.end_headers(), s.wfile.write(json.dumps({'content':[{'text':'mocked'}]}).encode())) if not s.headers.get('Content-Length') else None,'log_message':lambda s,*a: None}); HTTPServer(('127.0.0.1',18121),H).handle_request()" > /rpf/tmp/opencode/mock2.log 2>&1 & echo $! > /tmp/mock2.pid
+cat > /rpf/tmp/opencode/mock_anthropic2.py <<'PYEOF'
+import json
+from http.server import BaseHTTPRequestHandler, HTTPServer
+class H(BaseHTTPRequestHandler):
+    def do_POST(self):
+        ln=int(self.headers.get('Content-Length',0)); self.rfile.read(ln)
+        data=json.dumps({"content":[{"text":"mocked"}]}).encode()
+        self.send_response(200); self.send_header('Content-Type','application/json'); self.send_header('Content-Length',str(len(data))); self.end_headers(); self.wfile.write(data)
+    def log_message(self,*a): pass
+HTTPServer(('127.0.0.1',18121),H).handle_request()
+PYEOF
+python3 /rpf/tmp/opencode/mock_anthropic2.py > /rpf/tmp/opencode/mock2.log 2>&1 & echo $! > /rpf/tmp/opencode/mock2.pid
 sleep 1
 ./zig-out/bin/st-client --port $PORT backend.native '{"provider":"anthropic","model":"claude-3","api_key":"k","base_url":"http://127.0.0.1:18121","path":"/v1/messages","messages":[{"role":"user","content":"hi"}]}' | grep -q 'mocked' && echo PASS || echo FAIL_NATIVE
-kill $(cat /tmp/mock2.pid) 2>/dev/null || true
+kill $(cat /rpf/tmp/opencode/mock2.pid) 2>/dev/null || true
 echo "== bad method =="
 ./zig-out/bin/st-client --port $PORT nope | grep -q '"ok":false' && echo PASS
 cat "$TMP/server.log"
