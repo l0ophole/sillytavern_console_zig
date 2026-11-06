@@ -201,6 +201,37 @@ pub const OnnxModel = struct {
                     }
                 }
                 try env.put(node.outputs[0], out);
+            } else if (std.mem.eql(u8, node.op, "Gelu")) {
+                const a = env.get(node.inputs[0]) orelse return error.MissingInput;
+                const out = try alloc.alloc(f32, a.len);
+                for (a, 0..) |v, i| out[i] = 0.5 * v * (1 + std.math.tanh(@sqrt(2.0 / std.math.pi) * (v + 0.044715 * v * v * v)));
+                try env.put(node.outputs[0], out);
+            } else if (std.mem.eql(u8, node.op, "Split")) {
+                const a = env.get(node.inputs[0]) orelse return error.MissingInput;
+                // Equal split across outputs
+                const n = node.outputs.len;
+                const chunk = a.len / n;
+                for (0..n) |oi| {
+                    const slice = a[oi * chunk .. @min(a.len, (oi + 1) * chunk)];
+                    try env.put(node.outputs[oi], try alloc.dupe(f32, slice));
+                }
+            } else if (std.mem.eql(u8, node.op, "Concat")) {
+                var total: usize = 0;
+                for (node.inputs) |inp| {
+                    const t = self.tensors.get(inp) orelse return error.MissingWeight;
+                    total += t.data.len;
+                }
+                const out = try alloc.alloc(f32, total);
+                var off: usize = 0;
+                for (node.inputs) |inp| {
+                    const t = self.tensors.get(inp) orelse return error.MissingWeight;
+                    @memcpy(out[off .. off + t.data.len], t.data);
+                    off += t.data.len;
+                }
+                try env.put(node.outputs[0], out);
+            } else if (std.mem.eql(u8, node.op, "Unsqueeze") or std.mem.eql(u8, node.op, "Squeeze")) {
+                const a = env.get(node.inputs[0]) orelse return error.MissingInput;
+                try env.put(node.outputs[0], try alloc.dupe(f32, a));
             } else if (std.mem.eql(u8, node.op, "Softmax")) {
                 const a = env.get(node.inputs[0]) orelse return error.MissingInput;
                 const out = try alloc.alloc(f32, a.len);
@@ -570,6 +601,36 @@ test "onnx attention identity" {
     // token0 attends mostly to K0 (dot 1 vs 0) -> out near 10; token1 (0,0) uniform -> 15
     try std.testing.expect(out[0] > 10 and out[0] < 15);
     try std.testing.expectApproxEqAbs(@as(f32, 15), out[1], 1e-4);
+}
+
+test "onnx gelu" {
+    const alloc = std.testing.allocator;
+    const tensors = std.StringHashMap(Tensor).init(alloc);
+    var model = OnnxModel{
+        .tensors = tensors,
+        .nodes = try alloc.dupe(Node, &[_]Node{
+            .{ .op = try alloc.dupe(u8, "Gelu"), .inputs = try alloc.dupe([]u8, &[_][]u8{try alloc.dupe(u8, "X")}), .outputs = try alloc.dupe([]u8, &[_][]u8{try alloc.dupe(u8, "Y")}) },
+        }),
+        .input_name = try alloc.dupe(u8, "X"),
+        .output_name = try alloc.dupe(u8, "Y"),
+        .alloc = alloc,
+    };
+    const out = try model.run(alloc, &[_]f32{ 0, 1, -1 });
+    defer alloc.free(out);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), out[0], 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.84119), out[1], 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, -0.15881), out[2], 1e-4);
+    for (model.nodes) |n| {
+        alloc.free(n.op);
+        for (n.inputs) |i| alloc.free(i);
+        alloc.free(n.inputs);
+        for (n.outputs) |o| alloc.free(o);
+        alloc.free(n.outputs);
+    }
+    alloc.free(model.nodes);
+    alloc.free(model.input_name);
+    alloc.free(model.output_name);
+    model.tensors.deinit();
 }
 
 test "onnx varint" {
