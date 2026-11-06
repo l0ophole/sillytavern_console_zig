@@ -16,7 +16,7 @@ Status legend: DONE = implemented in Zig + tested (`zig build test` / `tests/run
 | themes / moving-ui / quick-replies | `themes.*`/`moving-ui.*`/`quick-replies.*` | DONE |
 | backgrounds / avatars / sprites / images / thumbnails / files / assets / backups / data-maid | `files.*`/`backgrounds.*`/`avatars.*`/`sprites.*`/`images.*`/`assets.*`/`thumbnails.*`/`data-maid.scan`/`backups.*` | DONE |
 | stats | `stats.summary` | DONE Task 8 |
-| tokenizers | `tokenizer.estimate` + `tokenizer.encode` (tiktoken cl100k/p50k/r50k, HF llama3.json, sentencepiece .model mistral/gemma verified vs JS reference) | DONE |
+| tokenizers | `tokenizer.estimate` + `tokenizer.encode` (tiktoken cl100k/p50k/r50k, HF llama3.json, sentencepiece .model mistral/gemma/llama verified vs JS reference) | DONE |
 | backends/chat-completions, openai, anthropic, google, azure, openrouter, novelai, horde, kobold, text-completions | `backend.chat`/`backend.fetch` + `backend.provider` + `backend.native` + `chat.generate_and_save` (end-to-end SDK flow with chat persistence) | DONE |
 | image-metadata | `image-metadata.get/detect` | DONE |
 | users-admin/users-private/users-public | `users.*` create/list/delete/login/validate/logout (Sha256 + session tokens, 24h) | DONE |

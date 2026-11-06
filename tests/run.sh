@@ -501,6 +501,12 @@ o=json.load(open('/rpf/tmp/opencode/ort_ref.json'))['ort'][0]
 assert abs(z[0]-o[0])<1e-4 and abs(z[1]-o[1])<1e-4, (z,o)
 print("ORT_EQUIV_2LAYER_PASS")
 PYEOF
+echo "== llama .model tokenizer =="
+if [ -f ../SillyTavern/src/tokenizers/llama.model ]; then
+  ./zig-out/bin/st-client --port $PORT tokenizer.encode '{"text":"hello world","vocab":"../SillyTavern/src/tokenizers/llama.model"}' | grep -q '22172,3186' && echo PASS_LLAMA_MODEL || echo FAIL_LLAMA_MODEL
+else
+  echo SKIP_NO_LLAMA_MODEL
+fi
 echo "== bad method =="
 ./zig-out/bin/st-client --port $PORT nope | grep -q '"ok":false' && echo PASS
 cat "$TMP/server.log"
