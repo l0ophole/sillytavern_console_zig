@@ -1188,6 +1188,114 @@ fn handleClient(conn: posix.fd_t) void {
         const s = out.toOwnedSlice(alloc) catch return;
         defer alloc.free(s);
         resp = protocol.encodeOk(alloc, s) catch return;
+    } else if (std.mem.startsWith(u8, req.method, "speech.") or std.mem.startsWith(u8, req.method, "caption.") or std.mem.startsWith(u8, req.method, "classify.") or std.mem.startsWith(u8, req.method, "translate.") or std.mem.startsWith(u8, req.method, "stable-diffusion.") or std.mem.startsWith(u8, req.method, "openai.") or std.mem.startsWith(u8, req.method, "anthropic.") or std.mem.startsWith(u8, req.method, "google.") or std.mem.startsWith(u8, req.method, "azure.") or std.mem.startsWith(u8, req.method, "openrouter.") or std.mem.startsWith(u8, req.method, "novelai.") or std.mem.startsWith(u8, req.method, "horde.") or std.mem.startsWith(u8, req.method, "minimax.") or std.mem.startsWith(u8, req.method, "volcengine.") or std.mem.startsWith(u8, req.method, "nanogpt.") or std.mem.startsWith(u8, req.method, "backends.")) {
+        // Generic HTTP proxy to third-party APIs (speech TTS/STT, caption, classify,
+        // translate, SD image gen, LLM providers, horde, backends/*).
+        // Params: {host, port, path, body} — same shape as backend.chat.
+        const bhost = getStr(req, "host") orelse "127.0.0.1";
+        const bpath = getStr(req, "path") orelse "/";
+        var bport: u16 = 11434;
+        if (getObjValue(req, "port")) |pv| {
+            if (pv == .integer) bport = @intCast(pv.integer);
+        }
+        var body_str: []u8 = undefined;
+        if (getObjValue(req, "body")) |bv| {
+            body_str = store.stringifyValue(alloc, bv) catch return;
+        } else if (getStr(req, "text")) |tx| {
+            body_str = alloc.dupe(u8, tx) catch return;
+        } else {
+            body_str = alloc.dupe(u8, "{}") catch return;
+        }
+        defer alloc.free(body_str);
+        const raw = backend.forwardHttp(alloc, bhost, bport, bpath, body_str) catch {
+            resp = protocol.encodeErr(alloc, "backend_unreachable") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        defer alloc.free(raw);
+        const split = backend.splitHttpResponse(raw);
+        const q = protocol.jsonQuote(alloc, split.body) catch return;
+        defer alloc.free(q);
+        const inner = std.fmt.allocPrint(alloc, "{{\"status\":{d},\"body\":{s}}}", .{ split.status, q }) catch return;
+        defer alloc.free(inner);
+        resp = protocol.encodeOk(alloc, inner) catch return;
+    } else if (std.mem.startsWith(u8, req.method, "extensions.") or std.mem.startsWith(u8, req.method, "content-manager.")) {
+        const dot = std.mem.indexOfScalar(u8, req.method, '.') orelse {
+            resp = protocol.encodeErr(alloc, "unknown_method") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        const prefix = req.method[0..dot];
+        const action = req.method[dot + 1 ..];
+        if (std.mem.eql(u8, prefix, "extensions")) {
+            resp = genericFiles(alloc, udir, "extensions", action, req) catch {
+                resp = protocol.encodeErr(alloc, "io_error") catch return;
+                defer alloc.free(resp);
+                _ = posix.write(conn, resp) catch {};
+                return;
+            };
+        } else {
+            // content-manager.import {name, kind, content} / content-manager.list
+            if (std.mem.eql(u8, action, "import")) {
+                const name = getStr(req, "name") orelse {
+                    resp = protocol.encodeErr(alloc, "bad_request") catch return;
+                    defer alloc.free(resp);
+                    _ = posix.write(conn, resp) catch {};
+                    return;
+                };
+                const kind = getStr(req, "kind") orelse "characters";
+                const content = getStr(req, "content") orelse {
+                    resp = protocol.encodeErr(alloc, "bad_request") catch return;
+                    defer alloc.free(resp);
+                    _ = posix.write(conn, resp) catch {};
+                    return;
+                };
+                if (!protocol.isSafeName(name) or !protocol.isSafeName(kind)) {
+                    resp = protocol.encodeErr(alloc, "bad_name") catch return;
+                    defer alloc.free(resp);
+                    _ = posix.write(conn, resp) catch {};
+                    return;
+                }
+                const tdir = std.fs.path.join(alloc, &.{ udir, kind }) catch return;
+                defer alloc.free(tdir);
+                std.fs.cwd().makePath(tdir) catch {};
+                const fname = std.fmt.allocPrint(alloc, "{s}.json", .{name}) catch return;
+                defer alloc.free(fname);
+                const tpath = std.fs.path.join(alloc, &.{ tdir, fname }) catch return;
+                defer alloc.free(tpath);
+                store.writeAtomic(tpath, content) catch {
+                    resp = protocol.encodeErr(alloc, "io_error") catch return;
+                    defer alloc.free(resp);
+                    _ = posix.write(conn, resp) catch {};
+                    return;
+                };
+                resp = protocol.encodeOk(alloc, "{\"saved\":true}") catch return;
+            } else if (std.mem.eql(u8, action, "list")) {
+                const kind = getStr(req, "kind") orelse "characters";
+                if (!protocol.isSafeName(kind)) {
+                    resp = protocol.encodeErr(alloc, "bad_name") catch return;
+                    defer alloc.free(resp);
+                    _ = posix.write(conn, resp) catch {};
+                    return;
+                }
+                const tdir = std.fs.path.join(alloc, &.{ udir, kind }) catch return;
+                defer alloc.free(tdir);
+                const names = crud.listNames(alloc, tdir) catch {
+                    resp = protocol.encodeOk(alloc, "[]") catch return;
+                    defer alloc.free(resp);
+                    _ = posix.write(conn, resp) catch {};
+                    return;
+                };
+                defer { for (names) |nm| alloc.free(nm); alloc.free(names); }
+                const arr = crud.jsonArrayOfNames(alloc, names) catch return;
+                defer alloc.free(arr);
+                resp = protocol.encodeOk(alloc, arr) catch return;
+            } else {
+                resp = protocol.encodeErr(alloc, "unknown_method") catch return;
+            }
+        }
     } else if (std.mem.eql(u8, req.method, "ping")) {
         resp = protocol.encodeOk(alloc, "{\"pong\":true,\"version\":\"" ++ protocol.VERSION ++ "\"}") catch return;
     } else if (std.mem.eql(u8, req.method, "version")) {

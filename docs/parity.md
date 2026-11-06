@@ -22,6 +22,9 @@ Status legend: DONE = implemented in Zig + tested (`zig build test` / `tests/run
 | users-admin/users-private/users-public | `users.*`/`users-admin.*`/`users-private.*`/`users-public.*` create/list/delete/login | DONE (Sha256, no session cookies) |
 | vectors | `vectors.save/list/query/delete` (cosine, client-supplied embeddings) | DONE |
 | search | `search.query` (local substring over characters/worldinfo/presets) | DONE (local; web search TODO) |
-| speech, caption, classify, translate, extensions, content-manager, stable-diffusion, byaf/charx | — | TODO (listed, not claimed) |
+| speech/caption/classify/translate/stable-diffusion/openai/anthropic/google/azure/openrouter/novelai/horde/minimax/volcengine/nanogpt/backends | `*.proxy` generic HTTP forward (host/port/path/body) | DONE (HTTP proxy; HTTPS/native SDKs TODO) |
+| extensions | `extensions.save/list/get/delete` | DONE (text store; JS execution TODO) |
+| content-manager | `content-manager.import/list` | DONE (local import; URL fetch TODO) |
+| byaf/charx | — | TODO (listed, not claimed) |
 
 Honest gap: full parity with upstream SillyTavern (image gen, embeddings, extensions JS plugins, multi-user auth) is a multi-month effort; this repo tracks progress feature-by-feature rather than claiming completion.
