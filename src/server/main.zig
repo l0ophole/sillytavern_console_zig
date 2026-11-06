@@ -3109,6 +3109,76 @@ fn handleClient(conn: posix.fd_t) void {
         const inner = std.fmt.allocPrint(alloc, "{{\"total\":{d},\"ok\":{d},\"all_ok\":{s}}}", .{ total, ok_count, if (ok_count == total and total > 0) "true" else "false" }) catch return;
         defer alloc.free(inner);
         resp = protocol.encodeOk(alloc, inner) catch return;
+    } else if (std.mem.eql(u8, req.method, "frontend.browser_exec")) {
+        const script = getStr(req, "script") orelse "constants.js";
+        if (!protocol.isSafeName(script)) {
+            resp = protocol.encodeErr(alloc, "bad_name") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        }
+        const web_root = getStr(req, "web_root") orelse "../SillyTavern/public";
+        const fpath = std.fs.path.join(alloc, &.{ web_root, "scripts", script }) catch return;
+        defer alloc.free(fpath);
+        const content = store.readFileAlloc(alloc, fpath) catch {
+            resp = protocol.encodeErr(alloc, "not_found") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        defer alloc.free(content);
+        // Build shim wrapper: DOM stubs + script with export stripped
+        var wrapper: std.ArrayListUnmanaged(u8) = .empty;
+        defer wrapper.deinit(alloc);
+        wrapper.appendSlice(alloc, "const __commands=[];const __mkEl=()=>({style:{},children:[],appendChild(c){this.children.push(c)},addEventListener(){},setAttribute(){},querySelector(){return null},querySelectorAll(){return []}});globalThis.document={createElement:()=>__mkEl(),querySelector:()=>null,querySelectorAll:()=>[],body:__mkEl(),addEventListener(){}};globalThis.window=globalThis;globalThis.localStorage={getItem:()=>null,setItem(){},removeItem(){}};\n") catch return;
+        var src_pos: usize = 0;
+        while (src_pos < content.len) {
+            // strip leading "export " and "export default "
+            if (std.mem.startsWith(u8, content[src_pos..], "export const ")) {
+                src_pos += 7;
+            } else if (std.mem.startsWith(u8, content[src_pos..], "export let ")) {
+                src_pos += 7;
+            } else if (std.mem.startsWith(u8, content[src_pos..], "export var ")) {
+                src_pos += 7;
+            } else if (std.mem.startsWith(u8, content[src_pos..], "export function ")) {
+                src_pos += 7;
+            } else if (std.mem.startsWith(u8, content[src_pos..], "export class ")) {
+                src_pos += 7;
+            } else if (std.mem.startsWith(u8, content[src_pos..], "export default ")) {
+                src_pos += 15;
+            } else if (std.mem.startsWith(u8, content[src_pos..], "export {")) {
+                // skip export { ... };
+                if (std.mem.indexOfScalar(u8, content[src_pos..], ';')) |semi| {
+                    src_pos += semi + 1;
+                    continue;
+                }
+            }
+            wrapper.append(alloc, content[src_pos]) catch return;
+            src_pos += 1;
+        }
+        wrapper.appendSlice(alloc, "\nconsole.log('EXEC_OK');\n") catch return;
+        const wsrc = wrapper.toOwnedSlice(alloc) catch return;
+        defer alloc.free(wsrc);
+        const result = std.process.Child.run(.{
+            .allocator = alloc,
+            .argv = &.{ "node", "-e", wsrc },
+            .max_output_bytes = 1 << 20,
+        }) catch {
+            resp = protocol.encodeErr(alloc, "runtime_unavailable") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        defer alloc.free(result.stdout);
+        defer alloc.free(result.stderr);
+        const oq = protocol.jsonQuote(alloc, result.stdout) catch return;
+        defer alloc.free(oq);
+        const eq = protocol.jsonQuote(alloc, result.stderr) catch return;
+        defer alloc.free(eq);
+        const ok_str = if (result.term.Exited == 0 and std.mem.indexOf(u8, result.stdout, "EXEC_OK") != null) "true" else "false";
+        const inner = std.fmt.allocPrint(alloc, "{{\"script\":\"{s}\",\"exec_ok\":{s},\"exit_code\":{d},\"stdout\":{s},\"stderr\":{s}}}", .{ script, ok_str, result.term.Exited, oq, eq }) catch return;
+        defer alloc.free(inner);
+        resp = protocol.encodeOk(alloc, inner) catch return;
     } else if (std.mem.eql(u8, req.method, "ping")) {
         resp = protocol.encodeOk(alloc, "{\"pong\":true,\"version\":\"" ++ protocol.VERSION ++ "\"}") catch return;
     } else if (std.mem.eql(u8, req.method, "version")) {

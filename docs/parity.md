@@ -4,7 +4,7 @@ Status legend: DONE = implemented in Zig + tested (`zig build test` / `tests/run
 
 | SillyTavern endpoint | Zig method(s) | Status |
 |---|---|---|
-| server-main (listen, config) + frontend | `st-server` + `frontend.verify` + `frontend.browser_verify` + `frontend.browser_smoke` + `frontend.browser_smoke_all` (node --check all 76 real frontend scripts) + REPL slash commands | DONE — verified on Arch (glibc) + Alpine 3.20 container (musl build+run, Zig 0.15 build inside Alpine) |
+| server-main (listen, config) + frontend | `st-server` + `frontend.verify` + `frontend.browser_verify` + `frontend.browser_smoke_all` (node --check 76) + `frontend.browser_exec` (executes real scripts in DOM shim) + REPL slash commands | DONE — verified on Arch (glibc) + Alpine 3.20 container (musl build+run, Zig 0.15 build inside Alpine) |
 | healthcheck | `ping`, `version`, `health` | DONE (Task 1) |
 | settings | `settings.get`, `settings.save` | DONE Task 2 |
 | characters | `characters.list/create/get/delete/import_png/import` | DONE (JSON+PNG) |

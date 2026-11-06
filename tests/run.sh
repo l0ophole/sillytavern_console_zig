@@ -555,6 +555,9 @@ PYEOF
 else
   echo SKIP_NO_MINILM
 fi
+echo "== browser exec real scripts =="
+./zig-out/bin/st-client --port $PORT frontend.browser_exec '{"script":"constants.js"}' | grep -q '"exec_ok":true' && echo PASS
+./zig-out/bin/st-client --port $PORT frontend.browser_exec '{"script":"a11y.js"}' | grep -q '"exec_ok":true' && echo PASS
 echo "== bad method =="
 ./zig-out/bin/st-client --port $PORT nope | grep -q '"ok":false' && echo PASS
 cat "$TMP/server.log"
