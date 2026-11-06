@@ -6,6 +6,7 @@ const tokenizer = @import("tokenizer");
 const backend = @import("backend");
 const png = @import("png");
 const users_mod = @import("users");
+const vectors_mod = @import("vectors");
 const posix = std.posix;
 
 var data_root: []const u8 = "data";
@@ -15,6 +16,12 @@ var host: []const u8 = "127.0.0.1";
 fn printUsage() void {
     const stderr = std.fs.File.stderr();
     stderr.writeAll("Usage: st-server [--host 127.0.0.1] [--port 8000] [--data-dir ./data]\n") catch {};
+}
+
+fn lowerCase(alloc: std.mem.Allocator, s: []const u8) ![]u8 {
+    const out = try alloc.alloc(u8, s.len);
+    for (s, 0..) |c, i| out[i] = std.ascii.toLower(c);
+    return out;
 }
 
 fn getStr(req: protocol.Request, key: []const u8) ?[]const u8 {
@@ -985,6 +992,202 @@ fn handleClient(conn: posix.fd_t) void {
         } else {
             resp = protocol.encodeErr(alloc, "unknown_method") catch return;
         }
+    } else if (std.mem.startsWith(u8, req.method, "vectors.")) {
+        const dot = std.mem.indexOfScalar(u8, req.method, '.') orelse {
+            resp = protocol.encodeErr(alloc, "unknown_method") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        const action = req.method[dot + 1 ..];
+        const coll = getStr(req, "collection") orelse "default";
+        if (!protocol.isSafeName(coll)) {
+            resp = protocol.encodeErr(alloc, "bad_name") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        }
+        const cdir = std.fs.path.join(alloc, &.{ udir, "vectors", coll }) catch return;
+        defer alloc.free(cdir);
+        std.fs.cwd().makePath(cdir) catch {};
+        if (std.mem.eql(u8, action, "save") or std.mem.eql(u8, action, "insert") or std.mem.eql(u8, action, "create")) {
+            const vid = getStr(req, "id") orelse {
+                resp = protocol.encodeErr(alloc, "bad_request") catch return;
+                defer alloc.free(resp);
+                _ = posix.write(conn, resp) catch {};
+                return;
+            };
+            if (!protocol.isSafeName(vid)) {
+                resp = protocol.encodeErr(alloc, "bad_name") catch return;
+                defer alloc.free(resp);
+                _ = posix.write(conn, resp) catch {};
+                return;
+            }
+            var val: std.json.Value = req.params.?;
+            if (getObjValue(req, "value")) |v| val = v;
+            if (getObjValue(req, "data")) |v| val = v;
+            // val should be object with vector; if params has vector directly, wrap
+            crud.saveJson(alloc, cdir, vid, val) catch {
+                resp = protocol.encodeErr(alloc, "io_error") catch return;
+                defer alloc.free(resp);
+                _ = posix.write(conn, resp) catch {};
+                return;
+            };
+            resp = protocol.encodeOk(alloc, "{\"saved\":true}") catch return;
+        } else if (std.mem.eql(u8, action, "list")) {
+            const names = crud.listNames(alloc, cdir) catch {
+                resp = protocol.encodeOk(alloc, "[]") catch return;
+                defer alloc.free(resp);
+                _ = posix.write(conn, resp) catch {};
+                return;
+            };
+            defer { for (names) |nm| alloc.free(nm); alloc.free(names); }
+            const arr = crud.jsonArrayOfNames(alloc, names) catch return;
+            defer alloc.free(arr);
+            resp = protocol.encodeOk(alloc, arr) catch return;
+        } else if (std.mem.eql(u8, action, "delete")) {
+            const vid = getStr(req, "id") orelse {
+                resp = protocol.encodeErr(alloc, "bad_request") catch return;
+                defer alloc.free(resp);
+                _ = posix.write(conn, resp) catch {};
+                return;
+            };
+            const fname = std.fmt.allocPrint(alloc, "{s}.json", .{vid}) catch return;
+            defer alloc.free(fname);
+            crud.deleteFile(alloc, cdir, fname) catch {
+                resp = protocol.encodeErr(alloc, "not_found") catch return;
+                defer alloc.free(resp);
+                _ = posix.write(conn, resp) catch {};
+                return;
+            };
+            resp = protocol.encodeOk(alloc, "{\"deleted\":true}") catch return;
+        } else if (std.mem.eql(u8, action, "query") or std.mem.eql(u8, action, "search")) {
+            // query vector from params.vector (array of numbers)
+            var qvec: []f64 = &[_]f64{};
+            var qowned = false;
+            if (getObjValue(req, "vector")) |vv| {
+                if (vv == .array) {
+                    qvec = alloc.alloc(f64, vv.array.items.len) catch return;
+                    qowned = true;
+                    for (vv.array.items, 0..) |item, idx| {
+                        qvec[idx] = switch (item) {
+                            .integer => @as(f64, @floatFromInt(item.integer)),
+                            .float => item.float,
+                            else => 0,
+                        };
+                    }
+                }
+            }
+            defer if (qowned) alloc.free(qvec);
+            var limit: usize = 5;
+            if (getObjValue(req, "limit")) |lv| {
+                if (lv == .integer) limit = @intCast(lv.integer);
+            }
+            const names = crud.listNames(alloc, cdir) catch {
+                resp = protocol.encodeOk(alloc, "[]") catch return;
+                defer alloc.free(resp);
+                _ = posix.write(conn, resp) catch {};
+                return;
+            };
+            defer { for (names) |nm| alloc.free(nm); alloc.free(names); }
+            const Scored = struct { id: []const u8, score: f64 };
+            var scored: std.ArrayListUnmanaged(Scored) = .empty;
+            defer scored.deinit(alloc);
+            for (names) |nm| {
+                const content = crud.loadFile(alloc, cdir, nm) catch continue;
+                defer alloc.free(content);
+                if (std.json.parseFromSlice(std.json.Value, alloc, content, .{})) |parsed| {
+                    if (parsed.value == .object) {
+                        if (parsed.value.object.get("vector")) |vv| {
+                            if (vv == .array and vv.array.items.len == qvec.len and qvec.len > 0) {
+                                var svec = alloc.alloc(f64, vv.array.items.len) catch continue;
+                                defer alloc.free(svec);
+                                for (vv.array.items, 0..) |item, idx| {
+                                    svec[idx] = switch (item) {
+                                        .integer => @as(f64, @floatFromInt(item.integer)),
+                                        .float => item.float,
+                                        else => 0,
+                                    };
+                                }
+                                const sc = vectors_mod.cosine(qvec, svec);
+                                scored.append(alloc, .{ .id = nm, .score = sc }) catch continue;
+                            }
+                        }
+                    }
+                } else |_| {}
+            }
+            std.mem.sort(Scored, scored.items, {}, struct {
+                fn lt(_: void, a: Scored, b: Scored) bool {
+                    return a.score > b.score;
+                }
+            }.lt);
+            var out: std.ArrayListUnmanaged(u8) = .empty;
+            defer out.deinit(alloc);
+            out.append(alloc, '[') catch return;
+            const ntop = @min(limit, scored.items.len);
+            for (scored.items[0..ntop], 0..) |s, idx| {
+                if (idx > 0) out.append(alloc, ',') catch return;
+                const iq = protocol.jsonQuote(alloc, s.id) catch return;
+                defer alloc.free(iq);
+                const ss = std.fmt.allocPrint(alloc, "{{\"id\":{s},\"score\":{d}}}", .{ iq, s.score }) catch return;
+                defer alloc.free(ss);
+                out.appendSlice(alloc, ss) catch return;
+            }
+            out.append(alloc, ']') catch return;
+            const arr = out.toOwnedSlice(alloc) catch return;
+            defer alloc.free(arr);
+            resp = protocol.encodeOk(alloc, arr) catch return;
+        } else {
+            resp = protocol.encodeErr(alloc, "unknown_method") catch return;
+        }
+    } else if (std.mem.eql(u8, req.method, "search.query")) {
+        const query = getStr(req, "query") orelse {
+            resp = protocol.encodeErr(alloc, "bad_request") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        const lower_q = lowerCase(alloc, query) catch return;
+        defer alloc.free(lower_q);
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        defer out.deinit(alloc);
+        out.append(alloc, '[') catch return;
+        var first = true;
+        const search_dirs = [_][]const u8{ "characters", "worldinfo", "presets" };
+        for (search_dirs) |sd| {
+            const d = std.fs.path.join(alloc, &.{ udir, sd }) catch continue;
+            defer alloc.free(d);
+            const names = crud.listNames(alloc, d) catch continue;
+            defer { for (names) |nm| alloc.free(nm); alloc.free(names); }
+            for (names) |nm| {
+                const content = crud.loadFile(alloc, d, nm) catch continue;
+                defer alloc.free(content);
+                const lower_c = lowerCase(alloc, content) catch continue;
+                defer alloc.free(lower_c);
+                var count: usize = 0;
+                var pos: usize = 0;
+                while (std.mem.indexOf(u8, lower_c[pos..], lower_q)) |idx| {
+                    count += 1;
+                    pos += idx + lower_q.len;
+                    if (pos >= lower_c.len) break;
+                }
+                if (count > 0) {
+                    if (!first) out.append(alloc, ',') catch return;
+                    first = false;
+                    const fq = std.fmt.allocPrint(alloc, "{s}/{s}", .{ sd, nm }) catch continue;
+                    defer alloc.free(fq);
+                    const fqq = protocol.jsonQuote(alloc, fq) catch continue;
+                    defer alloc.free(fqq);
+                    const cs = std.fmt.allocPrint(alloc, "{{\"file\":{s},\"matches\":{d}}}", .{ fqq, count }) catch continue;
+                    defer alloc.free(cs);
+                    out.appendSlice(alloc, cs) catch return;
+                }
+            }
+        }
+        out.append(alloc, ']') catch return;
+        const s = out.toOwnedSlice(alloc) catch return;
+        defer alloc.free(s);
+        resp = protocol.encodeOk(alloc, s) catch return;
     } else if (std.mem.eql(u8, req.method, "ping")) {
         resp = protocol.encodeOk(alloc, "{\"pong\":true,\"version\":\"" ++ protocol.VERSION ++ "\"}") catch return;
     } else if (std.mem.eql(u8, req.method, "version")) {

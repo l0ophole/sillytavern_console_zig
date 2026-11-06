@@ -20,6 +20,8 @@ Status legend: DONE = implemented in Zig + tested (`zig build test` / `tests/run
 | backends/chat-completions, openai, anthropic, google, azure, openrouter, novelai, horde, kobold, text-completions | `backend.chat` (OpenAI-compatible HTTP proxy; native SDKs TODO) | DONE Task 7 (HTTP proxy) |
 | image-metadata | `image-metadata.get/detect` | DONE |
 | users-admin/users-private/users-public | `users.*`/`users-admin.*`/`users-private.*`/`users-public.*` create/list/delete/login | DONE (Sha256, no session cookies) |
-| speech, caption, classify, translate, search, vectors, extensions, content-manager, stable-diffusion, byaf/charx | — | TODO (listed, not claimed) |
+| vectors | `vectors.save/list/query/delete` (cosine, client-supplied embeddings) | DONE |
+| search | `search.query` (local substring over characters/worldinfo/presets) | DONE (local; web search TODO) |
+| speech, caption, classify, translate, extensions, content-manager, stable-diffusion, byaf/charx | — | TODO (listed, not claimed) |
 
 Honest gap: full parity with upstream SillyTavern (image gen, embeddings, extensions JS plugins, multi-user auth) is a multi-month effort; this repo tracks progress feature-by-feature rather than claiming completion.
