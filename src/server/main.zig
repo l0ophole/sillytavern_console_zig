@@ -128,6 +128,14 @@ fn genericCollection(alloc: std.mem.Allocator, udir: []const u8, subdir: []const
 
 // Generic text/binary file handler for files/backgrounds/avatars/sprites/images/assets/thumbnails.
 fn genericFiles(alloc: std.mem.Allocator, udir: []const u8, subdir: []const u8, action_in: []const u8, req: protocol.Request) ![]u8 {
+    // JS /api/assets/character?name=&category= returns an array of asset paths
+    if (std.mem.eql(u8, subdir, "assets") and std.mem.eql(u8, action_in, "character")) {
+        return protocol.encodeOk(alloc, "[]");
+    }
+    // JS /api/assets/get returns a folder map {ambient:[],bgm:[],...,vrm:{model:[],animation:[]}}
+    if (std.mem.eql(u8, subdir, "assets") and std.mem.eql(u8, action_in, "get")) {
+        return protocol.encodeOk(alloc, "{\"ambient\":[],\"bgm\":[],\"blip\":[],\"character\":[],\"live2d\":[],\"vrm\":{\"model\":[],\"animation\":[]}}");
+    }
     var action = action_in;
     if (std.mem.eql(u8, action, "all") or std.mem.eql(u8, action, "folders")) action = "list";
     if (std.mem.eql(u8, action, "chats") or std.mem.eql(u8, action, "recent")) action = "list";
@@ -219,6 +227,39 @@ fn readLine(stream: posix.fd_t, buf: []u8) !usize {
     return n;
 }
 
+// Percent-decode a query component (%XX and '+' -> space). Returns null on bad input.
+fn urlDecode(alloc: std.mem.Allocator, s: []const u8) ?[]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(alloc);
+    var i: usize = 0;
+    while (i < s.len) {
+        if (s[i] == '%') {
+            if (i + 2 >= s.len) return null;
+            const hexVal = struct {
+                fn f(c: u8) ?u8 {
+                    return switch (c) {
+                        '0'...'9' => c - '0',
+                        'a'...'f' => c - 'a' + 10,
+                        'A'...'F' => c - 'A' + 10,
+                        else => null,
+                    };
+                }
+            }.f;
+            const hv = hexVal(s[i + 1]) orelse return null;
+            const lv = hexVal(s[i + 2]) orelse return null;
+            out.append(alloc, @intCast(hv * 16 + lv)) catch return null;
+            i += 3;
+        } else if (s[i] == '+') {
+            out.append(alloc, ' ') catch return null;
+            i += 1;
+        } else {
+            out.append(alloc, s[i]) catch return null;
+            i += 1;
+        }
+    }
+    return out.toOwnedSlice(alloc) catch null;
+}
+
 fn handleHttp(conn: posix.fd_t, first_line: []const u8) void {
     // Static web UI serving (SillyTavern public/) + /api health.
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -245,7 +286,35 @@ fn handleHttp(conn: posix.fd_t, first_line: []const u8) void {
             path = rest[0..s2];
         }
     }
-    const clean_path = std.mem.trim(u8, path, " ");
+    var clean_path = std.mem.trim(u8, path, " ");
+    // Split off query string: JS reads some params from the query (assets/character?name=&category=)
+    var query_pairs: std.ArrayListUnmanaged(u8) = .empty;
+    defer query_pairs.deinit(alloc);
+    var has_query = false;
+    if (std.mem.indexOfScalar(u8, clean_path, '?')) |qpos| {
+        const qs = clean_path[qpos + 1 ..];
+        clean_path = clean_path[0..qpos];
+        var it = std.mem.splitScalar(u8, qs, '&');
+        while (it.next()) |kv| {
+            if (kv.len == 0) continue;
+            has_query = true;
+            const eq = std.mem.indexOfScalar(u8, kv, '=');
+            const kraw = if (eq) |e| kv[0..e] else kv;
+            const vraw = if (eq) |e| kv[e + 1 ..] else "";
+            const k = urlDecode(alloc, kraw) orelse return;
+            defer alloc.free(k);
+            const v = urlDecode(alloc, vraw) orelse return;
+            defer alloc.free(v);
+            if (query_pairs.items.len > 0) query_pairs.append(alloc, ',') catch return;
+            const kq = protocol.jsonQuote(alloc, k) catch return;
+            defer alloc.free(kq);
+            query_pairs.appendSlice(alloc, kq) catch return;
+            query_pairs.append(alloc, ':') catch return;
+            const vq = protocol.jsonQuote(alloc, v) catch return;
+            defer alloc.free(vq);
+            query_pairs.appendSlice(alloc, vq) catch return;
+        }
+    }
     if (std.mem.startsWith(u8, clean_path, "/api/")) {
         const method = clean_path[5..];
         if (method.len == 0 or std.mem.indexOf(u8, method, "/") != null or std.mem.indexOf(u8, method, ".") != null and false) {}
@@ -321,7 +390,25 @@ fn handleHttp(conn: posix.fd_t, first_line: []const u8) void {
                 }
             }
         }
-        const params_json = if (multipart_params) |mp| mp else if (body.items.len == 0) "{}" else body.items;
+        var params_base: []const u8 = if (multipart_params) |mp| mp else if (body.items.len == 0) "{}" else body.items;
+        // Merge query-string params into the JSON params object (JS request.query)
+        var merged_params: ?[]u8 = null;
+        defer if (merged_params) |mp| alloc.free(mp);
+        if (has_query and query_pairs.items.len > 0) {
+            const t = std.mem.trim(u8, params_base, " \t\r\n");
+            var m: std.ArrayListUnmanaged(u8) = .empty;
+            defer m.deinit(alloc);
+            m.append(alloc, '{') catch return;
+            if (t.len > 2 and std.mem.startsWith(u8, t, "{")) {
+                m.appendSlice(alloc, t[1 .. t.len - 1]) catch return;
+                m.append(alloc, ',') catch return;
+            }
+            m.appendSlice(alloc, query_pairs.items) catch return;
+            m.append(alloc, '}') catch return;
+            merged_params = m.toOwnedSlice(alloc) catch return;
+            params_base = merged_params.?;
+        }
+        const params_json = params_base;
         // Frontend Express route mapping: /api/<res>/<action> -> <res>.<action>
         // Handles nested routes (e.g. /api/backups/chat/get -> backups.chat.get),
         // mount aliases (extra/caption -> caption, content -> content-manager), and verb aliases.
@@ -3491,9 +3578,10 @@ fn handleClient(conn: posix.fd_t) void {
                     norm = "list";
                 }
             }
-            // Explicit absent-file semantics matching JS: chats/group/get|info and
-            // chats/export return {} when the chat file is absent; image-metadata/folders/get returns [].
-            if (std.mem.eql(u8, prefix, "chats") and (std.mem.eql(u8, action, "group.get") or std.mem.eql(u8, action, "group.info"))) {
+            // JS /api/assets/character?name=&category= returns an array of asset paths
+            if (std.mem.eql(u8, prefix, "assets") and std.mem.eql(u8, action, "character")) {
+                resp = protocol.encodeOk(alloc, "[]") catch return;
+            } else if (std.mem.eql(u8, prefix, "chats") and (std.mem.eql(u8, action, "group.get") or std.mem.eql(u8, action, "group.info"))) {
                 if (getStr(req, "id")) |id| {
                     const gdir = std.fs.path.join(alloc, &.{ udir, "groupChats" }) catch return;
                     defer alloc.free(gdir);
