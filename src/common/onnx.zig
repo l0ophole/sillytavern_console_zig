@@ -286,6 +286,50 @@ pub fn loadOnnx(alloc: std.mem.Allocator, path: []const u8) !OnnxModel {
     return model;
 }
 
+test "onnx gemm equivalence" {
+    // Manual Gemm [2,2] identity, transB: out = in * W
+    const alloc = std.testing.allocator;
+    var tensors = std.StringHashMap(Tensor).init(alloc);
+    const w = try alloc.dupe(f32, &[_]f32{ 1, 0, 0, 1 });
+    const b = try alloc.dupe(f32, &[_]f32{ 0, 0 });
+    try tensors.put(try alloc.dupe(u8, "W"), .{ .name = try alloc.dupe(u8, "W"), .dims = try alloc.dupe(i64, &[_]i64{ 2, 2 }), .data = w });
+    try tensors.put(try alloc.dupe(u8, "B"), .{ .name = try alloc.dupe(u8, "B"), .dims = try alloc.dupe(i64, &[_]i64{2}), .data = b });
+    var model = OnnxModel{
+        .tensors = tensors,
+        .nodes = try alloc.dupe(Node, &[_]Node{
+            .{ .op = try alloc.dupe(u8, "Gemm"), .inputs = try alloc.dupe([]u8, &[_][]u8{ try alloc.dupe(u8, "X"), try alloc.dupe(u8, "W"), try alloc.dupe(u8, "B") }), .outputs = try alloc.dupe([]u8, &[_][]u8{try alloc.dupe(u8, "Y")}), .trans_b = true },
+        }),
+        .input_name = try alloc.dupe(u8, "X"),
+        .output_name = try alloc.dupe(u8, "Y"),
+        .alloc = alloc,
+    };
+    defer {
+        // free model nodes/names only (tensors map owned by test below)
+        for (model.nodes) |n| {
+            alloc.free(n.op);
+            for (n.inputs) |i| alloc.free(i);
+            alloc.free(n.inputs);
+            for (n.outputs) |o| alloc.free(o);
+            alloc.free(n.outputs);
+        }
+        alloc.free(model.nodes);
+        alloc.free(model.input_name);
+        alloc.free(model.output_name);
+        var it = tensors.iterator();
+        while (it.next()) |e| {
+            alloc.free(e.key_ptr.*);
+            alloc.free(e.value_ptr.*.name);
+            alloc.free(e.value_ptr.*.dims);
+            alloc.free(e.value_ptr.*.data);
+        }
+        tensors.deinit();
+    }
+    const out = try model.run(alloc, &[_]f32{ 3, 4 });
+    defer alloc.free(out);
+    try std.testing.expectApproxEqAbs(@as(f32, 3), out[0], 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 4), out[1], 1e-5);
+}
+
 test "onnx varint" {
     try std.testing.expect(true);
 }
