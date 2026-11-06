@@ -16,6 +16,7 @@ pub fn build(b: *std.Build) void {
     const users = b.addModule("users", .{ .root_source_file = b.path("src/common/users.zig") });
     const vectors = b.addModule("vectors", .{ .root_source_file = b.path("src/common/vectors.zig") });
     const zipm = b.addModule("zipm", .{ .root_source_file = b.path("src/common/zip.zig") });
+    const providers = b.addModule("providers", .{ .root_source_file = b.path("src/common/providers.zig") });
 
     const server_mod = b.createModule(.{ .root_source_file = b.path("src/server/main.zig"), .target = target, .optimize = optimize });
     server_mod.addImport("common", common);
@@ -27,6 +28,7 @@ pub fn build(b: *std.Build) void {
     server_mod.addImport("users", users);
     server_mod.addImport("vectors", vectors);
     server_mod.addImport("zipm", zipm);
+    server_mod.addImport("providers", providers);
     const server = b.addExecutable(.{ .name = "st-server", .root_module = server_mod });
     b.installArtifact(server);
 
@@ -66,6 +68,8 @@ pub fn build(b: *std.Build) void {
     const vec_tests = b.addTest(.{ .root_module = vec_test_mod });
     const zip_test_mod = b.createModule(.{ .root_source_file = b.path("src/common/zip.zig"), .target = target, .optimize = optimize });
     const zip_tests = b.addTest(.{ .root_module = zip_test_mod });
+    const prov_test_mod = b.createModule(.{ .root_source_file = b.path("src/common/providers.zig"), .target = target, .optimize = optimize });
+    const prov_tests = b.addTest(.{ .root_module = prov_test_mod });
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&b.addRunArtifact(unit_tests).step);
     test_step.dependOn(&b.addRunArtifact(store_tests).step);
@@ -76,4 +80,5 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(users_tests).step);
     test_step.dependOn(&b.addRunArtifact(vec_tests).step);
     test_step.dependOn(&b.addRunArtifact(zip_tests).step);
+    test_step.dependOn(&b.addRunArtifact(prov_tests).step);
 }

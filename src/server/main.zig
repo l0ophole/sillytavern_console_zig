@@ -8,6 +8,7 @@ const png = @import("png");
 const users_mod = @import("users");
 const vectors_mod = @import("vectors");
 const zipm = @import("zipm");
+const providers_mod = @import("providers");
 const posix = std.posix;
 
 var data_root: []const u8 = "data";
@@ -1779,6 +1780,56 @@ fn handleClient(conn: posix.fd_t) void {
         const arr = out.toOwnedSlice(alloc) catch return;
         defer alloc.free(arr);
         const inner = std.fmt.allocPrint(alloc, "{{\"ids\":{s},\"count\":{d},\"exact\":true}}", .{ arr, ids.len }) catch return;
+        defer alloc.free(inner);
+        resp = protocol.encodeOk(alloc, inner) catch return;
+    } else if (std.mem.eql(u8, req.method, "backend.provider")) {
+        const pname = getStr(req, "provider") orelse {
+            resp = protocol.encodeErr(alloc, "bad_request") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        const prov = providers_mod.getProvider(pname) orelse {
+            resp = protocol.encodeErr(alloc, "unknown_provider") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        const url = providers_mod.buildUrl(alloc, prov, getStr(req, "base_url"), getStr(req, "path")) catch return;
+        defer alloc.free(url);
+        var body_str: []u8 = undefined;
+        if (getObjValue(req, "body")) |bv| {
+            body_str = store.stringifyValue(alloc, bv) catch return;
+        } else {
+            body_str = alloc.dupe(u8, "{}") catch return;
+        }
+        defer alloc.free(body_str);
+        const ak = getStr(req, "api_key") orelse "";
+        var headers_buf: [4]std.http.Header = undefined;
+        var nheaders: usize = 0;
+        headers_buf[0] = .{ .name = "Content-Type", .value = "application/json" };
+        nheaders = 1;
+        var auth_val: ?[]u8 = null;
+        if (prov.auth_header.len > 0) {
+            auth_val = std.fmt.allocPrint(alloc, "{s}{s}", .{ prov.auth_prefix, ak }) catch return;
+            headers_buf[1] = .{ .name = prov.auth_header, .value = auth_val.? };
+            nheaders = 2;
+            if (std.mem.eql(u8, pname, "anthropic")) {
+                headers_buf[2] = .{ .name = "anthropic-version", .value = "2023-06-01" };
+                nheaders = 3;
+            }
+        }
+        defer if (auth_val) |av| alloc.free(av);
+        const fetched = backend.fetchUrlHeaders(alloc, url, "POST", body_str, headers_buf[0..nheaders]) catch {
+            resp = protocol.encodeErr(alloc, "backend_unreachable") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        defer alloc.free(fetched.body);
+        const q = protocol.jsonQuote(alloc, fetched.body) catch return;
+        defer alloc.free(q);
+        const inner = std.fmt.allocPrint(alloc, "{{\"provider\":\"{s}\",\"url\":\"{s}\",\"status\":{d},\"body\":{s}}}", .{ prov.name, url, fetched.status, q }) catch return;
         defer alloc.free(inner);
         resp = protocol.encodeOk(alloc, inner) catch return;
     } else if (std.mem.eql(u8, req.method, "ping")) {

@@ -125,6 +125,10 @@ if [ -s /tmp/cl100k.tiktoken ]; then
 else
   echo SKIP_NO_VOCAB
 fi
+echo "== per-provider backend =="
+./zig-out/bin/st-client --port $PORT backend.provider '{"provider":"openai","base_url":"http://127.0.0.1:9","path":"/v1/chat/completions","body":{}}' | grep -q 'backend_unreachable' && echo PASS
+./zig-out/bin/st-client --port $PORT backend.provider '{"provider":"unknown"}' | grep -q 'unknown_provider' && echo PASS
+./zig-out/bin/st-client --port $PORT backend.provider '{"provider":"anthropic","base_url":"http://127.0.0.1:9","path":"/v1/messages","body":{}}' | grep -q 'backend_unreachable' && echo PASS
 echo "== bad method =="
 ./zig-out/bin/st-client --port $PORT nope | grep -q '"ok":false' && echo PASS
 cat "$TMP/server.log"
