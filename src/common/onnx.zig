@@ -77,19 +77,41 @@ pub const OnnxModel = struct {
         for (self.nodes) |node| {
             if (std.mem.eql(u8, node.op, "Gemm") or std.mem.eql(u8, node.op, "MatMul")) {
                 const a = env.get(node.inputs[0]) orelse return error.MissingInput;
-                const b_tensor = self.tensors.get(node.inputs[1]) orelse return error.MissingWeight;
-                const b = b_tensor.data;
-                const dims = b_tensor.dims;
-                if (dims.len != 2) return error.BadShape;
-                const n_out: usize = @intCast(dims[0]);
-                const k_dim: usize = @intCast(dims[1]);
-                // Y = X * W (W is [N,K] with transB, or [K,N] without)
+                // B can be initializer weight or activation (MatMul of two activations, e.g. Q@K^T)
+                var b_slices: []const f32 = undefined;
+                var b_dims: []const i64 = &[_]i64{};
+                var b_from_tensor = false;
+                if (self.tensors.get(node.inputs[1])) |bt| {
+                    b_slices = bt.data;
+                    b_dims = bt.dims;
+                    b_from_tensor = true;
+                } else if (env.get(node.inputs[1])) |bv| {
+                    b_slices = bv;
+                } else return error.MissingWeight;
+                const is_gemm = std.mem.eql(u8, node.op, "Gemm");
+                const trans_b = node.trans_b or is_gemm;
+                // Infer shapes: Gemm/MatMul vector x matrix -> vector
+                var k_dim: usize = 0;
+                var n_out: usize = 0;
+                if (b_from_tensor and b_dims.len == 2) {
+                    if (trans_b) {
+                        n_out = @intCast(b_dims[0]);
+                        k_dim = @intCast(b_dims[1]);
+                    } else {
+                        k_dim = @intCast(b_dims[0]);
+                        n_out = @intCast(b_dims[1]);
+                    }
+                } else {
+                    // Square assume
+                    k_dim = a.len;
+                    n_out = b_slices.len / k_dim;
+                }
+                if (k_dim != a.len) return error.BadShape;
                 const out = try alloc.alloc(f32, n_out);
-                const trans_b = node.trans_b or std.mem.eql(u8, node.op, "Gemm");
                 for (0..n_out) |o| {
                     var sum: f32 = 0;
                     for (0..k_dim) |k| {
-                        const wval = if (trans_b) b[o * k_dim + k] else b[k * n_out + o];
+                        const wval = if (trans_b) b_slices[o * k_dim + k] else b_slices[k * n_out + o];
                         sum += a[k] * wval;
                     }
                     out[o] = sum;
@@ -97,7 +119,9 @@ pub const OnnxModel = struct {
                 // Add bias if third input present
                 if (node.inputs.len > 2) {
                     if (self.tensors.get(node.inputs[2])) |bt| {
-                        for (0..n_out) |o| out[o] += bt.data[o];
+                        for (0..n_out) |o| out[o] += bt.data[o % bt.data.len];
+                    } else if (env.get(node.inputs[2])) |bv| {
+                        for (0..n_out) |o| out[o] += bv[o % bv.len];
                     }
                 }
                 try env.put(node.outputs[0], out);
