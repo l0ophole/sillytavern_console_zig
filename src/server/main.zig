@@ -216,8 +216,27 @@ fn handleHttp(conn: posix.fd_t, first_line: []const u8) void {
             remaining -= r;
         }
         const params_json = if (body.items.len == 0) "{}" else body.items;
+        // Frontend Express route mapping: /api/<res>/<action> -> <res>.<action>
+        var mapped_method: []u8 = undefined;
+        defer alloc.free(mapped_method);
+        if (std.mem.indexOfScalar(u8, method, '/')) |slash| {
+            const res_name = method[0..slash];
+            var action = method[slash + 1 ..];
+            if (std.mem.indexOfScalar(u8, action, '/')) |s2| action = action[0..s2];
+            // Map frontend verbs to server verbs
+            if (std.mem.eql(u8, action, "load")) action = "get";
+            if (std.mem.eql(u8, action, "save")) action = "save";
+            if (std.mem.eql(u8, action, "create")) action = "create";
+            if (std.mem.eql(u8, action, "list")) action = "list";
+            if (std.mem.eql(u8, action, "delete")) action = "delete";
+            if (std.mem.eql(u8, action, "import")) action = "import";
+            if (std.mem.eql(u8, action, "import_url")) action = "import_url";
+            mapped_method = std.fmt.allocPrint(alloc, "{s}.{s}", .{ res_name, action }) catch return;
+        } else {
+            mapped_method = alloc.dupe(u8, method) catch return;
+        }
         // Bridge to TCP dispatch via loopback self-connection
-        const line = std.fmt.allocPrint(alloc, "{{\"method\":\"{s}\",\"params\":{s}}}\n", .{ method, params_json }) catch return;
+        const line = std.fmt.allocPrint(alloc, "{{\"method\":\"{s}\",\"params\":{s}}}\n", .{ mapped_method, params_json }) catch return;
         defer alloc.free(line);
         const addr_str = std.fmt.allocPrint(alloc, "127.0.0.1:{d}", .{port}) catch return;
         defer alloc.free(addr_str);
