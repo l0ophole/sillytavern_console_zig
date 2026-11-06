@@ -5,9 +5,12 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     const common = b.addModule("common", .{ .root_source_file = b.path("src/common/protocol.zig") });
+    const store = b.addModule("store", .{ .root_source_file = b.path("src/common/store.zig") });
+    store.addImport("common", common);
 
     const server_mod = b.createModule(.{ .root_source_file = b.path("src/server/main.zig"), .target = target, .optimize = optimize });
     server_mod.addImport("common", common);
+    server_mod.addImport("store", store);
     const server = b.addExecutable(.{ .name = "st-server", .root_module = server_mod });
     b.installArtifact(server);
 
@@ -28,6 +31,10 @@ pub fn build(b: *std.Build) void {
 
     const test_mod = b.createModule(.{ .root_source_file = b.path("src/common/protocol.zig"), .target = target, .optimize = optimize });
     const unit_tests = b.addTest(.{ .root_module = test_mod });
+    const store_test_mod = b.createModule(.{ .root_source_file = b.path("src/common/store.zig"), .target = target, .optimize = optimize });
+    store_test_mod.addImport("common", common);
+    const store_tests = b.addTest(.{ .root_module = store_test_mod });
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&b.addRunArtifact(unit_tests).step);
+    test_step.dependOn(&b.addRunArtifact(store_tests).step);
 }

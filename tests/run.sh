@@ -16,6 +16,9 @@ echo "== ping =="
 ./zig-out/bin/st-client --port $PORT ping | grep -q '"pong":true' && echo PASS
 echo "== version =="
 ./zig-out/bin/st-client --port $PORT version | grep -q '"version"' && echo PASS
+echo "== settings round-trip =="
+./zig-out/bin/st-client --port $PORT settings.save '{"settings":{"power_user":true}}' | grep -q '"saved":true' && echo PASS
+./zig-out/bin/st-client --port $PORT settings.get | grep -q 'power_user' && echo PASS
 echo "== bad method =="
 ./zig-out/bin/st-client --port $PORT nope | grep -q '"ok":false' && echo PASS
 cat "$TMP/server.log"

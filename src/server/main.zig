@@ -1,5 +1,6 @@
 const std = @import("std");
 const protocol = @import("common");
+const store = @import("store");
 const posix = std.posix;
 
 var data_root: []const u8 = "data";
@@ -45,8 +46,61 @@ fn handleClient(conn: posix.fd_t) void {
         _ = posix.write(conn, e) catch {};
         return;
     };
+    // Resolve user (default-user) for data methods.
+    var user: []const u8 = "default-user";
+    if (req.params) |p| {
+        if (p == .object) {
+            if (p.object.get("user")) |uv| {
+                if (uv == .string) user = uv.string;
+            }
+        }
+    }
+    const udir = store.userDir(alloc, data_root, user) catch {
+        const e = protocol.encodeErr(alloc, "bad_user") catch return;
+        defer alloc.free(e);
+        _ = posix.write(conn, e) catch {};
+        return;
+    };
+    defer alloc.free(udir);
+    store.ensureUserDirs(udir) catch {};
     var resp: []u8 = undefined;
-    if (std.mem.eql(u8, req.method, "ping")) {
+    if (std.mem.eql(u8, req.method, "settings.get")) {
+        const path = std.fs.path.join(alloc, &.{ udir, "settings.json" }) catch return;
+        defer alloc.free(path);
+        const content = store.readFileAlloc(alloc, path) catch blk: {
+            const d = alloc.dupe(u8, "{}") catch return;
+            break :blk d;
+        };
+        defer alloc.free(content);
+        resp = protocol.encodeOk(alloc, content) catch return;
+    } else if (std.mem.eql(u8, req.method, "settings.save")) {
+        const path = std.fs.path.join(alloc, &.{ udir, "settings.json" }) catch return;
+        defer alloc.free(path);
+        var to_save: std.json.Value = .{ .object = undefined };
+        var have = false;
+        if (req.params) |p| {
+            if (p == .object and p.object.get("settings") != null) {
+                to_save = p.object.get("settings").?;
+                have = true;
+            } else {
+                to_save = p;
+                have = true;
+            }
+        }
+        if (!have) {
+            resp = protocol.encodeErr(alloc, "bad_request") catch return;
+        } else {
+            const s = store.stringifyValue(alloc, to_save) catch return;
+            defer alloc.free(s);
+            store.writeAtomic(path, s) catch {
+                resp = protocol.encodeErr(alloc, "io_error") catch return;
+                defer alloc.free(resp);
+                _ = posix.write(conn, resp) catch {};
+                return;
+            };
+            resp = protocol.encodeOk(alloc, "{\"saved\":true}") catch return;
+        }
+    } else if (std.mem.eql(u8, req.method, "ping")) {
         resp = protocol.encodeOk(alloc, "{\"pong\":true,\"version\":\"" ++ protocol.VERSION ++ "\"}") catch return;
     } else if (std.mem.eql(u8, req.method, "version")) {
         resp = protocol.encodeOk(alloc, "{\"version\":\"" ++ protocol.VERSION ++ "\",\"name\":\"sillytavern-console-zig\"}") catch return;
