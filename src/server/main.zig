@@ -33,6 +33,44 @@ fn getObjValue(req: protocol.Request, key: []const u8) ?std.json.Value {
     return null;
 }
 
+// Generic JSON collection handler for presets/worldinfo/groups/themes.
+fn genericCollection(alloc: std.mem.Allocator, udir: []const u8, subdir: []const u8, action: []const u8, req: protocol.Request) ![]u8 {
+    const dir = try std.fs.path.join(alloc, &.{ udir, subdir });
+    defer alloc.free(dir);
+    std.fs.cwd().makePath(dir) catch {};
+    if (std.mem.eql(u8, action, "list")) {
+        const names = crud.listNames(alloc, dir) catch return protocol.encodeOk(alloc, "[]");
+        defer { for (names) |nm| alloc.free(nm); alloc.free(names); }
+        const arr = try crud.jsonArrayOfNames(alloc, names);
+        defer alloc.free(arr);
+        return protocol.encodeOk(alloc, arr);
+    } else if (std.mem.eql(u8, action, "save") or std.mem.eql(u8, action, "create")) {
+        const name = getStr(req, "name") orelse return protocol.encodeErr(alloc, "bad_request");
+        if (!protocol.isSafeName(name)) return protocol.encodeErr(alloc, "bad_name");
+        var val: std.json.Value = req.params.?;
+        if (getObjValue(req, "value")) |v| val = v;
+        if (getObjValue(req, "data")) |v| val = v;
+        try crud.saveJson(alloc, dir, name, val);
+        return protocol.encodeOk(alloc, "{\"saved\":true}");
+    } else if (std.mem.eql(u8, action, "load") or std.mem.eql(u8, action, "get")) {
+        const name = getStr(req, "name") orelse return protocol.encodeErr(alloc, "bad_request");
+        if (!protocol.isSafeName(name)) return protocol.encodeErr(alloc, "bad_name");
+        const fname = try std.fmt.allocPrint(alloc, "{s}.json", .{name});
+        defer alloc.free(fname);
+        const content = crud.loadFile(alloc, dir, fname) catch return protocol.encodeErr(alloc, "not_found");
+        defer alloc.free(content);
+        return protocol.encodeOk(alloc, content);
+    } else if (std.mem.eql(u8, action, "delete")) {
+        const name = getStr(req, "name") orelse return protocol.encodeErr(alloc, "bad_request");
+        if (!protocol.isSafeName(name)) return protocol.encodeErr(alloc, "bad_name");
+        const fname = try std.fmt.allocPrint(alloc, "{s}.json", .{name});
+        defer alloc.free(fname);
+        crud.deleteFile(alloc, dir, fname) catch return protocol.encodeErr(alloc, "not_found");
+        return protocol.encodeOk(alloc, "{\"deleted\":true}");
+    }
+    return protocol.encodeErr(alloc, "unknown_method");
+}
+
 fn readLine(stream: posix.fd_t, buf: []u8) !usize {
     var n: usize = 0;
     while (n < buf.len) {
@@ -337,6 +375,26 @@ fn handleClient(conn: posix.fd_t) void {
             return;
         };
         resp = protocol.encodeOk(alloc, "{\"deleted\":true}") catch return;
+    } else if (std.mem.startsWith(u8, req.method, "presets.") or std.mem.startsWith(u8, req.method, "worldinfo.") or std.mem.startsWith(u8, req.method, "groups.") or std.mem.startsWith(u8, req.method, "themes.")) {
+        const dot = std.mem.indexOfScalar(u8, req.method, '.') orelse {
+            resp = protocol.encodeErr(alloc, "unknown_method") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        const prefix = req.method[0..dot];
+        const action = req.method[dot + 1 ..];
+        var subdir: []const u8 = prefix;
+        if (std.mem.eql(u8, prefix, "presets")) subdir = "presets";
+        if (std.mem.eql(u8, prefix, "worldinfo")) subdir = "worldinfo";
+        if (std.mem.eql(u8, prefix, "groups")) subdir = "groups";
+        if (std.mem.eql(u8, prefix, "themes")) subdir = "themes";
+        resp = genericCollection(alloc, udir, subdir, action, req) catch {
+            resp = protocol.encodeErr(alloc, "io_error") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
     } else if (std.mem.eql(u8, req.method, "ping")) {
         resp = protocol.encodeOk(alloc, "{\"pong\":true,\"version\":\"" ++ protocol.VERSION ++ "\"}") catch return;
     } else if (std.mem.eql(u8, req.method, "version")) {

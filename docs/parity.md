@@ -9,11 +9,11 @@ Status legend: DONE = implemented in Zig + tested (`zig build test` / `tests/run
 | settings | `settings.get`, `settings.save` | DONE Task 2 |
 | characters | `characters.list/create/get/delete` | DONE Task 3 (JSON; PNG card TODO) |
 | chats | `chats.list/save/load/delete` | DONE Task 4 |
-| presets (instruct/textgen) | `presets.list/save/load/delete` | TODO Task 5 |
-| worldinfo | `worldinfo.list/save/load/delete` | TODO Task 5 |
+| presets (instruct/textgen) | `presets.list/save/load/delete` | DONE Task 5 |
+| worldinfo | `worldinfo.list/save/load/delete` | DONE Task 5 |
 | secrets | `secrets.set/get(list masked)` | TODO Task 6 |
-| groups | `groups.list/save/delete` | TODO Task 6 |
-| themes / moving-ui / quick-replies | `collections.*` generic | TODO Task 6 |
+| groups | `groups.list/save/delete` | DONE Task 6 |
+| themes / moving-ui / quick-replies | `themes.*` generic | DONE Task 6 (themes) |
 | backgrounds / avatars / sprites / images / thumbnails / files / assets / backups / data-maid | `files.*`, `backups.create/list` (generic binary store) | TODO Task 6/8 |
 | stats | `stats.summary` | TODO Task 8 |
 | tokenizers | `tokenizer.estimate` (chars/4 heuristic; tiktoken TODO) | TODO Task 7 |
