@@ -40,6 +40,14 @@ fn getStr(req: protocol.Request, key: []const u8) ?[]const u8 {
     return null;
 }
 
+// Strip common file suffixes for JS frontend names (avatar_url "X.png" -> "X", file_name "Y.jsonl" -> "Y")
+fn stripSuffix(name: []const u8) []const u8 {
+    if (std.mem.endsWith(u8, name, ".png")) return name[0 .. name.len - 4];
+    if (std.mem.endsWith(u8, name, ".jsonl")) return name[0 .. name.len - 6];
+    if (std.mem.endsWith(u8, name, ".json")) return name[0 .. name.len - 5];
+    return name;
+}
+
 fn getObjValue(req: protocol.Request, key: []const u8) ?std.json.Value {
     if (req.params) |p| {
         if (p == .object) {
@@ -591,18 +599,20 @@ fn handleClient(conn: posix.fd_t) void {
         defer alloc.free(arr);
         resp = protocol.encodeOk(alloc, arr) catch return;
     } else if (std.mem.eql(u8, req.method, "chats.save")) {
-        const ch = getStr(req, "character") orelse getStr(req, "avatar_url") orelse getStr(req, "avatar") orelse {
+        const ch_raw = getStr(req, "character") orelse getStr(req, "avatar_url") orelse getStr(req, "avatar") orelse {
             resp = protocol.encodeErr(alloc, "bad_request") catch return;
             defer alloc.free(resp);
             _ = posix.write(conn, resp) catch {};
             return;
         };
-        const chat = getStr(req, "chat") orelse getStr(req, "file_name") orelse {
+        const ch = stripSuffix(ch_raw);
+        const chat_raw = getStr(req, "chat") orelse getStr(req, "file_name") orelse {
             resp = protocol.encodeErr(alloc, "bad_request") catch return;
             defer alloc.free(resp);
             _ = posix.write(conn, resp) catch {};
             return;
         };
+        const chat = stripSuffix(chat_raw);
         if (!protocol.isSafeName(ch) or !protocol.isSafeName(chat)) {
             resp = protocol.encodeErr(alloc, "bad_name") catch return;
             defer alloc.free(resp);
@@ -650,19 +660,21 @@ fn handleClient(conn: posix.fd_t) void {
         };
         resp = protocol.encodeOk(alloc, "{\"saved\":true}") catch return;
     } else if (std.mem.eql(u8, req.method, "chats.load")) {
-        const ch = getStr(req, "character") orelse getStr(req, "avatar_url") orelse getStr(req, "avatar") orelse getStr(req, "card_name");
-        const ch_final = ch orelse {
+        const ch_raw = getStr(req, "character") orelse getStr(req, "avatar_url") orelse getStr(req, "avatar") orelse getStr(req, "card_name");
+        const ch_final_raw = ch_raw orelse {
             resp = protocol.encodeErr(alloc, "bad_request") catch return;
             defer alloc.free(resp);
             _ = posix.write(conn, resp) catch {};
             return;
         };
-        const chat = getStr(req, "chat") orelse getStr(req, "file_name") orelse {
+        const ch_final = stripSuffix(ch_final_raw);
+        const chat_raw = getStr(req, "chat") orelse getStr(req, "file_name") orelse {
             resp = protocol.encodeErr(alloc, "bad_request") catch return;
             defer alloc.free(resp);
             _ = posix.write(conn, resp) catch {};
             return;
         };
+        const chat = stripSuffix(chat_raw);
         if (!protocol.isSafeName(ch_final) or !protocol.isSafeName(chat)) {
             resp = protocol.encodeErr(alloc, "bad_name") catch return;
             defer alloc.free(resp);
@@ -686,18 +698,20 @@ fn handleClient(conn: posix.fd_t) void {
         defer alloc.free(inner);
         resp = protocol.encodeOk(alloc, inner) catch return;
     } else if (std.mem.eql(u8, req.method, "chats.delete")) {
-        const ch = getStr(req, "character") orelse getStr(req, "avatar_url") orelse getStr(req, "avatar") orelse {
+        const ch_raw = getStr(req, "character") orelse getStr(req, "avatar_url") orelse getStr(req, "avatar") orelse {
             resp = protocol.encodeErr(alloc, "bad_request") catch return;
             defer alloc.free(resp);
             _ = posix.write(conn, resp) catch {};
             return;
         };
-        const chat = getStr(req, "chat") orelse getStr(req, "file_name") orelse {
+        const ch = stripSuffix(ch_raw);
+        const chat_raw = getStr(req, "chat") orelse getStr(req, "file_name") orelse {
             resp = protocol.encodeErr(alloc, "bad_request") catch return;
             defer alloc.free(resp);
             _ = posix.write(conn, resp) catch {};
             return;
         };
+        const chat = stripSuffix(chat_raw);
         const cdir = std.fs.path.join(alloc, &.{ udir, "chats", ch }) catch return;
         defer alloc.free(cdir);
         const fname = std.fmt.allocPrint(alloc, "{s}.jsonl", .{chat}) catch return;
