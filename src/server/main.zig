@@ -167,6 +167,67 @@ fn readLine(stream: posix.fd_t, buf: []u8) !usize {
     return n;
 }
 
+fn handleHttp(conn: posix.fd_t, first_line: []const u8) void {
+    // Static web UI serving (SillyTavern public/) + /api health.
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    // Drain headers
+    var header_buf = alloc.alloc(u8, 8192) catch return;
+    defer alloc.free(header_buf);
+    var drain_pos: usize = 0;
+    while (drain_pos < header_buf.len - 1) {
+        var b: [1]u8 = undefined;
+        const r = posix.read(conn, &b) catch break;
+        if (r == 0) break;
+        header_buf[drain_pos] = b[0];
+        drain_pos += 1;
+        if (drain_pos >= 4 and std.mem.endsWith(u8, header_buf[0..drain_pos], "\r\n\r\n")) break;
+        if (drain_pos >= 3 and std.mem.endsWith(u8, header_buf[0..drain_pos], "\n\n")) break;
+    }
+    // Parse path from request line "GET <path> HTTP/1.1"
+    var path: []const u8 = "/";
+    if (std.mem.indexOfScalar(u8, first_line, ' ')) |s1| {
+        const rest = first_line[s1 + 1 ..];
+        if (std.mem.indexOfScalar(u8, rest, ' ')) |s2| {
+            path = rest[0..s2];
+        }
+    }
+    const clean_path = std.mem.trim(u8, path, " ");
+    if (std.mem.eql(u8, clean_path, "/api/health") or std.mem.eql(u8, clean_path, "/api/ping")) {
+        const body = "{\"ok\":true,\"result\":{\"pong\":true}}";
+        const hdr = std.fmt.allocPrint(alloc, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{body.len}) catch return;
+        defer alloc.free(hdr);
+        _ = posix.write(conn, hdr) catch {};
+        _ = posix.write(conn, body) catch {};
+        return;
+    }
+    var file_path: []const u8 = clean_path;
+    if (std.mem.eql(u8, clean_path, "/")) file_path = "/index.html";
+    // Prevent traversal
+    if (std.mem.indexOf(u8, file_path, "..") != null) {
+        _ = posix.write(conn, "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n") catch {};
+        return;
+    }
+    const web_root = std.posix.getenv("ST_WEB_ROOT") orelse "../SillyTavern/public";
+    const full = std.fs.path.join(alloc, &.{ web_root, file_path[1..] }) catch return;
+    defer alloc.free(full);
+    const content = store.readFileAlloc(alloc, full) catch {
+        _ = posix.write(conn, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n") catch {};
+        return;
+    };
+    defer alloc.free(content);
+    var ctype: []const u8 = "text/plain";
+    if (std.mem.endsWith(u8, file_path, ".html")) ctype = "text/html";
+    if (std.mem.endsWith(u8, file_path, ".js")) ctype = "application/javascript";
+    if (std.mem.endsWith(u8, file_path, ".css")) ctype = "text/css";
+    if (std.mem.endsWith(u8, file_path, ".json")) ctype = "application/json";
+    const hdr = std.fmt.allocPrint(alloc, "HTTP/1.1 200 OK\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{ ctype, content.len }) catch return;
+    defer alloc.free(hdr);
+    _ = posix.write(conn, hdr) catch {};
+    _ = posix.write(conn, content) catch {};
+}
+
 fn handleClient(conn: posix.fd_t) void {
     defer posix.close(conn);
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -181,6 +242,10 @@ fn handleClient(conn: posix.fd_t) void {
         return;
     };
     if (n == 0) return;
+    if (std.mem.startsWith(u8, buf[0..n], "GET ") or std.mem.startsWith(u8, buf[0..n], "POST ")) {
+        handleHttp(conn, buf[0..n]);
+        return;
+    }
     const req = protocol.parseRequest(alloc, buf[0..n]) catch {
         const e = protocol.encodeErr(alloc, "bad_request") catch return;
         defer alloc.free(e);

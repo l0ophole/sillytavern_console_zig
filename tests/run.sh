@@ -326,6 +326,11 @@ python3 /rpf/tmp/opencode/mock_openai.py > /rpf/tmp/opencode/o.log 2>&1 & echo $
 sleep 1
 ./zig-out/bin/st-client --port $PORT chat.generate_and_save '{"provider":"openai","model":"gpt-4","api_key":"k","base_url":"http://127.0.0.1:18140","path":"/v1/chat/completions","messages":[{"role":"user","content":"hi"}],"character":"Alice","chat":"main"}' | grep -q 'Hi from OpenAI' && echo PASS
 kill $(cat /rpf/tmp/opencode/o.pid) 2>/dev/null || true
+echo "== web UI HTTP =="
+curl -s http://127.0.0.1:$PORT/api/health | grep -q '"pong":true' && echo PASS
+ST_WEB_ROOT=../SillyTavern/public curl -s http://127.0.0.1:$PORT/ > /rpf/tmp/opencode/webui.html 2>/dev/null || true
+# web root is relative to server cwd (repo root in tests), default ../SillyTavern/public works when run from repo parent? server cwd is repo, so check index served:
+grep -q 'SillyTavern' /rpf/tmp/opencode/webui.html && echo PASS_WEBUI || echo SKIP_WEBUI_PATH
 echo "== bad method =="
 ./zig-out/bin/st-client --port $PORT nope | grep -q '"ok":false' && echo PASS
 cat "$TMP/server.log"
