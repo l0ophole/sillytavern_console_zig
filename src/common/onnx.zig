@@ -101,6 +101,30 @@ pub const OnnxModel = struct {
                     }
                 }
                 try env.put(node.outputs[0], out);
+            } else if (std.mem.eql(u8, node.op, "Softmax")) {
+                const a = env.get(node.inputs[0]) orelse return error.MissingInput;
+                const out = try alloc.alloc(f32, a.len);
+                var maxv: f32 = a[0];
+                for (a) |v| maxv = @max(maxv, v);
+                var sum: f32 = 0;
+                for (a, 0..) |v, i| {
+                    out[i] = @exp(v - maxv);
+                    sum += out[i];
+                }
+                for (out) |*v| v.* /= sum;
+                try env.put(node.outputs[0], out);
+            } else if (std.mem.eql(u8, node.op, "LayerNormalization")) {
+                const a = env.get(node.inputs[0]) orelse return error.MissingInput;
+                const n = a.len;
+                var mean: f32 = 0;
+                for (a) |v| mean += v;
+                mean /= @as(f32, @floatFromInt(n));
+                var var_sum: f32 = 0;
+                for (a) |v| var_sum += (v - mean) * (v - mean);
+                const stdv = @sqrt(var_sum / @as(f32, @floatFromInt(n)) + 1e-5);
+                const out = try alloc.alloc(f32, a.len);
+                for (a, 0..) |v, i| out[i] = (v - mean) / stdv;
+                try env.put(node.outputs[0], out);
             } else if (std.mem.eql(u8, node.op, "Relu")) {
                 const a = env.get(node.inputs[0]) orelse return error.MissingInput;
                 const out = try alloc.alloc(f32, a.len);
@@ -328,6 +352,37 @@ test "onnx gemm equivalence" {
     defer alloc.free(out);
     try std.testing.expectApproxEqAbs(@as(f32, 3), out[0], 1e-5);
     try std.testing.expectApproxEqAbs(@as(f32, 4), out[1], 1e-5);
+}
+
+test "onnx softmax/layernorm" {
+    const alloc = std.testing.allocator;
+    const tensors = std.StringHashMap(Tensor).init(alloc);
+    var model = OnnxModel{
+        .tensors = tensors,
+        .nodes = try alloc.dupe(Node, &[_]Node{
+            .{ .op = try alloc.dupe(u8, "Softmax"), .inputs = try alloc.dupe([]u8, &[_][]u8{try alloc.dupe(u8, "X")}), .outputs = try alloc.dupe([]u8, &[_][]u8{try alloc.dupe(u8, "Y")}) },
+        }),
+        .input_name = try alloc.dupe(u8, "X"),
+        .output_name = try alloc.dupe(u8, "Y"),
+        .alloc = alloc,
+    };
+    const out = try model.run(alloc, &[_]f32{ 1, 2, 3 });
+    defer alloc.free(out);
+    var sum: f32 = 0;
+    for (out) |v| sum += v;
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), sum, 1e-5);
+    try std.testing.expect(out[2] > out[1] and out[1] > out[0]);
+    for (model.nodes) |n| {
+        alloc.free(n.op);
+        for (n.inputs) |i| alloc.free(i);
+        alloc.free(n.inputs);
+        for (n.outputs) |o| alloc.free(o);
+        alloc.free(n.outputs);
+    }
+    alloc.free(model.nodes);
+    alloc.free(model.input_name);
+    alloc.free(model.output_name);
+    model.tensors.deinit();
 }
 
 test "onnx varint" {
