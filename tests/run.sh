@@ -344,7 +344,7 @@ ST_WEB_ROOT=../SillyTavern/public curl -s http://127.0.0.1:$PORT/ > /rpf/tmp/ope
 # web root is relative to server cwd (repo root in tests), default ../SillyTavern/public works when run from repo parent? server cwd is repo, so check index served:
 grep -q 'SillyTavern' /rpf/tmp/opencode/webui.html && echo PASS_WEBUI || echo SKIP_WEBUI_PATH
 echo "== web API bridge =="
-curl -s -m 5 -X POST -H 'Content-Type: application/json' -d '{}' http://127.0.0.1:$PORT/api/settings.get | grep -q '"ok":true' && echo PASS
+curl -s -m 5 -X POST -H 'Content-Type: application/json' -d '{}' http://127.0.0.1:$PORT/api/settings.get | grep -q '"settings"' && echo PASS
 echo "== provider error parity =="
 cat > /rpf/tmp/opencode/mock_err.py <<'PYEOF'
 import json
@@ -370,7 +370,7 @@ else
   echo SKIP_NO_CLAUDE
 fi
 echo "== frontend API routes =="
-curl -s -m 5 -X POST -H 'Content-Type: application/json' -d '{}' http://127.0.0.1:$PORT/api/settings/load | grep -q '"ok":true' && echo PASS
+curl -s -m 5 -X POST -H 'Content-Type: application/json' -d '{}' http://127.0.0.1:$PORT/api/settings/load | grep -q '"settings"' && echo PASS
 curl -s -m 5 -X POST -H 'Content-Type: application/json' -d '{"name":"Alice","character":{"name":"Alice"}}' http://127.0.0.1:$PORT/api/characters/create | grep -q '"saved"' && echo PASS
 curl -s -m 5 -X POST -H 'Content-Type: application/json' -d '{}' http://127.0.0.1:$PORT/api/characters/list | grep -q 'Alice' && echo PASS
 echo "== multipart frontend upload =="

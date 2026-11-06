@@ -57,6 +57,30 @@ fn getObjValue(req: protocol.Request, key: []const u8) ?std.json.Value {
     return null;
 }
 
+// Convert JSONL file content to a JSON array string (JS getChatData: parse each
+// non-empty line, skip unparseable lines). Empty content -> "[]".
+fn jsonlToArray(alloc: std.mem.Allocator, content: []const u8) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(alloc);
+    try out.append(alloc, '[');
+    var it = std.mem.splitScalar(u8, content, '\n');
+    var first = true;
+    while (it.next()) |line| {
+        const t = std.mem.trim(u8, line, " \t\r");
+        if (t.len == 0) continue;
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const v = std.json.parseFromSlice(std.json.Value, arena.allocator(), t, .{}) catch continue;
+        const s = store.stringifyValue(alloc, v.value) catch continue;
+        defer alloc.free(s);
+        if (!first) try out.append(alloc, ',');
+        first = false;
+        try out.appendSlice(alloc, s);
+    }
+    try out.append(alloc, ']');
+    return out.toOwnedSlice(alloc);
+}
+
 // Generic JSON collection handler for presets/worldinfo/groups/themes.
 fn genericCollection(alloc: std.mem.Allocator, udir: []const u8, subdir: []const u8, action_in: []const u8, req: protocol.Request) ![]u8 {
     var action = action_in;
@@ -380,10 +404,33 @@ fn handleHttp(conn: posix.fd_t, first_line: []const u8) void {
         var rbuf: [65536]u8 = undefined;
         const rn = posix.read(sock, &rbuf) catch 0;
         const resp_body = rbuf[0..rn];
-        const hdr = std.fmt.allocPrint(alloc, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{resp_body.len}) catch return;
+        // Unwrap the TCP envelope to a raw JS body: {"ok":true,"result":X} -> X,
+        // {"ok":false,"error":"m"} -> HTTP 400 {"error":"m"} (JS endpoints send error bodies).
+        var body_out: []const u8 = resp_body;
+        var status: []const u8 = "200 OK";
+        const ok_prefix = "{\"ok\":true,\"result\":";
+        const err_prefix = "{\"ok\":false,\"error\":\"";
+        if (std.mem.startsWith(u8, resp_body, ok_prefix) and std.mem.endsWith(u8, std.mem.trim(u8, resp_body, " \t\r\n"), "}")) {
+            const t = std.mem.trim(u8, resp_body, " \t\r\n");
+            body_out = t[ok_prefix.len .. t.len - 1];
+        } else if (std.mem.startsWith(u8, resp_body, err_prefix)) {
+            const t = std.mem.trim(u8, resp_body, " \t\r\n");
+            const msg_end = t.len - 2; // strip "}
+            if (msg_end > err_prefix.len) {
+                const mk = std.fmt.allocPrint(alloc, "{{\"error\":{s}}}", .{t[err_prefix.len - 1 .. msg_end + 1]}) catch resp_body;
+                defer alloc.free(mk);
+                status = "400 Bad Request";
+                const hdr2 = std.fmt.allocPrint(alloc, "HTTP/1.1 {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{ status, mk.len }) catch return;
+                defer alloc.free(hdr2);
+                _ = posix.write(conn, hdr2) catch {};
+                _ = posix.write(conn, mk) catch {};
+                return;
+            }
+        }
+        const hdr = std.fmt.allocPrint(alloc, "HTTP/1.1 {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{ status, body_out.len }) catch return;
         defer alloc.free(hdr);
         _ = posix.write(conn, hdr) catch {};
-        _ = posix.write(conn, resp_body) catch {};
+        _ = posix.write(conn, body_out) catch {};
         return;
     }
     if (std.mem.eql(u8, clean_path, "/api/health") or std.mem.eql(u8, clean_path, "/api/ping")) {
@@ -649,7 +696,8 @@ fn handleClient(conn: posix.fd_t) void {
             return;
         };
         const ch = stripSuffix(ch_raw);
-        const chat_raw = getStr(req, "chat") orelse getStr(req, "file_name") orelse {
+        // JS style: {avatar_url, file_name, chat: [...]}; TCP style: {character, chat: "name", data: [...]}
+        const chat_raw = getStr(req, "file_name") orelse getStr(req, "chat") orelse {
             resp = protocol.encodeErr(alloc, "bad_request") catch return;
             defer alloc.free(resp);
             _ = posix.write(conn, resp) catch {};
@@ -672,8 +720,6 @@ fn handleClient(conn: posix.fd_t) void {
         var content: []u8 = undefined;
         if (getStr(req, "content")) |c| {
             content = alloc.dupe(u8, c) catch return;
-        } else if (getStr(req, "chat")) |c2| {
-            content = alloc.dupe(u8, c2) catch return;
         } else if (getObjValue(req, "data")) |d| {
             if (d == .array) {
                 var out: std.ArrayListUnmanaged(u8) = .empty;
@@ -687,6 +733,21 @@ fn handleClient(conn: posix.fd_t) void {
                 content = out.toOwnedSlice(alloc) catch return;
             } else {
                 content = store.stringifyValue(alloc, d) catch return;
+            }
+        } else if (getObjValue(req, "chat")) |c2| {
+            // JS style: chat field holds the message array
+            if (c2 == .array) {
+                var out: std.ArrayListUnmanaged(u8) = .empty;
+                defer out.deinit(alloc);
+                for (c2.array.items) |item| {
+                    const s = store.stringifyValue(alloc, item) catch return;
+                    defer alloc.free(s);
+                    out.appendSlice(alloc, s) catch return;
+                    out.append(alloc, '\n') catch return;
+                }
+                content = out.toOwnedSlice(alloc) catch return;
+            } else {
+                content = store.stringifyValue(alloc, c2) catch return;
             }
         } else {
             resp = protocol.encodeErr(alloc, "bad_request") catch return;
@@ -736,11 +797,10 @@ fn handleClient(conn: posix.fd_t) void {
             return;
         };
         defer alloc.free(content);
-        const q = protocol.jsonQuote(alloc, content) catch return;
-        defer alloc.free(q);
-        const inner = std.fmt.allocPrint(alloc, "{{\"content\":{s}}}", .{q}) catch return;
-        defer alloc.free(inner);
-        resp = protocol.encodeOk(alloc, inner) catch return;
+        // JS /api/chats/get returns the parsed chat array (getChatData), not a content wrapper
+        const arr = jsonlToArray(alloc, content) catch return;
+        defer alloc.free(arr);
+        resp = protocol.encodeOk(alloc, arr) catch return;
     } else if (std.mem.eql(u8, req.method, "chats.delete")) {
         const ch_raw = getStr(req, "character") orelse getStr(req, "avatar_url") orelse getStr(req, "avatar") orelse {
             resp = protocol.encodeErr(alloc, "bad_request") catch return;
@@ -3446,11 +3506,9 @@ fn handleClient(conn: posix.fd_t) void {
                         return;
                     };
                     defer alloc.free(content);
-                    const q = protocol.jsonQuote(alloc, content) catch return;
-                    defer alloc.free(q);
-                    const inner = std.fmt.allocPrint(alloc, "{{\"content\":{s}}}", .{q}) catch return;
-                    defer alloc.free(inner);
-                    resp = protocol.encodeOk(alloc, inner) catch return;
+                    const arr = jsonlToArray(alloc, content) catch return;
+                    defer alloc.free(arr);
+                    resp = protocol.encodeOk(alloc, arr) catch return;
                 } else {
                     resp = protocol.encodeOk(alloc, "{}") catch return;
                 }
