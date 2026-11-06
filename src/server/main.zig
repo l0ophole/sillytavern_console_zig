@@ -1666,6 +1666,94 @@ fn handleClient(conn: posix.fd_t) void {
         const inner = std.fmt.allocPrint(alloc, "{{\"saved\":{s},\"bytes\":{d},\"status\":{d}}}", .{ q, fetched.body.len, fetched.status }) catch return;
         defer alloc.free(inner);
         resp = protocol.encodeOk(alloc, inner) catch return;
+    } else if (std.mem.eql(u8, req.method, "classify.classify")) {
+        const text = getStr(req, "text") orelse {
+            resp = protocol.encodeErr(alloc, "bad_request") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        const base = getStr(req, "base_url") orelse "http://127.0.0.1:11434";
+        const cpath = getStr(req, "path") orelse "/classify";
+        const url = std.fmt.allocPrint(alloc, "{s}{s}", .{ base, cpath }) catch return;
+        defer alloc.free(url);
+        var bb: std.ArrayListUnmanaged(u8) = .empty;
+        defer bb.deinit(alloc);
+        bb.appendSlice(alloc, "{\"text\":\"") catch return;
+        for (text) |c| {
+            if (c == '"' or c == '\\') bb.append(alloc, '\\') catch return;
+            if (c == '\n') {
+                bb.appendSlice(alloc, "\\n") catch return;
+            } else {
+                bb.append(alloc, c) catch return;
+            }
+        }
+        bb.appendSlice(alloc, "\"}") catch return;
+        const body = bb.toOwnedSlice(alloc) catch return;
+        defer alloc.free(body);
+        const fetched = backend.fetchUrl(alloc, url, "POST", body) catch {
+            resp = protocol.encodeErr(alloc, "backend_unreachable") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        defer alloc.free(fetched.body);
+        // Normalize: pass through API array if present, else wrap
+        const inner = std.fmt.allocPrint(alloc, "{{\"status\":{d},\"classification\":{s}}}", .{ fetched.status, fetched.body }) catch return;
+        // fetched.body may be raw JSON array or text; if not valid JSON object/array, quote it
+        defer alloc.free(inner);
+        resp = protocol.encodeOk(alloc, inner) catch return;
+    } else if (std.mem.eql(u8, req.method, "translate.translate")) {
+        const text = getStr(req, "text") orelse {
+            resp = protocol.encodeErr(alloc, "bad_request") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        const source = getStr(req, "source") orelse "auto";
+        const target = getStr(req, "target") orelse "en";
+        const base = getStr(req, "base_url") orelse "http://127.0.0.1:1188/translate";
+        var bb: std.ArrayListUnmanaged(u8) = .empty;
+        defer bb.deinit(alloc);
+        bb.appendSlice(alloc, "{\"text\":\"") catch return;
+        for (text) |c| {
+            if (c == '"' or c == '\\') bb.append(alloc, '\\') catch return;
+            if (c == '\n') {
+                bb.appendSlice(alloc, "\\n") catch return;
+            } else {
+                bb.append(alloc, c) catch return;
+            }
+        }
+        const tail = std.fmt.allocPrint(alloc, "\",\"source_lang\":\"{s}\",\"target_lang\":\"{s}\"}}", .{ source, target }) catch return;
+        defer alloc.free(tail);
+        bb.appendSlice(alloc, tail) catch return;
+        const body = bb.toOwnedSlice(alloc) catch return;
+        defer alloc.free(body);
+        const fetched = backend.fetchUrl(alloc, base, "POST", body) catch {
+            resp = protocol.encodeErr(alloc, "backend_unreachable") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        defer alloc.free(fetched.body);
+        // Parse {data} or {translatedText} or plain
+        var translated: []const u8 = fetched.body;
+        if (std.json.parseFromSlice(std.json.Value, alloc, fetched.body, .{})) |parsed| {
+            if (parsed.value == .object) {
+                if (parsed.value.object.get("data")) |d| {
+                    if (d == .string) translated = d.string;
+                } else if (parsed.value.object.get("translatedText")) |d| {
+                    if (d == .string) translated = d.string;
+                } else if (parsed.value.object.get("text")) |d| {
+                    if (d == .string) translated = d.string;
+                }
+            }
+        } else |_| {}
+        const tq = protocol.jsonQuote(alloc, translated) catch return;
+        defer alloc.free(tq);
+        const inner = std.fmt.allocPrint(alloc, "{{\"translatedText\":{s},\"status\":{d}}}", .{ tq, fetched.status }) catch return;
+        defer alloc.free(inner);
+        resp = protocol.encodeOk(alloc, inner) catch return;
     } else if (std.mem.startsWith(u8, req.method, "speech.") or std.mem.startsWith(u8, req.method, "caption.") or std.mem.startsWith(u8, req.method, "classify.") or std.mem.startsWith(u8, req.method, "translate.") or std.mem.startsWith(u8, req.method, "stable-diffusion.") or std.mem.startsWith(u8, req.method, "openai.") or std.mem.startsWith(u8, req.method, "anthropic.") or std.mem.startsWith(u8, req.method, "google.") or std.mem.startsWith(u8, req.method, "azure.") or std.mem.startsWith(u8, req.method, "openrouter.") or std.mem.startsWith(u8, req.method, "novelai.") or std.mem.startsWith(u8, req.method, "horde.") or std.mem.startsWith(u8, req.method, "minimax.") or std.mem.startsWith(u8, req.method, "volcengine.") or std.mem.startsWith(u8, req.method, "nanogpt.") or std.mem.startsWith(u8, req.method, "backends.")) {
         // Generic HTTP proxy to third-party APIs (speech TTS/STT, caption, classify,
         // translate, SD image gen, LLM providers, horde, backends/*).

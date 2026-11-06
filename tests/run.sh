@@ -243,6 +243,23 @@ python3 /rpf/tmp/opencode/mock_tts.py > /rpf/tmp/opencode/tts.log 2>&1 & echo $!
 sleep 1
 ./zig-out/bin/st-client --port $PORT speech.tts '{"input":"Hello","name":"hello.mp3","api_key":"k","base_url":"http://127.0.0.1:18131"}' | grep -q 'hello.mp3' && echo PASS
 kill $(cat /rpf/tmp/opencode/tts.pid) 2>/dev/null || true
+echo "== classify/translate full =="
+cat > /rpf/tmp/opencode/mock_ct.py <<'PYEOF'
+import json
+from http.server import BaseHTTPRequestHandler, HTTPServer
+class H(BaseHTTPRequestHandler):
+    def do_POST(self):
+        ln=int(self.headers.get('Content-Length',0)); self.rfile.read(ln)
+        data=json.dumps([{"label":"positive","score":0.9}]).encode() if self.path=='/classify' else json.dumps({"data":"Bonjour"}).encode()
+        self.send_response(200); self.send_header('Content-Type','application/json'); self.send_header('Content-Length',str(len(data))); self.end_headers(); self.wfile.write(data)
+    def log_message(self,*a): pass
+HTTPServer(('127.0.0.1',18133),H).serve_forever()
+PYEOF
+python3 /rpf/tmp/opencode/mock_ct.py > /rpf/tmp/opencode/ct.log 2>&1 & echo $! > /rpf/tmp/opencode/ct.pid
+sleep 1
+./zig-out/bin/st-client --port $PORT classify.classify '{"text":"I love this","base_url":"http://127.0.0.1:18133","path":"/classify"}' | grep -q 'positive' && echo PASS
+./zig-out/bin/st-client --port $PORT translate.translate '{"text":"Hello","source":"en","target":"fr","base_url":"http://127.0.0.1:18133/translate"}' | grep -q 'Bonjour' && echo PASS
+kill $(cat /rpf/tmp/opencode/ct.pid) 2>/dev/null || true
 echo "== bad method =="
 ./zig-out/bin/st-client --port $PORT nope | grep -q '"ok":false' && echo PASS
 cat "$TMP/server.log"
