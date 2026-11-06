@@ -158,6 +158,8 @@ if [ -s /rpf/tmp/opencode/p50k_base.tiktoken ]; then
 else
   echo SKIP_NO_P50K
 fi
+echo "== REPL =="
+printf "/help\n/ping\n/exit\n" | timeout 5 ./zig-out/bin/st-client --port $PORT | grep -q '"pong":true' && echo PASS
 echo "== bad method =="
 ./zig-out/bin/st-client --port $PORT nope | grep -q '"ok":false' && echo PASS
 cat "$TMP/server.log"
