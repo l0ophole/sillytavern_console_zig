@@ -1122,6 +1122,84 @@ fn handleClient(conn: posix.fd_t) void {
         } else {
             resp = protocol.encodeErr(alloc, "unknown_method") catch return;
         }
+    } else if (std.mem.eql(u8, req.method, "vectors.generate")) {
+        const text = getStr(req, "text") orelse {
+            resp = protocol.encodeErr(alloc, "bad_request") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        var dim: usize = 32;
+        if (getObjValue(req, "dim")) |dv| {
+            if (dv == .integer) dim = @intCast(dv.integer);
+        }
+        const vec = vectors_mod.localEmbed(alloc, text, dim) catch return;
+        defer alloc.free(vec);
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        defer out.deinit(alloc);
+        out.append(alloc, '[') catch return;
+        for (vec, 0..) |v, idx| {
+            if (idx > 0) out.append(alloc, ',') catch return;
+            const vs = std.fmt.allocPrint(alloc, "{d}", .{v}) catch return;
+            defer alloc.free(vs);
+            out.appendSlice(alloc, vs) catch return;
+        }
+        out.append(alloc, ']') catch return;
+        const arr = out.toOwnedSlice(alloc) catch return;
+        defer alloc.free(arr);
+        const inner = std.fmt.allocPrint(alloc, "{{\"vector\":{s},\"dim\":{d},\"local\":true}}", .{ arr, dim }) catch return;
+        defer alloc.free(inner);
+        resp = protocol.encodeOk(alloc, inner) catch return;
+    } else if (std.mem.eql(u8, req.method, "vectors.embed")) {
+        // Proxy to embedding API (host/port/path/body or url)
+        if (getStr(req, "url")) |u| {
+            var body_str: []u8 = undefined;
+            if (getObjValue(req, "body")) |bv| {
+                body_str = store.stringifyValue(alloc, bv) catch return;
+            } else {
+                body_str = alloc.dupe(u8, "{}") catch return;
+            }
+            defer alloc.free(body_str);
+            const fetched = backend.fetchUrl(alloc, u, "POST", body_str) catch {
+                resp = protocol.encodeErr(alloc, "backend_unreachable") catch return;
+                defer alloc.free(resp);
+                _ = posix.write(conn, resp) catch {};
+                return;
+            };
+            defer alloc.free(fetched.body);
+            const q = protocol.jsonQuote(alloc, fetched.body) catch return;
+            defer alloc.free(q);
+            const inner = std.fmt.allocPrint(alloc, "{{\"status\":{d},\"body\":{s}}}", .{ fetched.status, q }) catch return;
+            defer alloc.free(inner);
+            resp = protocol.encodeOk(alloc, inner) catch return;
+        } else {
+            const bhost = getStr(req, "host") orelse "127.0.0.1";
+            const bpath = getStr(req, "path") orelse "/v1/embeddings";
+            var bport: u16 = 11434;
+            if (getObjValue(req, "port")) |pv| {
+                if (pv == .integer) bport = @intCast(pv.integer);
+            }
+            var body_str: []u8 = undefined;
+            if (getObjValue(req, "body")) |bv| {
+                body_str = store.stringifyValue(alloc, bv) catch return;
+            } else {
+                body_str = alloc.dupe(u8, "{}") catch return;
+            }
+            defer alloc.free(body_str);
+            const raw = backend.forwardHttp(alloc, bhost, bport, bpath, body_str) catch {
+                resp = protocol.encodeErr(alloc, "backend_unreachable") catch return;
+                defer alloc.free(resp);
+                _ = posix.write(conn, resp) catch {};
+                return;
+            };
+            defer alloc.free(raw);
+            const split = backend.splitHttpResponse(raw);
+            const q = protocol.jsonQuote(alloc, split.body) catch return;
+            defer alloc.free(q);
+            const inner = std.fmt.allocPrint(alloc, "{{\"status\":{d},\"body\":{s}}}", .{ split.status, q }) catch return;
+            defer alloc.free(inner);
+            resp = protocol.encodeOk(alloc, inner) catch return;
+        }
     } else if (std.mem.startsWith(u8, req.method, "vectors.")) {
         const dot = std.mem.indexOfScalar(u8, req.method, '.') orelse {
             resp = protocol.encodeErr(alloc, "unknown_method") catch return;
@@ -1156,7 +1234,18 @@ fn handleClient(conn: posix.fd_t) void {
             var val: std.json.Value = req.params.?;
             if (getObjValue(req, "value")) |v| val = v;
             if (getObjValue(req, "data")) |v| val = v;
-            // val should be object with vector; if params has vector directly, wrap
+            // Auto-generate local embedding if text given without vector
+            if (val == .object and val.object.get("vector") == null) {
+                if (val.object.get("text")) |tv| {
+                    if (tv == .string) {
+                        const gen = vectors_mod.localEmbed(alloc, tv.string, 32) catch return;
+                        defer alloc.free(gen);
+                        var arr = std.json.Array.init(alloc);
+                        for (gen) |f| arr.append(.{ .float = f }) catch return;
+                        val.object.put("vector", .{ .array = arr }) catch return;
+                    }
+                }
+            }
             crud.saveJson(alloc, cdir, vid, val) catch {
                 resp = protocol.encodeErr(alloc, "io_error") catch return;
                 defer alloc.free(resp);
