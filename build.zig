@@ -7,10 +7,14 @@ pub fn build(b: *std.Build) void {
     const common = b.addModule("common", .{ .root_source_file = b.path("src/common/protocol.zig") });
     const store = b.addModule("store", .{ .root_source_file = b.path("src/common/store.zig") });
     store.addImport("common", common);
+    const crud = b.addModule("crud", .{ .root_source_file = b.path("src/common/crud.zig") });
+    crud.addImport("common", common);
+    crud.addImport("store", store);
 
     const server_mod = b.createModule(.{ .root_source_file = b.path("src/server/main.zig"), .target = target, .optimize = optimize });
     server_mod.addImport("common", common);
     server_mod.addImport("store", store);
+    server_mod.addImport("crud", crud);
     const server = b.addExecutable(.{ .name = "st-server", .root_module = server_mod });
     b.installArtifact(server);
 
@@ -34,7 +38,12 @@ pub fn build(b: *std.Build) void {
     const store_test_mod = b.createModule(.{ .root_source_file = b.path("src/common/store.zig"), .target = target, .optimize = optimize });
     store_test_mod.addImport("common", common);
     const store_tests = b.addTest(.{ .root_module = store_test_mod });
+    const crud_test_mod = b.createModule(.{ .root_source_file = b.path("src/common/crud.zig"), .target = target, .optimize = optimize });
+    crud_test_mod.addImport("common", common);
+    crud_test_mod.addImport("store", store);
+    const crud_tests = b.addTest(.{ .root_module = crud_test_mod });
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&b.addRunArtifact(unit_tests).step);
     test_step.dependOn(&b.addRunArtifact(store_tests).step);
+    test_step.dependOn(&b.addRunArtifact(crud_tests).step);
 }
