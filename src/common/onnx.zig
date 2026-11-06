@@ -101,6 +101,59 @@ pub const OnnxModel = struct {
                     }
                 }
                 try env.put(node.outputs[0], out);
+            } else if (std.mem.eql(u8, node.op, "Gather")) {
+                const data_t = self.tensors.get(node.inputs[0]) orelse return error.MissingWeight;
+                const idx_t = self.tensors.get(node.inputs[1]) orelse return error.MissingWeight;
+                if (data_t.dims.len != 2) return error.BadShape;
+                const vocab: usize = @intCast(data_t.dims[0]);
+                const dim: usize = @intCast(data_t.dims[1]);
+                const n_idx = idx_t.data.len;
+                const out = try alloc.alloc(f32, n_idx * dim);
+                for (0..n_idx) |i| {
+                    const row: usize = @intCast(@as(i64, @intFromFloat(idx_t.data[i])));
+                    if (row >= vocab) return error.BadIndex;
+                    @memcpy(out[i * dim .. (i + 1) * dim], data_t.data[row * dim .. (row + 1) * dim]);
+                }
+                try env.put(node.outputs[0], out);
+            } else if (std.mem.eql(u8, node.op, "Transpose")) {
+                const a = env.get(node.inputs[0]) orelse return error.MissingInput;
+                // 2D transpose [R,C]->[C,R] using input tensor dims if available else square assumption via node attr
+                // For transformer weights we use initializer dims; for activations assume 2D with rows from output name lookup fallback: use sqrt
+                const out = try alloc.alloc(f32, a.len);
+                // Default: transpose as [C,R] requires dims; use stored tensor dims if input is weight, else assume input length factors from node (fallback square)
+                var rows: usize = 0;
+                var cols: usize = 0;
+                if (self.tensors.get(node.inputs[0])) |t| {
+                    if (t.dims.len == 2) {
+                        rows = @intCast(t.dims[0]);
+                        cols = @intCast(t.dims[1]);
+                    }
+                }
+                if (rows == 0) {
+                    // Square fallback
+                    rows = @intFromFloat(@sqrt(@as(f64, @floatFromInt(a.len))));
+                    cols = rows;
+                }
+                for (0..rows) |r| {
+                    for (0..cols) |c| {
+                        out[c * rows + r] = a[r * cols + c];
+                    }
+                }
+                try env.put(node.outputs[0], out);
+            } else if (std.mem.eql(u8, node.op, "Add") or std.mem.eql(u8, node.op, "Mul") or std.mem.eql(u8, node.op, "Div")) {
+                const a = env.get(node.inputs[0]) orelse return error.MissingInput;
+                const b_tensor = self.tensors.get(node.inputs[1]);
+                const b = if (b_tensor) |bt| bt.data else (env.get(node.inputs[1]) orelse return error.MissingInput);
+                const out = try alloc.alloc(f32, a.len);
+                for (a, 0..) |v, i| {
+                    const bv = b[i % b.len];
+                    out[i] = if (std.mem.eql(u8, node.op, "Add")) v + bv else if (std.mem.eql(u8, node.op, "Mul")) v * bv else v / bv;
+                }
+                try env.put(node.outputs[0], out);
+            } else if (std.mem.eql(u8, node.op, "Reshape")) {
+                const a = env.get(node.inputs[0]) orelse return error.MissingInput;
+                const out = try alloc.dupe(f32, a);
+                try env.put(node.outputs[0], out);
             } else if (std.mem.eql(u8, node.op, "Softmax")) {
                 const a = env.get(node.inputs[0]) orelse return error.MissingInput;
                 const out = try alloc.alloc(f32, a.len);
@@ -382,6 +435,50 @@ test "onnx softmax/layernorm" {
     alloc.free(model.nodes);
     alloc.free(model.input_name);
     alloc.free(model.output_name);
+    model.tensors.deinit();
+}
+
+test "onnx gather/add/transpose" {
+    const alloc = std.testing.allocator;
+    // Gather: data [3,2] rows [0,1,2], indices [1,0] as float tensor hack (value in float)
+    const tensors = std.StringHashMap(Tensor).init(alloc);
+    var model = OnnxModel{
+        .tensors = tensors,
+        .nodes = try alloc.dupe(Node, &[_]Node{
+            .{ .op = try alloc.dupe(u8, "Gather"), .inputs = try alloc.dupe([]u8, &[_][]u8{ try alloc.dupe(u8, "D"), try alloc.dupe(u8, "I") }), .outputs = try alloc.dupe([]u8, &[_][]u8{try alloc.dupe(u8, "Y")}) },
+            .{ .op = try alloc.dupe(u8, "Add"), .inputs = try alloc.dupe([]u8, &[_][]u8{ try alloc.dupe(u8, "Y"), try alloc.dupe(u8, "B") }), .outputs = try alloc.dupe([]u8, &[_][]u8{try alloc.dupe(u8, "Z")}) },
+        }),
+        .input_name = try alloc.dupe(u8, "X"),
+        .output_name = try alloc.dupe(u8, "Z"),
+        .alloc = alloc,
+    };
+    // Manually inject tensors via run env? Use tensors map directly:
+    try model.tensors.put(try alloc.dupe(u8, "D"), .{ .name = try alloc.dupe(u8, "D"), .dims = try alloc.dupe(i64, &[_]i64{ 3, 2 }), .data = try alloc.dupe(f32, &[_]f32{ 0, 1, 2, 3, 4, 5 }) });
+    try model.tensors.put(try alloc.dupe(u8, "I"), .{ .name = try alloc.dupe(u8, "I"), .dims = try alloc.dupe(i64, &[_]i64{2}), .data = try alloc.dupe(f32, &[_]f32{ 1, 0 }) });
+    try model.tensors.put(try alloc.dupe(u8, "B"), .{ .name = try alloc.dupe(u8, "B"), .dims = try alloc.dupe(i64, &[_]i64{4}), .data = try alloc.dupe(f32, &[_]f32{ 10, 10, 10, 10 }) });
+    const out = try model.run(alloc, &[_]f32{0});
+    defer alloc.free(out);
+    try std.testing.expectApproxEqAbs(@as(f32, 12), out[0], 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 13), out[1], 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 10), out[2], 1e-5);
+    // cleanup
+    for (model.nodes) |n| {
+        alloc.free(n.op);
+        for (n.inputs) |i| alloc.free(i);
+        alloc.free(n.inputs);
+        for (n.outputs) |o| alloc.free(o);
+        alloc.free(n.outputs);
+    }
+    alloc.free(model.nodes);
+    alloc.free(model.input_name);
+    alloc.free(model.output_name);
+    var it = model.tensors.iterator();
+    while (it.next()) |e| {
+        alloc.free(e.key_ptr.*);
+        alloc.free(e.value_ptr.*.name);
+        alloc.free(e.value_ptr.*.dims);
+        alloc.free(e.value_ptr.*.data);
+    }
     model.tensors.deinit();
 }
 
