@@ -72,6 +72,33 @@ pub fn loadVocab(alloc: std.mem.Allocator, path: []const u8) !BpeVocab {
     return vocab;
 }
 
+/// Load HuggingFace tokenizer.json BPE vocab (model.vocab: token -> id).
+/// Works for llama3.json bundled in SillyTavern (src/tokenizers/llama3.json).
+pub fn loadHfVocab(alloc: std.mem.Allocator, path: []const u8) !BpeVocab {
+    const f = try std.fs.cwd().openFile(path, .{});
+    defer f.close();
+    const content = try f.readToEndAlloc(alloc, 20 << 20);
+    defer alloc.free(content);
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    // Parse with arena to avoid leaks; copy keys out
+    const parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), content, .{});
+    if (parsed.value != .object) return error.BadVocab;
+    const model = parsed.value.object.get("model") orelse return error.BadVocab;
+    if (model != .object) return error.BadVocab;
+    const vocab_v = model.object.get("vocab") orelse return error.BadVocab;
+    if (vocab_v != .object) return error.BadVocab;
+    var vocab = BpeVocab.init(alloc);
+    errdefer vocab.deinit();
+    var it = vocab_v.object.iterator();
+    while (it.next()) |kv| {
+        if (kv.value_ptr.* != .integer) continue;
+        const key = try alloc.dupe(u8, kv.key_ptr.*);
+        try vocab.ranks.put(key, @intCast(kv.value_ptr.*.integer));
+    }
+    arena.deinit();
+    return vocab;
+}
+
 fn byteLevelEncode(alloc: std.mem.Allocator, chunk: []const u8, out: *std.ArrayListUnmanaged([]u8)) !void {
     for (chunk) |byte| {
         const cp = bytesToUnicode(byte);

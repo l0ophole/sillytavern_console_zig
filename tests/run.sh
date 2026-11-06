@@ -193,6 +193,12 @@ python3 /rpf/tmp/opencode/mock_kobold.py > /rpf/tmp/opencode/k.log 2>&1 & echo $
 sleep 1
 ./zig-out/bin/st-client --port $PORT backend.native '{"provider":"kobold","model":"m","base_url":"http://127.0.0.1:18124","path":"/api/v1/generate","messages":[{"role":"user","content":"hi"}]}' | grep -q 'kobold mock out' && echo PASS
 kill $(cat /rpf/tmp/opencode/k.pid) 2>/dev/null || true
+echo "== llama tokenizer =="
+if [ -f ../SillyTavern/src/tokenizers/llama3.json ]; then
+  ./zig-out/bin/st-client --port $PORT tokenizer.encode '{"text":"hello world","vocab":"../SillyTavern/src/tokenizers/llama3.json"}' | grep -q '15339,1917' && echo PASS_LLAMA || echo FAIL_LLAMA
+else
+  echo SKIP_NO_LLAMA
+fi
 echo "== bad method =="
 ./zig-out/bin/st-client --port $PORT nope | grep -q '"ok":false' && echo PASS
 cat "$TMP/server.log"

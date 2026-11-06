@@ -1904,15 +1904,28 @@ fn handleClient(conn: posix.fd_t) void {
             break :blk "data/tokenizers/cl100k_base.tiktoken";
         };
         defer if (vocab_path_owned) |vp| alloc.free(vp);
-        var vocab = tokenizer.loadVocab(alloc, vocab_path) catch {
-            const nest = tokenizer.estimateTokens(text);
-            const inner = std.fmt.allocPrint(alloc, "{{\"tokens\":{d},\"exact\":false}}", .{nest}) catch return;
-            defer alloc.free(inner);
-            resp = protocol.encodeOk(alloc, inner) catch return;
-            defer alloc.free(resp);
-            _ = posix.write(conn, resp) catch {};
-            return;
-        };
+        var vocab: tokenizer.BpeVocab = undefined;
+        if (std.mem.endsWith(u8, vocab_path, ".json")) {
+            vocab = tokenizer.loadHfVocab(alloc, vocab_path) catch {
+                const nest = tokenizer.estimateTokens(text);
+                const inner = std.fmt.allocPrint(alloc, "{{\"tokens\":{d},\"exact\":false}}", .{nest}) catch return;
+                defer alloc.free(inner);
+                resp = protocol.encodeOk(alloc, inner) catch return;
+                defer alloc.free(resp);
+                _ = posix.write(conn, resp) catch {};
+                return;
+            };
+        } else {
+            vocab = tokenizer.loadVocab(alloc, vocab_path) catch {
+                const nest = tokenizer.estimateTokens(text);
+                const inner = std.fmt.allocPrint(alloc, "{{\"tokens\":{d},\"exact\":false}}", .{nest}) catch return;
+                defer alloc.free(inner);
+                resp = protocol.encodeOk(alloc, inner) catch return;
+                defer alloc.free(resp);
+                _ = posix.write(conn, resp) catch {};
+                return;
+            };
+        }
         defer vocab.deinit();
         const ids = tokenizer.bpeEncode(alloc, &vocab, text) catch {
             resp = protocol.encodeErr(alloc, "tokenize_failed") catch return;
