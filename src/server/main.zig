@@ -2798,6 +2798,103 @@ fn handleClient(conn: posix.fd_t) void {
         const inner = std.fmt.allocPrint(alloc, "{{\"text\":{s},\"provider\":\"{s}\",\"status\":{d},\"saved\":{s}}}", .{ tq, prov.name, fetched.status, if (saved) "true" else "false" }) catch return;
         defer alloc.free(inner);
         resp = protocol.encodeOk(alloc, inner) catch return;
+    } else if (std.mem.eql(u8, req.method, "backend.stream")) {
+        // Streaming SDK flow: SSE deltas accumulated into full text.
+        const pname = getStr(req, "provider") orelse "openai";
+        const prov = providers_mod.getProvider(pname) orelse {
+            resp = protocol.encodeErr(alloc, "unknown_provider") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        const model_name = getStr(req, "model") orelse "gpt-4";
+        var msgs_json: []u8 = undefined;
+        if (getObjValue(req, "messages")) |mv| {
+            msgs_json = store.stringifyValue(alloc, mv) catch return;
+        } else {
+            msgs_json = alloc.dupe(u8, "[]") catch return;
+        }
+        defer alloc.free(msgs_json);
+        var native_body = providers_mod.buildNativeBody(alloc, pname, model_name, msgs_json, 1024) catch return;
+        defer alloc.free(native_body);
+        // Inject stream:true before final }
+        const with_stream = std.fmt.allocPrint(alloc, "{s},\"stream\":true}}", .{native_body[0 .. native_body.len - 1]}) catch return;
+        defer alloc.free(with_stream);
+        const url = providers_mod.buildUrl(alloc, prov, getStr(req, "base_url"), getStr(req, "path")) catch return;
+        defer alloc.free(url);
+        const ak = getStr(req, "api_key") orelse "";
+        var headers_buf: [3]std.http.Header = undefined;
+        headers_buf[0] = .{ .name = "Content-Type", .value = "application/json" };
+        var auth_val: ?[]u8 = null;
+        var nheaders: usize = 1;
+        if (prov.auth_header.len > 0) {
+            auth_val = std.fmt.allocPrint(alloc, "{s}{s}", .{ prov.auth_prefix, ak }) catch return;
+            headers_buf[1] = .{ .name = prov.auth_header, .value = auth_val.? };
+            nheaders = 2;
+        }
+        defer if (auth_val) |av| alloc.free(av);
+        const fetched = backend.fetchUrlHeaders(alloc, url, "POST", with_stream, headers_buf[0..nheaders]) catch {
+            resp = protocol.encodeErr(alloc, "backend_unreachable") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        defer alloc.free(fetched.body);
+        // Parse SSE: split on \n\n, each data: {...} or [DONE]
+        var full: std.ArrayListUnmanaged(u8) = .empty;
+        defer full.deinit(alloc);
+        var chunks: usize = 0;
+        var pos: usize = 0;
+        while (pos < fetched.body.len) {
+            const data_idx = std.mem.indexOf(u8, fetched.body[pos..], "data:") orelse break;
+            const line_start = pos + data_idx + 5;
+            const line_end = std.mem.indexOfScalar(u8, fetched.body[line_start..], '\n') orelse fetched.body.len;
+            const payload = std.mem.trim(u8, fetched.body[line_start .. line_start + line_end], " \r");
+            pos = line_start + line_end;
+            if (std.mem.eql(u8, payload, "[DONE]")) break;
+            if (payload.len == 0) continue;
+            chunks += 1;
+            if (std.json.parseFromSlice(std.json.Value, alloc, payload, .{})) |parsed| {
+                if (parsed.value == .object) {
+                    // OpenAI: choices[0].delta.content
+                    if (parsed.value.object.get("choices")) |ch| {
+                        if (ch == .array and ch.array.items.len > 0) {
+                            const f = ch.array.items[0];
+                            if (f == .object) {
+                                if (f.object.get("delta")) |d| {
+                                    if (d == .object) {
+                                        if (d.object.get("content")) |c| {
+                                            if (c == .string) full.appendSlice(alloc, c.string) catch return;
+                                        }
+                                    }
+                                } else if (f.object.get("text")) |t| {
+                                    if (t == .string) full.appendSlice(alloc, t.string) catch return;
+                                }
+                            }
+                        }
+                    }
+                    // Anthropic: delta.text
+                    if (parsed.value.object.get("delta")) |d| {
+                        if (d == .object) {
+                            if (d.object.get("text")) |t| {
+                                if (t == .string) full.appendSlice(alloc, t.string) catch return;
+                            }
+                        }
+                    }
+                    // Generic text field
+                    if (parsed.value.object.get("text")) |t| {
+                        if (t == .string and full.items.len == 0) full.appendSlice(alloc, t.string) catch return;
+                    }
+                }
+            } else |_| {}
+        }
+        const full_str = full.toOwnedSlice(alloc) catch return;
+        defer alloc.free(full_str);
+        const tq = protocol.jsonQuote(alloc, full_str) catch return;
+        defer alloc.free(tq);
+        const inner = std.fmt.allocPrint(alloc, "{{\"provider\":\"{s}\",\"status\":{d},\"text\":{s},\"chunks\":{d},\"streamed\":true}}", .{ prov.name, fetched.status, tq, chunks }) catch return;
+        defer alloc.free(inner);
+        resp = protocol.encodeOk(alloc, inner) catch return;
     } else if (std.mem.eql(u8, req.method, "ping")) {
         resp = protocol.encodeOk(alloc, "{\"pong\":true,\"version\":\"" ++ protocol.VERSION ++ "\"}") catch return;
     } else if (std.mem.eql(u8, req.method, "version")) {

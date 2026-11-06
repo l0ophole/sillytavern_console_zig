@@ -363,6 +363,21 @@ curl -s -m 5 -X POST -H 'Content-Type: application/json' -d '{"name":"Alice","ch
 curl -s -m 5 -X POST -H 'Content-Type: application/json' -d '{}' http://127.0.0.1:$PORT/api/characters/list | grep -q 'Alice' && echo PASS
 echo "== multipart frontend upload =="
 curl -s -m 5 -F "name=Bob" -F 'character={"name":"Bob"}' http://127.0.0.1:$PORT/api/characters/create | grep -q '"saved"' && echo PASS
+echo "== streaming provider =="
+cat > /rpf/tmp/opencode/mock_sse.py <<'PYEOF'
+from http.server import BaseHTTPRequestHandler, HTTPServer
+class H(BaseHTTPRequestHandler):
+    def do_POST(self):
+        ln=int(self.headers.get('Content-Length',0)); self.rfile.read(ln)
+        body=b'data: {"choices":[{"delta":{"content":"Hello "}}]}\n\ndata: {"choices":[{"delta":{"content":"stream"}}]}\n\ndata: [DONE]\n\n'
+        self.send_response(200); self.send_header('Content-Type','text/event-stream'); self.send_header('Content-Length',str(len(body))); self.end_headers(); self.wfile.write(body)
+    def log_message(self,*a): pass
+HTTPServer(('127.0.0.1',18151),H).handle_request()
+PYEOF
+python3 /rpf/tmp/opencode/mock_sse.py > /rpf/tmp/opencode/sse.log 2>&1 & echo $! > /rpf/tmp/opencode/sse.pid
+sleep 1
+./zig-out/bin/st-client --port $PORT backend.stream '{"provider":"openai","model":"gpt-4","api_key":"k","base_url":"http://127.0.0.1:18151","path":"/v1/chat/completions","messages":[{"role":"user","content":"hi"}]}' | grep -q 'Hello stream' && echo PASS
+kill $(cat /rpf/tmp/opencode/sse.pid) 2>/dev/null || true
 echo "== bad method =="
 ./zig-out/bin/st-client --port $PORT nope | grep -q '"ok":false' && echo PASS
 cat "$TMP/server.log"
