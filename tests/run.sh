@@ -151,6 +151,13 @@ python3 /rpf/tmp/opencode/mock_anthropic2.py > /rpf/tmp/opencode/mock2.log 2>&1 
 sleep 1
 ./zig-out/bin/st-client --port $PORT backend.native '{"provider":"anthropic","model":"claude-3","api_key":"k","base_url":"http://127.0.0.1:18121","path":"/v1/messages","messages":[{"role":"user","content":"hi"}]}' | grep -q 'mocked' && echo PASS || echo FAIL_NATIVE
 kill $(cat /rpf/tmp/opencode/mock2.pid) 2>/dev/null || true
+echo "== multi-model tokenizer =="
+curl -sL -o /rpf/tmp/opencode/p50k_base.tiktoken https://openaipublic.blob.core.windows.net/encodings/p50k_base.tiktoken 2>/dev/null || true
+if [ -s /rpf/tmp/opencode/p50k_base.tiktoken ]; then
+  ./zig-out/bin/st-client --port $PORT tokenizer.encode '{"text":"hello world","vocab":"/rpf/tmp/opencode/p50k_base.tiktoken"}' | grep -q '31373,995' && echo PASS_P50K || echo FAIL_P50K
+else
+  echo SKIP_NO_P50K
+fi
 echo "== bad method =="
 ./zig-out/bin/st-client --port $PORT nope | grep -q '"ok":false' && echo PASS
 cat "$TMP/server.log"

@@ -16,7 +16,7 @@ Status legend: DONE = implemented in Zig + tested (`zig build test` / `tests/run
 | themes / moving-ui / quick-replies | `themes.*`/`moving-ui.*`/`quick-replies.*` | DONE |
 | backgrounds / avatars / sprites / images / thumbnails / files / assets / backups / data-maid | `files.*`/`backgrounds.*`/`avatars.*`/`sprites.*`/`images.*`/`assets.*`/`thumbnails.*`/`data-maid.scan`/`backups.*` | DONE |
 | stats | `stats.summary` | DONE Task 8 |
-| tokenizers | `tokenizer.estimate` + `tokenizer.encode` (exact cl100k BPE when vocab present) | DONE |
+| tokenizers | `tokenizer.estimate` + `tokenizer.encode` (exact BPE cl100k/p50k/r50k via vocab file, model shortcut) | DONE |
 | backends/chat-completions, openai, anthropic, google, azure, openrouter, novelai, horde, kobold, text-completions | `backend.chat`/`backend.fetch` + `backend.provider` + `backend.native` (per-provider request/response normalization) | DONE |
 | image-metadata | `image-metadata.get/detect` | DONE |
 | users-admin/users-private/users-public | `users.*` create/list/delete/login/validate/logout (Sha256 + session tokens, 24h) | DONE |

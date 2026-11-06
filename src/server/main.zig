@@ -1825,7 +1825,17 @@ fn handleClient(conn: posix.fd_t) void {
             _ = posix.write(conn, resp) catch {};
             return;
         };
-        const vocab_path = getStr(req, "vocab") orelse "data/tokenizers/cl100k_base.tiktoken";
+        var vocab_path_owned: ?[]u8 = null;
+        const vocab_path = blk: {
+            if (getStr(req, "vocab")) |v| break :blk v;
+            if (getStr(req, "model")) |m| {
+                const fname = std.fmt.allocPrint(alloc, "data/tokenizers/{s}_base.tiktoken", .{m}) catch return;
+                vocab_path_owned = fname;
+                break :blk fname;
+            }
+            break :blk "data/tokenizers/cl100k_base.tiktoken";
+        };
+        defer if (vocab_path_owned) |vp| alloc.free(vp);
         var vocab = tokenizer.loadVocab(alloc, vocab_path) catch {
             const nest = tokenizer.estimateTokens(text);
             const inner = std.fmt.allocPrint(alloc, "{{\"tokens\":{d},\"exact\":false}}", .{nest}) catch return;
