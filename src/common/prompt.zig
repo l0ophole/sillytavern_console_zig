@@ -82,6 +82,119 @@ fn randBelow(n: usize) usize {
     return @intCast(v % @as(u64, @intCast(n)));
 }
 
+// Object/array variable support for {{setvarkey}}/{{getvarkey}} (+global
+// variants, upstream variable-macros.js: set(name, value, {index: key}).
+// Stored as serialized JSON under the plain (or $-prefixed) variable name;
+// all-numeric contiguous keys serialize as arrays, otherwise as objects.
+fn stringifyJson(alloc: std.mem.Allocator, v: std.json.Value) ![]u8 {
+    var tmp: std.Io.Writer.Allocating = .init(alloc);
+    defer tmp.deinit();
+    var s: std.json.Stringify = .{ .writer = &tmp.writer };
+    try s.write(v);
+    return alloc.dupe(u8, tmp.written());
+}
+
+fn isCanonicalIndex(k: []const u8) bool {
+    if (k.len == 0) return false;
+    if (k.len > 1 and k[0] == '0') return false;
+    for (k) |c| {
+        if (c < '0' or c > '9') return false;
+    }
+    return true;
+}
+
+fn serializeVarObject(alloc: std.mem.Allocator, obj: std.json.ObjectMap) ![]u8 {
+    const Entry = struct { k: []const u8, v: std.json.Value };
+    var entries: std.ArrayListUnmanaged(Entry) = .empty;
+    defer entries.deinit(alloc);
+    var it = obj.iterator();
+    while (it.next()) |kv| {
+        try entries.append(alloc, .{ .k = kv.key_ptr.*, .v = kv.value_ptr.* });
+    }
+    var all_index = entries.items.len > 0;
+    for (entries.items) |e| {
+        if (!isCanonicalIndex(e.k)) {
+            all_index = false;
+            break;
+        }
+    }
+    if (all_index) {
+        std.sort.block(Entry, entries.items, {}, struct {
+            fn less(_: void, a: Entry, b: Entry) bool {
+                const ai = std.fmt.parseInt(i64, a.k, 10) catch 0;
+                const bi = std.fmt.parseInt(i64, b.k, 10) catch 0;
+                return ai < bi;
+            }
+        }.less);
+        var contiguous = true;
+        for (entries.items, 0..) |e, idx| {
+            const v = std.fmt.parseInt(i64, e.k, 10) catch -1;
+            if (v != @as(i64, @intCast(idx))) {
+                contiguous = false;
+                break;
+            }
+        }
+        if (contiguous) {
+            var arr = std.json.Array.init(alloc);
+            defer arr.deinit();
+            for (entries.items) |e| try arr.append(e.v);
+            const vv: std.json.Value = .{ .array = arr };
+            return stringifyJson(alloc, vv);
+        }
+    }
+    std.sort.block(Entry, entries.items, {}, struct {
+        fn less(_: void, a: Entry, b: Entry) bool {
+            return std.mem.order(u8, a.k, b.k) == .lt;
+        }
+    }.less);
+    var new_obj = std.json.ObjectMap.init(alloc);
+    for (entries.items) |e| try new_obj.put(e.k, e.v);
+    const vv: std.json.Value = .{ .object = new_obj };
+    return stringifyJson(alloc, vv);
+}
+
+fn varSetKey(alloc: std.mem.Allocator, ctx: *MacroCtx, map_key: []const u8, subkey: []const u8, value: []const u8) !void {
+    var obj = std.json.ObjectMap.init(alloc);
+    if (ctx.vars.get(map_key)) |existing| {
+        if (std.json.parseFromSlice(std.json.Value, alloc, existing, .{})) |parsed| {
+            if (parsed.value == .object) {
+                obj = parsed.value.object;
+            } else if (parsed.value == .array) {
+                // Existing array-serialized var: merge items back as index keys
+                for (parsed.value.array.items, 0..) |item, idx| {
+                    const ik = try std.fmt.allocPrint(alloc, "{d}", .{idx});
+                    try obj.put(ik, item);
+                }
+            }
+        } else |_| {}
+    }
+    try obj.put(try alloc.dupe(u8, subkey), .{ .string = try alloc.dupe(u8, value) });
+    const serialized = try serializeVarObject(alloc, obj);
+    if (ctx.vars.getPtr(map_key)) |old| alloc.free(old.*);
+    const key_copy = if (ctx.vars.contains(map_key)) map_key else try alloc.dupe(u8, map_key);
+    try ctx.vars.put(key_copy, serialized);
+}
+
+fn varGetKey(alloc: std.mem.Allocator, ctx: *MacroCtx, map_key: []const u8, subkey: []const u8) ?[]u8 {
+    const existing = ctx.vars.get(map_key) orelse return null;
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, existing, .{}) catch return null;
+    if (parsed.value != .object) {
+        // Array-serialized var: numeric subkey indexes into the array
+        if (parsed.value == .array) {
+            const idx = std.fmt.parseInt(usize, subkey, 10) catch return null;
+            if (idx < parsed.value.array.items.len) {
+                const item = parsed.value.array.items[idx];
+                if (item == .string) return alloc.dupe(u8, item.string) catch null;
+                return stringifyJson(alloc, item) catch null;
+            }
+        }
+        return null;
+    }
+    const hit = parsed.value.object.get(subkey) orelse return null;
+    if (hit == .string) return alloc.dupe(u8, hit.string) catch null;
+    return stringifyJson(alloc, hit) catch null;
+}
+
 // Expand {{macro}} / {{macro::arg1::arg2}} / {{macro arg}} in text.
 pub fn expandMacros(alloc: std.mem.Allocator, text: []const u8, ctx: *MacroCtx) ![]u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
@@ -340,6 +453,38 @@ fn expandOne(alloc: std.mem.Allocator, inner: []const u8, ctx: *MacroCtx) ?[]u8 
         var buf: [128]u8 = undefined;
         const prefixed = std.fmt.bufPrint(&buf, "${s}", .{k}) catch return alloc.dupe(u8, "") catch null;
         _ = ctx.vars.remove(prefixed);
+        return alloc.dupe(u8, "") catch null;
+    }
+    if (std.mem.eql(u8, n, "setvarkey") or std.mem.eql(u8, n, "setvarindex")) {
+        const name_var = arg(args, 0);
+        const key = arg(args, 1);
+        const v = arg(args, 2);
+        if (name_var.len > 0 and key.len > 0) varSetKey(alloc, ctx, name_var, key, v) catch return null;
+        return alloc.dupe(u8, "") catch null;
+    }
+    if (std.mem.eql(u8, n, "getvarkey") or std.mem.eql(u8, n, "getvarindex")) {
+        const name_var = arg(args, 0);
+        const key = arg(args, 1);
+        if (varGetKey(alloc, ctx, name_var, key)) |v| return alloc.dupe(u8, v) catch null;
+        return alloc.dupe(u8, "") catch null;
+    }
+    if (std.mem.eql(u8, n, "setglobalvarkey") or std.mem.eql(u8, n, "setglobalvarindex")) {
+        const name_var = arg(args, 0);
+        const key = arg(args, 1);
+        const v = arg(args, 2);
+        if (name_var.len > 0 and key.len > 0) {
+            const prefixed = std.fmt.allocPrint(alloc, "${s}", .{name_var}) catch return null;
+            defer alloc.free(prefixed);
+            varSetKey(alloc, ctx, prefixed, key, v) catch return null;
+        }
+        return alloc.dupe(u8, "") catch null;
+    }
+    if (std.mem.eql(u8, n, "getglobalvarkey") or std.mem.eql(u8, n, "getglobalvarindex")) {
+        const name_var = arg(args, 0);
+        const key = arg(args, 1);
+        const prefixed = std.fmt.allocPrint(alloc, "${s}", .{name_var}) catch return null;
+        defer alloc.free(prefixed);
+        if (varGetKey(alloc, ctx, prefixed, key)) |v| return alloc.dupe(u8, v) catch null;
         return alloc.dupe(u8, "") catch null;
     }
     return null; // unknown macro: leave original text untouched
@@ -1040,4 +1185,24 @@ test "global vars" {
     var ctx = MacroCtx{ .vars = vars };
     const out = try expandMacros(alloc, "{{setglobalvar::flag::on}}{{getglobalvar::flag}} {{hasglobalvar::flag}} {{banned secret}}x", &ctx);
     try std.testing.expectEqualStrings("on true x", out);
+}
+
+test "object/array var macros (setvarkey/getvarkey)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const vars = std.StringHashMap([]const u8).init(alloc);
+    var ctx = MacroCtx{ .vars = vars };
+    // Object vars: set two keys, get each back, getvar serializes the object
+    const out = try expandMacros(alloc, "{{setvarkey::obj::name::alice}}{{setvarkey::obj::role::knight}}name={{getvarkey::obj::name}} role={{getvarindex::obj::role}} obj={{getvar::obj}} has={{hasvar::obj}} missing={{getvarkey::obj::missing}};", &ctx);
+    try std.testing.expectEqualStrings("name=alice role=knight obj={\"name\":\"alice\",\"role\":\"knight\"} has=true missing=;", out);
+    // Array vars: numeric contiguous keys serialize as an array
+    const out2 = try expandMacros(alloc, "{{setvarkey::arr::0::first}}{{setvarkey::arr::1::second}}arr={{getvar::arr}} second={{getvarkey::arr::1}};", &ctx);
+    try std.testing.expectEqualStrings("arr=[\"first\",\"second\"] second=second;", out2);
+    // Global variants with $-prefix isolation
+    const out3 = try expandMacros(alloc, "{{setglobalvarkey::g::k::gv}}g={{getglobalvarkey::g::k}} local-missing={{getvarkey::g::k}};", &ctx);
+    try std.testing.expectEqualStrings("g=gv local-missing=;", out3);
+    // deletevar removes the whole object
+    const out4 = try expandMacros(alloc, "{{deletevar::obj}}after={{hasvar::obj}};", &ctx);
+    try std.testing.expectEqualStrings("after=false;", out4);
 }

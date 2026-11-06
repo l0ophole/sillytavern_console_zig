@@ -366,6 +366,24 @@ sleep 1
 ./zig-out/bin/st-client --port $PORT characters.create '{"name":"Alice","character":{"name":"Alice","description":"A brave knight.","personality":"Cheerful","scenario":"In a tavern"}}' | grep -q '"saved"' && echo PASS
 ./zig-out/bin/st-client --port $PORT chat.turn '{"character":"Alice","chat":"turnchat","user_message":"Greetings {{char}}!","provider":"openai","model":"gpt-4","base_url":"http://127.0.0.1:18141","path":"/v1/chat/completions","api_key":"k"}' | grep -q 'Hello there!' && echo PASS_TURN
 ./zig-out/bin/st-client --port $PORT chats.load '{"character":"Alice","chat":"turnchat"}' | grep -q 'Greetings Alice!' && echo PASS_TURN_RELOAD
+cat > $TMP/opencode/mock_varkey.py <<'PYEOF'
+import json
+from http.server import BaseHTTPRequestHandler, HTTPServer
+class H(BaseHTTPRequestHandler):
+    def do_POST(self):
+        ln=int(self.headers.get('Content-Length',0)); body=self.rfile.read(ln)
+        req=json.loads(body)
+        user_content = [m['content'] for m in req['messages'] if m.get('role')=='user'][0]
+        assert 'hero=alice' in user_content, user_content
+        out=b"data: "+json.dumps({"choices":[{"delta":{"content":"ok"}}]}).encode()+b"\n\ndata: [DONE]\n\n"
+        self.send_response(200); self.send_header('Content-Type','text/event-stream'); self.send_header('Content-Length',str(len(out))); self.end_headers(); self.wfile.write(out)
+    def log_message(self,*a): pass
+HTTPServer(('127.0.0.1',18143),H).handle_request()
+PYEOF
+python3 $TMP/opencode/mock_varkey.py > $TMP/opencode/varkey.log 2>&1 & echo $! > $TMP/opencode/varkey.pid
+sleep 1
+./zig-out/bin/st-client --port $PORT chat.turn '{"character":"Alice","chat":"varkeychat","user_message":"{{setvarkey::obj::hero::alice}}hero={{getvarkey::obj::hero}}","provider":"openai","model":"gpt-4","base_url":"http://127.0.0.1:18143","path":"/v1/chat/completions","api_key":"k"}' | grep -q '"saved":true' && echo PASS_VARKEY_E2E
+kill $(cat $TMP/opencode/varkey.pid) 2>/dev/null || true
 echo "== prompt engine: worldinfo + author note + macros =="
 ./zig-out/bin/st-client --port $PORT worldinfo.save '{"name":"lore","value":{"entries":[{"key":["tavern"],"content":"WI-TAVERN-LORE","disable":false,"constant":false},{"key":[],"content":"WI-ALWAYS","disable":false,"constant":true}]}}' | grep -q '"saved"' && echo PASS
 ./zig-out/bin/st-client --port $PORT prompt.preview '{"character":"Alice","chat":"turnchat","user_message":"I enter the tavern","worldinfo":"lore"}' | grep -q 'WI-TAVERN-LORE' && echo PASS_WI
