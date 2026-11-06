@@ -38,8 +38,52 @@ pub fn buildUrl(alloc: std.mem.Allocator, provider: Provider, base_override: ?[]
     return std.fmt.allocPrint(alloc, "{s}{s}", .{ b, path });
 }
 
+pub fn concatPrompt(alloc: std.mem.Allocator, messages_json: []const u8) ![]u8 {
+    const mq = try std.json.parseFromSlice(std.json.Value, alloc, messages_json, .{});
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(alloc);
+    if (mq.value == .array) {
+        for (mq.value.array.items) |m| {
+            if (m == .object) {
+                if (m.object.get("content")) |c| {
+                    if (c == .string) try out.appendSlice(alloc, c.string);
+                }
+            }
+        }
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+fn jsonEscaped(alloc: std.mem.Allocator, s: []const u8) ![]u8 {
+    var esc: std.ArrayListUnmanaged(u8) = .empty;
+    defer esc.deinit(alloc);
+    for (s) |ch| {
+        if (ch == '"' or ch == '\\') try esc.append(alloc, '\\');
+        if (ch == '\n') {
+            try esc.appendSlice(alloc, "\\n");
+        } else {
+            try esc.append(alloc, ch);
+        }
+    }
+    return esc.toOwnedSlice(alloc);
+}
+
 /// Normalize provider-specific chat request body.
 pub fn buildNativeBody(alloc: std.mem.Allocator, provider_name: []const u8, model: []const u8, messages_json: []const u8, max_tokens: u32) ![]u8 {
+    if (std.mem.eql(u8, provider_name, "novelai") or std.mem.eql(u8, provider_name, "horde") or std.mem.eql(u8, provider_name, "kobold")) {
+        const prompt = try concatPrompt(alloc, messages_json);
+        defer alloc.free(prompt);
+        const eq = try jsonEscaped(alloc, prompt);
+        defer alloc.free(eq);
+        const mt = try std.fmt.allocPrint(alloc, "{d}", .{max_tokens});
+        defer alloc.free(mt);
+        if (std.mem.eql(u8, provider_name, "novelai")) {
+            return std.fmt.allocPrint(alloc, "{{\"prompt\":\"{s}\",\"model\":\"{s}\",\"parameters\":{{\"max_length\":{s}}}}}", .{ eq, model, mt });
+        } else if (std.mem.eql(u8, provider_name, "horde")) {
+            return std.fmt.allocPrint(alloc, "{{\"prompt\":\"{s}\",\"params\":{{\"model\":\"{s}\",\"max_length\":{s}}}}}", .{ eq, model, mt });
+        }
+        return std.fmt.allocPrint(alloc, "{{\"prompt\":\"{s}\",\"max_length\":{s}}}", .{ eq, mt });
+    }
     if (std.mem.eql(u8, provider_name, "anthropic")) {
         // Anthropic: {model, max_tokens, messages}
         const mq = try std.json.parseFromSlice(std.json.Value, alloc, messages_json, .{});
@@ -118,7 +162,36 @@ pub fn buildNativeBody(alloc: std.mem.Allocator, provider_name: []const u8, mode
 pub fn parseNativeResponse(alloc: std.mem.Allocator, provider_name: []const u8, body: []const u8) ![]u8 {
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
     if (parsed.value != .object) return alloc.dupe(u8, "");
-    if (std.mem.eql(u8, provider_name, "anthropic")) {
+    if (std.mem.eql(u8, provider_name, "novelai")) {
+        if (parsed.value.object.get("output")) |o| {
+            if (o == .string) return alloc.dupe(u8, o.string);
+        }
+        return alloc.dupe(u8, "");
+    } else if (std.mem.eql(u8, provider_name, "horde")) {
+        if (parsed.value.object.get("generations")) |g| {
+            if (g == .array and g.array.items.len > 0) {
+                const f = g.array.items[0];
+                if (f == .object) {
+                    if (f.object.get("text")) |t| {
+                        if (t == .string) return alloc.dupe(u8, t.string);
+                    }
+                }
+            }
+        }
+        return alloc.dupe(u8, "");
+    } else if (std.mem.eql(u8, provider_name, "kobold")) {
+        if (parsed.value.object.get("results")) |r| {
+            if (r == .array and r.array.items.len > 0) {
+                const f = r.array.items[0];
+                if (f == .object) {
+                    if (f.object.get("text")) |t| {
+                        if (t == .string) return alloc.dupe(u8, t.string);
+                    }
+                }
+            }
+        }
+        return alloc.dupe(u8, "");
+    } else if (std.mem.eql(u8, provider_name, "anthropic")) {
         if (parsed.value.object.get("content")) |c| {
             if (c == .array and c.array.items.len > 0) {
                 const first = c.array.items[0];
@@ -196,6 +269,31 @@ test "native build/parse" {
     const gtext = try parseNativeResponse(alloc, "google", "{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hi\"}]}}]}");
     defer alloc.free(gtext);
     try std.testing.expectEqualStrings("hi", gtext);
+    for ([_][]const u8{ "azure", "openrouter", "minimax", "volcengine", "nanogpt" }) |pn| {
+        const b = try buildNativeBody(alloc, pn, "m", msgs, 100);
+        defer alloc.free(b);
+        try std.testing.expect(std.mem.indexOf(u8, b, "\"messages\"") != null);
+        const t = try parseNativeResponse(alloc, pn, "{\"choices\":[{\"message\":{\"content\":\"x\"}}]}");
+        defer alloc.free(t);
+        try std.testing.expectEqualStrings("x", t);
+    }
+    const nb = try buildNativeBody(alloc, "novelai", "nai", msgs, 42);
+    defer alloc.free(nb);
+    try std.testing.expect(std.mem.indexOf(u8, nb, "\"prompt\":\"hi\"") != null);
+    const hb = try buildNativeBody(alloc, "horde", "hm", msgs, 42);
+    defer alloc.free(hb);
+    const kb = try buildNativeBody(alloc, "kobold", "km", msgs, 42);
+    defer alloc.free(kb);
+    const ntext = try parseNativeResponse(alloc, "novelai", "{\"output\":\"novel out\"}");
+    defer alloc.free(ntext);
+    try std.testing.expectEqualStrings("novel out", ntext);
+    const htext = try parseNativeResponse(alloc, "horde", "{\"generations\":[{\"text\":\"horde out\"}]}");
+    defer alloc.free(htext);
+    try std.testing.expectEqualStrings("horde out", htext);
+    const ktext = try parseNativeResponse(alloc, "kobold", "{\"results\":[{\"text\":\"kobold out\"}]}");
+    defer alloc.free(ktext);
+    try std.testing.expectEqualStrings("kobold out", ktext);
+
     const otext = try parseNativeResponse(alloc, "openai", "{\"choices\":[{\"message\":{\"content\":\"yo\"}}]}");
     defer alloc.free(otext);
     try std.testing.expectEqualStrings("yo", otext);
