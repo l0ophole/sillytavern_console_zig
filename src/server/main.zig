@@ -1905,8 +1905,19 @@ fn handleClient(conn: posix.fd_t) void {
         };
         defer if (vocab_path_owned) |vp| alloc.free(vp);
         var vocab: tokenizer.BpeVocab = undefined;
+        const is_sp = std.mem.endsWith(u8, vocab_path, ".model");
         if (std.mem.endsWith(u8, vocab_path, ".json")) {
             vocab = tokenizer.loadHfVocab(alloc, vocab_path) catch {
+                const nest = tokenizer.estimateTokens(text);
+                const inner = std.fmt.allocPrint(alloc, "{{\"tokens\":{d},\"exact\":false}}", .{nest}) catch return;
+                defer alloc.free(inner);
+                resp = protocol.encodeOk(alloc, inner) catch return;
+                defer alloc.free(resp);
+                _ = posix.write(conn, resp) catch {};
+                return;
+            };
+        } else if (is_sp) {
+            vocab = tokenizer.loadSpModel(alloc, vocab_path) catch {
                 const nest = tokenizer.estimateTokens(text);
                 const inner = std.fmt.allocPrint(alloc, "{{\"tokens\":{d},\"exact\":false}}", .{nest}) catch return;
                 defer alloc.free(inner);
@@ -1927,7 +1938,7 @@ fn handleClient(conn: posix.fd_t) void {
             };
         }
         defer vocab.deinit();
-        const ids = tokenizer.bpeEncode(alloc, &vocab, text) catch {
+        const ids = (if (is_sp) tokenizer.spEncode(alloc, &vocab, text) else tokenizer.bpeEncode(alloc, &vocab, text)) catch {
             resp = protocol.encodeErr(alloc, "tokenize_failed") catch return;
             defer alloc.free(resp);
             _ = posix.write(conn, resp) catch {};

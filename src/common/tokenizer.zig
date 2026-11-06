@@ -99,6 +99,145 @@ pub fn loadHfVocab(alloc: std.mem.Allocator, path: []const u8) !BpeVocab {
     return vocab;
 }
 
+fn readVarint(d: []const u8, pos: *usize) u64 {
+    var r: u64 = 0;
+    var s: u6 = 0;
+    while (pos.* < d.len) {
+        const b = d[pos.*];
+        pos.* += 1;
+        r |= @as(u64, b & 0x7f) << s;
+        if (b & 0x80 == 0) break;
+        s += 7;
+    }
+    return r;
+}
+
+/// Load SentencePiece .model (protobuf ModelProto, field 1 = pieces).
+/// Piece order = id; used as BPE merge priority (like tiktoken ranks).
+pub fn loadSpModel(alloc: std.mem.Allocator, path: []const u8) !BpeVocab {
+    const f = try std.fs.cwd().openFile(path, .{});
+    defer f.close();
+    const content = try f.readToEndAlloc(alloc, 20 << 20);
+    defer alloc.free(content);
+    var vocab = BpeVocab.init(alloc);
+    errdefer vocab.deinit();
+    var pos: usize = 0;
+    var id: u32 = 0;
+    while (pos < content.len) {
+        const tag = readVarint(content, &pos);
+        const field = @as(usize, @intCast(tag >> 3));
+        const wt = @as(usize, @intCast(tag & 7));
+        if (field == 1 and wt == 2) {
+            const ln = @as(usize, @intCast(readVarint(content, &pos)));
+            const msg = content[pos .. pos + ln];
+            pos += ln;
+            var p2: usize = 0;
+            var piece: ?[]const u8 = null;
+            while (p2 < msg.len) {
+                const t2 = readVarint(msg, &p2);
+                const f2 = @as(usize, @intCast(t2 >> 3));
+                const w2 = @as(usize, @intCast(t2 & 7));
+                if (f2 == 1 and w2 == 2) {
+                    const l2 = @as(usize, @intCast(readVarint(msg, &p2)));
+                    piece = msg[p2 .. p2 + l2];
+                    p2 += l2;
+                } else if (w2 == 2) {
+                    const l2 = @as(usize, @intCast(readVarint(msg, &p2)));
+                    p2 += l2;
+                } else if (w2 == 5) {
+                    p2 += 4;
+                } else if (w2 == 0) {
+                    _ = readVarint(msg, &p2);
+                } else break;
+            }
+            if (piece) |pc| {
+                const key = try alloc.dupe(u8, pc);
+                try vocab.ranks.put(key, id);
+            }
+            id += 1;
+        } else if (wt == 2) {
+            const ln = @as(usize, @intCast(readVarint(content, &pos)));
+            pos += ln;
+        } else if (wt == 5) {
+            pos += 4;
+        } else if (wt == 0) {
+            _ = readVarint(content, &pos);
+        } else break;
+    }
+    return vocab;
+}
+
+pub fn spEncode(alloc: std.mem.Allocator, vocab: *BpeVocab, text: []const u8) ![]u32 {
+    // SP normalization: dummy prefix + spaces to U+2581
+    var norm: std.ArrayListUnmanaged(u8) = .empty;
+    defer norm.deinit(alloc);
+    try norm.appendSlice(alloc, "▁");
+    for (text) |c| {
+        if (c == ' ') {
+            try norm.appendSlice(alloc, "▁");
+        } else {
+            try norm.append(alloc, c);
+        }
+    }
+    var parts: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (parts.items) |p| alloc.free(p);
+        parts.deinit(alloc);
+    }
+    // Initial symbols are UTF-8 characters
+    var i: usize = 0;
+    while (i < norm.items.len) {
+        const seq_len = utf8SeqLen(norm.items[i]);
+        const s = try alloc.dupe(u8, norm.items[i .. i + seq_len]);
+        try parts.append(alloc, s);
+        i += seq_len;
+    }
+    // BPE merges by lowest piece id
+    while (true) {
+        var best_idx: ?usize = null;
+        var best_rank: u32 = std.math.maxInt(u32);
+        var j: usize = 0;
+        while (j + 1 < parts.items.len) : (j += 1) {
+            const merged = try std.fmt.allocPrint(alloc, "{s}{s}", .{ parts.items[j], parts.items[j + 1] });
+            defer alloc.free(merged);
+            if (vocab.ranks.get(merged)) |r| {
+                if (r < best_rank) {
+                    best_rank = r;
+                    best_idx = j;
+                }
+            }
+        }
+        if (best_idx == null) break;
+        const idx = best_idx.?;
+        const merged = try std.fmt.allocPrint(alloc, "{s}{s}", .{ parts.items[idx], parts.items[idx + 1] });
+        alloc.free(parts.items[idx]);
+        alloc.free(parts.items[idx + 1]);
+        parts.items[idx] = merged;
+        _ = parts.orderedRemove(idx + 1);
+    }
+    var ids: std.ArrayListUnmanaged(u32) = .empty;
+    errdefer ids.deinit(alloc);
+    for (parts.items) |p| {
+        if (vocab.ranks.get(p)) |r| {
+            try ids.append(alloc, r);
+        } else {
+            // Byte fallback: emit <0xXX> pieces if present
+            for (p) |byte| {
+                const bp = try std.fmt.allocPrint(alloc, "<0x{X:0>2}>", .{byte});
+                defer alloc.free(bp);
+                if (vocab.ranks.get(bp)) |r| try ids.append(alloc, r);
+            }
+        }
+    }
+    return ids.toOwnedSlice(alloc);
+}
+
+fn utf8SeqLen(b: u8) usize {
+    if (b < 0x80) return 1;
+    if (b >> 5 == 0b110) return 2;
+    if (b >> 4 == 0b1110) return 3;
+    return 4;
+}
 fn byteLevelEncode(alloc: std.mem.Allocator, chunk: []const u8, out: *std.ArrayListUnmanaged([]u8)) !void {
     for (chunk) |byte| {
         const cp = bytesToUnicode(byte);

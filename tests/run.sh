@@ -201,6 +201,12 @@ else
 fi
 echo "== REPL coverage =="
 printf "/presets\n/worldinfo\n/groups\n/themes\n/stats\n/secrets\n/users\n/extensions\n/backups\n/exit\n" | timeout 5 ./zig-out/bin/st-client --port $PORT 2>&1 | grep -q '"ok":true' && echo PASS
+echo "== sentencepiece .model =="
+if [ -f ../SillyTavern/src/tokenizers/mistral.model ]; then
+  ./zig-out/bin/st-client --port $PORT tokenizer.encode '{"text":"hello world","vocab":"../SillyTavern/src/tokenizers/mistral.model"}' | grep -q '6312,28709,1526' && echo PASS_SP || echo FAIL_SP
+else
+  echo SKIP_NO_SP
+fi
 echo "== bad method =="
 ./zig-out/bin/st-client --port $PORT nope | grep -q '"ok":false' && echo PASS
 cat "$TMP/server.log"
