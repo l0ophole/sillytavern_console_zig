@@ -17,6 +17,8 @@ const posix = std.posix;
 var data_root: []const u8 = "data";
 var port: u16 = 8000;
 var host: []const u8 = "127.0.0.1";
+var allow_execute: bool = false; // extensions.execute is remote code execution: opt-in only (ST_ALLOW_EXECUTE=1)
+var auth_token: ?[]const u8 = null; // if ST_TOKEN is set, HTTP requests must present X-ST-Token
 
 fn printUsage() void {
     const stderr = std.fs.File.stderr();
@@ -128,8 +130,9 @@ fn genericCollection(alloc: std.mem.Allocator, udir: []const u8, subdir: []const
 
 // Generic text/binary file handler for files/backgrounds/avatars/sprites/images/assets/thumbnails.
 fn genericFiles(alloc: std.mem.Allocator, udir: []const u8, subdir: []const u8, action_in: []const u8, req: protocol.Request) ![]u8 {
-    // JS /api/assets/character?name=&category= returns an array of asset paths
+    // JS /api/assets/character?name=&category= returns an array of asset paths (400 without name)
     if (std.mem.eql(u8, subdir, "assets") and std.mem.eql(u8, action_in, "character")) {
+        if (getStr(req, "name") == null) return protocol.encodeErr(alloc, "bad_request");
         return protocol.encodeOk(alloc, "[]");
     }
     // JS /api/assets/get returns a folder map {ambient:[],bgm:[],...,vrm:{model:[],animation:[]}}
@@ -213,18 +216,83 @@ fn genericFiles(alloc: std.mem.Allocator, udir: []const u8, subdir: []const u8, 
     return protocol.encodeErr(alloc, "unknown_method");
 }
 
-fn readLine(stream: posix.fd_t, buf: []u8) !usize {
-    var n: usize = 0;
-    while (n < buf.len) {
-        var b: [1]u8 = undefined;
-        const r = posix.read(stream, &b) catch return n;
-        if (r == 0) break;
-        buf[n] = b[0];
-        n += 1;
-        if (b[0] == '\n') break;
-        if (n >= protocol.MAX_LINE) return error.TooLarge;
+fn writeAll(fd: posix.fd_t, bytes: []const u8) void {
+    var off: usize = 0;
+    while (off < bytes.len) {
+        const n = posix.write(fd, bytes[off..]) catch return;
+        if (n == 0) return;
+        off += n;
     }
-    return n;
+}
+
+// Buffered connection reader: chunked syscalls, leftover preserved between
+// the request line, headers and body (a plain chunk read would over-read).
+const ConnBuf = struct {
+    fd: posix.fd_t,
+    data: [8192]u8 = undefined,
+    start: usize = 0,
+    end: usize = 0,
+    fn fill(self: *ConnBuf) bool {
+        if (self.start < self.end) return true;
+        const r = posix.read(self.fd, &self.data) catch return false;
+        if (r == 0) return false;
+        self.start = 0;
+        self.end = r;
+        return true;
+    }
+    fn readByte(self: *ConnBuf) ?u8 {
+        if (!self.fill()) return null;
+        defer self.start += 1;
+        return self.data[self.start];
+    }
+    fn readInto(self: *ConnBuf, buf: []u8) usize {
+        if (!self.fill()) return 0;
+        const n = @min(buf.len, self.end - self.start);
+        @memcpy(buf[0..n], self.data[self.start .. self.start + n]);
+        self.start += n;
+        return n;
+    }
+    fn readLineAlloc(self: *ConnBuf, alloc: std.mem.Allocator) ![]u8 {
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer out.deinit(alloc);
+        while (true) {
+            if (!self.fill()) break;
+            const avail = self.data[self.start..self.end];
+            if (std.mem.indexOfScalar(u8, avail, '\n')) |nl| {
+                try out.appendSlice(alloc, avail[0 .. nl + 1]);
+                self.start += nl + 1;
+                break;
+            }
+            try out.appendSlice(alloc, avail);
+            self.start = self.end;
+            if (out.items.len >= protocol.MAX_LINE) return error.TooLarge;
+        }
+        return out.toOwnedSlice(alloc);
+    }
+};
+
+// Read until EOF (server closes after one response) into a growing buffer.
+fn readAllAlloc(alloc: std.mem.Allocator, stream: posix.fd_t) []u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    var chunk: [8192]u8 = undefined;
+    while (true) {
+        const r = posix.read(stream, &chunk) catch break;
+        if (r == 0) break;
+        out.appendSlice(alloc, chunk[0..r]) catch break;
+    }
+    return out.toOwnedSlice(alloc) catch alloc.dupe(u8, "") catch return &.{};
+}
+
+fn getHeader(headers: []const u8, name: []const u8) ?[]const u8 {
+    var it = std.mem.splitScalar(u8, headers, '\n');
+    while (it.next()) |line_raw| {
+        const line = std.mem.trim(u8, line_raw, " \t\r");
+        if (std.mem.indexOfScalar(u8, line, ':')) |c| {
+            const k = std.mem.trim(u8, line[0..c], " \t");
+            if (std.ascii.eqlIgnoreCase(k, name)) return std.mem.trim(u8, line[c + 1 ..], " \t");
+        }
+    }
+    return null;
 }
 
 // Percent-decode a query component (%XX and '+' -> space). Returns null on bad input.
@@ -260,23 +328,56 @@ fn urlDecode(alloc: std.mem.Allocator, s: []const u8) ?[]u8 {
     return out.toOwnedSlice(alloc) catch null;
 }
 
-fn handleHttp(conn: posix.fd_t, first_line: []const u8) void {
+fn handleHttp(conn: posix.fd_t, cbuf: *ConnBuf, first_line: []const u8) void {
     // Static web UI serving (SillyTavern public/) + /api health.
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
-    // Drain headers
-    var header_buf = alloc.alloc(u8, 8192) catch return;
-    defer alloc.free(header_buf);
-    var drain_pos: usize = 0;
-    while (drain_pos < header_buf.len - 1) {
-        var b: [1]u8 = undefined;
-        const r = posix.read(conn, &b) catch break;
-        if (r == 0) break;
-        header_buf[drain_pos] = b[0];
-        drain_pos += 1;
-        if (drain_pos >= 4 and std.mem.endsWith(u8, header_buf[0..drain_pos], "\r\n\r\n")) break;
-        if (drain_pos >= 3 and std.mem.endsWith(u8, header_buf[0..drain_pos], "\n\n")) break;
+    // Drain headers byte-by-byte from the buffered reader (no syscall/byte,
+    // and no body bytes are consumed past the terminator).
+    var header_list: std.ArrayListUnmanaged(u8) = .empty;
+    defer header_list.deinit(alloc);
+    var header_end: usize = 0;
+    while (header_list.items.len < 16384) {
+        const b = cbuf.readByte() orelse break;
+        header_list.append(alloc, b) catch break;
+        const hv = header_list.items;
+        if (std.mem.endsWith(u8, hv, "\r\n\r\n")) {
+            header_end = hv.len;
+            break;
+        }
+        if (std.mem.endsWith(u8, hv, "\n\n")) {
+            header_end = hv.len;
+            break;
+        }
+    }
+    const header_buf = header_list.items;
+    const drain_pos = header_end;
+    const headers_slice_all = header_buf[0..drain_pos];
+    // --- Loopback HTTP hardening against drive-by browser requests ---
+    // Browsers send Origin on POST (incl. text/plain "simple" requests without
+    // preflight) and Host matching the target. Reject anything not local.
+    if (getHeader(headers_slice_all, "origin")) |origin| {
+        const ok_origin = std.mem.startsWith(u8, origin, "http://127.0.0.1") or std.mem.startsWith(u8, origin, "http://localhost") or std.mem.startsWith(u8, origin, "http://[::1]");
+        if (!ok_origin) {
+            _ = posix.write(conn, "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n") catch {};
+            return;
+        }
+    }
+    if (getHeader(headers_slice_all, "host")) |hv| {
+        const ok_host = std.mem.startsWith(u8, hv, "127.0.0.1") or std.mem.startsWith(u8, hv, "localhost") or std.mem.startsWith(u8, hv, "[::1]");
+        if (!ok_host) {
+            _ = posix.write(conn, "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n") catch {};
+            return;
+        }
+    }
+    if (auth_token) |tok| {
+        const presented = getHeader(headers_slice_all, "x-st-token") orelse getHeader(headers_slice_all, "authorization") orelse "";
+        const presented_tok = if (std.mem.startsWith(u8, presented, "Bearer ")) presented[7..] else presented;
+        if (!std.mem.eql(u8, presented_tok, tok)) {
+            _ = posix.write(conn, "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n") catch {};
+            return;
+        }
     }
     // Parse path from request line "GET <path> HTTP/1.1"
     var path: []const u8 = "/";
@@ -318,6 +419,16 @@ fn handleHttp(conn: posix.fd_t, first_line: []const u8) void {
     if (std.mem.startsWith(u8, clean_path, "/api/")) {
         const method = clean_path[5..];
         if (method.len == 0 or std.mem.indexOf(u8, method, "/") != null or std.mem.indexOf(u8, method, ".") != null and false) {}
+        // JSON-only POST path (multipart kept for frontend file uploads):
+        // text/plain and other simple-request types are how browsers reach
+        // loopback listeners without a CORS preflight.
+        if (getHeader(headers_slice_all, "content-type")) |ct| {
+            const ok_ct = std.mem.indexOf(u8, ct, "application/json") != null or std.mem.indexOf(u8, ct, "multipart/form-data") != null;
+            if (!ok_ct) {
+                _ = posix.write(conn, "HTTP/1.1 415 Unsupported Media Type\r\nContent-Length: 0\r\nConnection: close\r\n\r\n") catch {};
+                return;
+            }
+        }
         // Read Content-Length from drained headers, then body
         var content_len: usize = 0;
         if (std.mem.indexOf(u8, header_buf[0..drain_pos], "Content-Length:")) |cl| {
@@ -329,9 +440,9 @@ fn handleHttp(conn: posix.fd_t, first_line: []const u8) void {
         defer body.deinit(alloc);
         var remaining = content_len;
         while (remaining > 0) {
-            var chunk: [4096]u8 = undefined;
+            var chunk: [8192]u8 = undefined;
             const want = @min(remaining, chunk.len);
-            const r = posix.read(conn, chunk[0..want]) catch break;
+            const r = cbuf.readInto(chunk[0..want]);
             if (r == 0) break;
             body.appendSlice(alloc, chunk[0..r]) catch break;
             remaining -= r;
@@ -408,6 +519,26 @@ fn handleHttp(conn: posix.fd_t, first_line: []const u8) void {
             merged_params = m.toOwnedSlice(alloc) catch return;
             params_base = merged_params.?;
         }
+        // Forward the validated HTTP token into the TCP params for dispatch
+        var token_params: ?[]u8 = null;
+        defer if (token_params) |tp| alloc.free(tp);
+        if (auth_token) |tok| {
+            const t = std.mem.trim(u8, params_base, " \t\r\n");
+            var m: std.ArrayListUnmanaged(u8) = .empty;
+            defer m.deinit(alloc);
+            m.append(alloc, '{') catch return;
+            if (t.len > 2 and std.mem.startsWith(u8, t, "{")) {
+                m.appendSlice(alloc, t[1 .. t.len - 1]) catch return;
+                m.append(alloc, ',') catch return;
+            }
+            const tq = protocol.jsonQuote(alloc, tok) catch return;
+            defer alloc.free(tq);
+            m.appendSlice(alloc, "\"token\":") catch return;
+            m.appendSlice(alloc, tq) catch return;
+            m.append(alloc, '}') catch return;
+            token_params = m.toOwnedSlice(alloc) catch return;
+            params_base = token_params.?;
+        }
         const params_json = params_base;
         // Frontend Express route mapping: /api/<res>/<action> -> <res>.<action>
         // Handles nested routes (e.g. /api/backups/chat/get -> backups.chat.get),
@@ -476,7 +607,9 @@ fn handleHttp(conn: posix.fd_t, first_line: []const u8) void {
             }
         }
         // Bridge to TCP dispatch via loopback self-connection
-        const line = std.fmt.allocPrint(alloc, "{{\"method\":\"{s}\",\"params\":{s}}}\n", .{ mapped_method, params_json }) catch return;
+        const mq = protocol.jsonQuote(alloc, mapped_method) catch return;
+        defer alloc.free(mq);
+        const line = std.fmt.allocPrint(alloc, "{{\"method\":{s},\"params\":{s}}}\n", .{ mq, params_json }) catch return;
         defer alloc.free(line);
         const addr_str = std.fmt.allocPrint(alloc, "127.0.0.1:{d}", .{port}) catch return;
         defer alloc.free(addr_str);
@@ -487,10 +620,9 @@ fn handleHttp(conn: posix.fd_t, first_line: []const u8) void {
             _ = posix.write(conn, "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n") catch {};
             return;
         };
-        _ = posix.write(sock, line) catch return;
-        var rbuf: [65536]u8 = undefined;
-        const rn = posix.read(sock, &rbuf) catch 0;
-        const resp_body = rbuf[0..rn];
+        writeAll(sock, line);
+        const resp_body = readAllAlloc(alloc, sock);
+        defer alloc.free(resp_body);
         // Unwrap the TCP envelope to a raw JS body: {"ok":true,"result":X} -> X,
         // {"ok":false,"error":"m"} -> HTTP 400 {"error":"m"} (JS endpoints send error bodies).
         var body_out: []const u8 = resp_body;
@@ -559,25 +691,38 @@ fn handleClient(conn: posix.fd_t) void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
-    var buf = alloc.alloc(u8, protocol.MAX_LINE + 1) catch return;
-    defer alloc.free(buf);
-    const n = readLine(conn, buf) catch {
+    var cbuf = ConnBuf{ .fd = conn };
+    const req_line = cbuf.readLineAlloc(alloc) catch {
         const e = protocol.encodeErr(alloc, "bad_request") catch return;
         defer alloc.free(e);
         _ = posix.write(conn, e) catch {};
         return;
     };
-    if (n == 0) return;
-    if (std.mem.startsWith(u8, buf[0..n], "GET ") or std.mem.startsWith(u8, buf[0..n], "POST ")) {
-        handleHttp(conn, buf[0..n]);
+    defer alloc.free(req_line);
+    if (req_line.len == 0) return;
+    if (std.mem.startsWith(u8, req_line, "GET ") or std.mem.startsWith(u8, req_line, "POST ")) {
+        handleHttp(conn, &cbuf, req_line);
         return;
     }
-    const req = protocol.parseRequest(alloc, buf[0..n]) catch {
+    const req = protocol.parseRequest(alloc, req_line) catch {
         const e = protocol.encodeErr(alloc, "bad_request") catch return;
         defer alloc.free(e);
         _ = posix.write(conn, e) catch {};
         return;
     };
+    // Token required on every endpoint that reads/changes user data.
+    const token_exempt = std.mem.eql(u8, req.method, "ping") or std.mem.eql(u8, req.method, "version") or std.mem.eql(u8, req.method, "health");
+    if (auth_token) |tok| {
+        if (!token_exempt) {
+            const presented = getStr(req, "token") orelse "";
+            if (!std.mem.eql(u8, presented, tok)) {
+                const e = protocol.encodeErr(alloc, "unauthorized") catch return;
+                defer alloc.free(e);
+                _ = posix.write(conn, e) catch {};
+                return;
+            }
+        }
+    }
     // Resolve user (default-user) for data methods.
     var user: []const u8 = "default-user";
     if (req.params) |p| {
@@ -1068,7 +1213,7 @@ fn handleClient(conn: posix.fd_t) void {
         const bpath = getStr(req, "path") orelse "/v1/chat/completions";
         var bport: u16 = 11434;
         if (getObjValue(req, "port")) |pv| {
-            if (pv == .integer) bport = @intCast(pv.integer);
+            if (pv == .integer) bport = std.math.cast(u16, pv.integer) orelse { resp = protocol.encodeErr(alloc, "bad_request") catch return; defer alloc.free(resp); _ = posix.write(conn, resp) catch {}; return; };
         }
         var body_str: []u8 = undefined;
         if (getObjValue(req, "body")) |bv| {
@@ -1595,7 +1740,7 @@ fn handleClient(conn: posix.fd_t) void {
         };
         var dim: usize = 32;
         if (getObjValue(req, "dim")) |dv| {
-            if (dv == .integer) dim = @intCast(dv.integer);
+            if (dv == .integer) dim = std.math.cast(usize, dv.integer) orelse { resp = protocol.encodeErr(alloc, "bad_request") catch return; defer alloc.free(resp); _ = posix.write(conn, resp) catch {}; return; };
         }
         const vec = vectors_mod.localEmbed(alloc, text, dim) catch return;
         defer alloc.free(vec);
@@ -1641,7 +1786,7 @@ fn handleClient(conn: posix.fd_t) void {
             const bpath = getStr(req, "path") orelse "/v1/embeddings";
             var bport: u16 = 11434;
             if (getObjValue(req, "port")) |pv| {
-                if (pv == .integer) bport = @intCast(pv.integer);
+                if (pv == .integer) bport = std.math.cast(u16, pv.integer) orelse { resp = protocol.encodeErr(alloc, "bad_request") catch return; defer alloc.free(resp); _ = posix.write(conn, resp) catch {}; return; };
             }
             var body_str: []u8 = undefined;
             if (getObjValue(req, "body")) |bv| {
@@ -2000,7 +2145,7 @@ fn handleClient(conn: posix.fd_t) void {
             defer if (qowned) alloc.free(qvec);
             var limit: usize = 5;
             if (getObjValue(req, "limit")) |lv| {
-                if (lv == .integer) limit = @intCast(lv.integer);
+                if (lv == .integer) limit = std.math.cast(usize, lv.integer) orelse { resp = protocol.encodeErr(alloc, "bad_request") catch return; defer alloc.free(resp); _ = posix.write(conn, resp) catch {}; return; };
             }
             const names = crud.listNames(alloc, cdir) catch {
                 resp = protocol.encodeOk(alloc, "[]") catch return;
@@ -2128,7 +2273,7 @@ fn handleClient(conn: posix.fd_t) void {
         const bpath = getStr(req, "path") orelse "/sdapi/v1/txt2img";
         var bport: u16 = 7860;
         if (getObjValue(req, "port")) |pv| {
-            if (pv == .integer) bport = @intCast(pv.integer);
+            if (pv == .integer) bport = std.math.cast(u16, pv.integer) orelse { resp = protocol.encodeErr(alloc, "bad_request") catch return; defer alloc.free(resp); _ = posix.write(conn, resp) catch {}; return; };
         }
         var body_str: []u8 = undefined;
         if (getObjValue(req, "body")) |bv| {
@@ -2460,7 +2605,7 @@ fn handleClient(conn: posix.fd_t) void {
         const bpath = getStr(req, "path") orelse "/";
         var bport: u16 = 11434;
         if (getObjValue(req, "port")) |pv| {
-            if (pv == .integer) bport = @intCast(pv.integer);
+            if (pv == .integer) bport = std.math.cast(u16, pv.integer) orelse { resp = protocol.encodeErr(alloc, "bad_request") catch return; defer alloc.free(resp); _ = posix.write(conn, resp) catch {}; return; };
         }
         var body_str: []u8 = undefined;
         if (getObjValue(req, "body")) |bv| {
@@ -2485,6 +2630,12 @@ fn handleClient(conn: posix.fd_t) void {
         defer alloc.free(inner);
         resp = protocol.encodeOk(alloc, inner) catch return;
     } else if (std.mem.eql(u8, req.method, "extensions.execute")) {
+        if (!allow_execute) {
+            resp = protocol.encodeErr(alloc, "execute_disabled") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        }
         // Execute JS via node subprocess (if available). Params: {code} or {name}
         var code: []const u8 = getStr(req, "code") orelse "";
         var code_owned: ?[]u8 = null;
@@ -2533,6 +2684,12 @@ fn handleClient(conn: posix.fd_t) void {
         defer alloc.free(inner);
         resp = protocol.encodeOk(alloc, inner) catch return;
     } else if (std.mem.eql(u8, req.method, "extensions.execute_browser")) {
+        if (!allow_execute) {
+            resp = protocol.encodeErr(alloc, "execute_disabled") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        }
         // Browser-equivalent shim: document/window/SillyTavern stubs, slash-command registry.
         const code = getStr(req, "code") orelse {
             resp = protocol.encodeErr(alloc, "bad_request") catch return;
@@ -2962,7 +3119,7 @@ fn handleClient(conn: posix.fd_t) void {
         const model_name = getStr(req, "model") orelse "gpt-4";
         var max_tokens: u32 = 1024;
         if (getObjValue(req, "max_tokens")) |mv| {
-            if (mv == .integer) max_tokens = @intCast(mv.integer);
+            if (mv == .integer) max_tokens = std.math.cast(u32, mv.integer) orelse { resp = protocol.encodeErr(alloc, "bad_request") catch return; defer alloc.free(resp); _ = posix.write(conn, resp) catch {}; return; };
         }
         var msgs_json: []u8 = undefined;
         if (getObjValue(req, "messages")) |mv| {
@@ -3113,7 +3270,7 @@ fn handleClient(conn: posix.fd_t) void {
         const model_name = getStr(req, "model") orelse "gpt-4";
         var max_tokens: u32 = 1024;
         if (getObjValue(req, "max_tokens")) |mv| {
-            if (mv == .integer) max_tokens = @intCast(mv.integer);
+            if (mv == .integer) max_tokens = std.math.cast(u32, mv.integer) orelse { resp = protocol.encodeErr(alloc, "bad_request") catch return; defer alloc.free(resp); _ = posix.write(conn, resp) catch {}; return; };
         }
         var msgs_json: []u8 = undefined;
         if (getObjValue(req, "messages")) |mv| {
@@ -3685,33 +3842,88 @@ pub fn main() !void {
     const args = try std.process.argsAlloc(alloc);
     defer std.process.argsFree(alloc, args);
     var i: usize = 1;
+    var port_explicit = false;
+    var unix_path: ?[]const u8 = null;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--help") or std.mem.eql(u8, args[i], "-h")) {
             printUsage();
             return;
         } else if (std.mem.eql(u8, args[i], "--port") and i + 1 < args.len) {
             port = try std.fmt.parseInt(u16, args[i + 1], 10);
+            port_explicit = true;
             i += 1;
         } else if (std.mem.eql(u8, args[i], "--host") and i + 1 < args.len) {
             host = args[i + 1];
+            i += 1;
+        } else if (std.mem.eql(u8, args[i], "--unix") and i + 1 < args.len) {
+            unix_path = args[i + 1];
             i += 1;
         } else if (std.mem.eql(u8, args[i], "--data-dir") and i + 1 < args.len) {
             data_root = args[i + 1];
             i += 1;
         }
     }
+    if (std.posix.getenv("ST_ALLOW_EXECUTE")) |v| {
+        if (std.mem.eql(u8, v, "1") or std.ascii.eqlIgnoreCase(v, "true")) allow_execute = true;
+    }
     try std.fs.cwd().makePath(data_root);
-    const addr_str = try std.fmt.allocPrint(alloc, "{s}:{d}", .{ host, port });
-    defer alloc.free(addr_str);
-    const addr = try std.net.Address.parseIpAndPort(addr_str);
-    const sock = try posix.socket(addr.any.family, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP);
+    // Auth token: ST_TOKEN env, else load/generate <data_root>/token (mode 0600).
+    // Required on every data endpoint (TCP params.token and HTTP X-ST-Token).
+    if (std.posix.getenv("ST_TOKEN")) |v| {
+        if (v.len > 0) auth_token = v;
+    }
+    if (auth_token == null) {
+        const token_path = std.fs.path.join(alloc, &.{ data_root, "token" }) catch unreachable;
+        defer alloc.free(token_path);
+        if (store.readFileAlloc(alloc, token_path) catch null) |existing| {
+            const t = std.mem.trim(u8, existing, " \t\r\n");
+            if (t.len >= 16) {
+                auth_token = alloc.dupe(u8, t) catch unreachable;
+            }
+        } else {
+            var bytes: [32]u8 = undefined;
+            std.crypto.random.bytes(&bytes);
+            const hex = std.fmt.allocPrint(alloc, "{x}", .{bytes[0..]}) catch unreachable;
+            auth_token = hex;
+            const f = std.fs.cwd().createFile(token_path, .{}) catch unreachable;
+            defer f.close();
+            f.writeAll(hex) catch unreachable;
+            std.posix.fchmod(f.handle, 0o600) catch {};
+        }
+    }
+    // Default: Unix socket under data_root (user-only). TCP is opt-in via --port.
+    var unix_owned: ?[]u8 = null;
+    defer if (unix_owned) |u| alloc.free(u);
+    if (unix_path == null and !port_explicit) {
+        unix_owned = std.fs.path.join(alloc, &.{ data_root, "st.sock" }) catch unreachable;
+        unix_path = unix_owned.?;
+    }
+    const sock: posix.fd_t = blk: {
+        if (unix_path) |up| {
+            std.posix.unlink(up) catch {};
+            const s = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
+            var sa: posix.sockaddr.un = undefined;
+            sa.family = posix.AF.UNIX;
+            @memset(&sa.path, 0);
+            if (up.len >= sa.path.len) return error.PathTooLong;
+            @memcpy(sa.path[0..up.len], up);
+            try posix.bind(s, @as(*posix.sockaddr, @ptrCast(&sa)), @sizeOf(posix.sockaddr.un));
+            std.posix.fchmod(s, 0o700) catch {};
+            break :blk s;
+        }
+        const addr_str = try std.fmt.allocPrint(alloc, "{s}:{d}", .{ host, port });
+        defer alloc.free(addr_str);
+        const addr = try std.net.Address.parseIpAndPort(addr_str);
+        const s = try posix.socket(addr.any.family, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP);
+        const one: c_int = 1;
+        posix.setsockopt(s, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(one)) catch {};
+        try posix.bind(s, &addr.any, addr.getOsSockLen());
+        break :blk s;
+    };
     defer posix.close(sock);
-    const one: c_int = 1;
-    posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(one)) catch {};
-    try posix.bind(sock, &addr.any, addr.getOsSockLen());
     try posix.listen(sock, 16);
     const out = std.fs.File.stdout();
-    const listen_msg = try std.fmt.allocPrint(alloc, "st-server listening on {s}:{d} data={s} version={s}\n", .{ host, port, data_root, protocol.VERSION });
+    const listen_msg = if (unix_path) |up| try std.fmt.allocPrint(alloc, "st-server listening on unix:{s} data={s} version={s}\n", .{ up, data_root, protocol.VERSION }) else try std.fmt.allocPrint(alloc, "st-server listening on {s}:{d} data={s} version={s}\n", .{ host, port, data_root, protocol.VERSION });
     defer alloc.free(listen_msg);
     out.writeAll(listen_msg) catch {};
     while (true) {

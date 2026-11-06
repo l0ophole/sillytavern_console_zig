@@ -1,7 +1,7 @@
 const std = @import("std");
 
 pub const VERSION = "0.1.0";
-pub const MAX_LINE: usize = 1 << 20; // 1 MiB
+pub const MAX_LINE: usize = 16 << 20; // 16 MiB (long chats exceed 1 MiB)
 
 pub const Request = struct {
     method: []const u8,

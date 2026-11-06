@@ -8,8 +8,13 @@ echo "== zig build =="
 zig build
 PORT=18081
 TMP=$(mktemp -d)
+export ST_TOKEN_FILE="$TMP/data/token"
+mkdir -p "$TMP/opencode"
 trap 'kill $(cat "$TMP/pid") 2>/dev/null || true; rm -rf "$TMP"' EXIT
 ./zig-out/bin/st-server --port $PORT --data-dir "$TMP/data" >"$TMP/server.log" 2>&1 &
+sleep 1
+# Server generates an auth token at startup; client reads it via ST_TOKEN_FILE.
+TOKEN=$(cat "$TMP/data/token" 2>/dev/null || true)
 echo $! >"$TMP/pid"
 sleep 1
 echo "== ping =="
@@ -130,13 +135,13 @@ echo "== per-provider backend =="
 ./zig-out/bin/st-client --port $PORT backend.provider '{"provider":"unknown"}' | grep -q 'unknown_provider' && echo PASS
 ./zig-out/bin/st-client --port $PORT backend.provider '{"provider":"anthropic","base_url":"http://127.0.0.1:9","path":"/v1/messages","body":{}}' | grep -q 'backend_unreachable' && echo PASS
 echo "== neural model =="
-python3 -c "import json; m={'input_dim':32,'hidden_dim':4,'output_dim':2,'W1':[0]*128,'b1':[0]*4,'W2':[1,0,0,0,0,1,0,0],'b2':[0,0]}; [exec(\"m['W1'].__setitem__(h*32+h,1)\") for h in range(4)]; json.dump(m, open('/rpf/tmp/opencode/model.json','w'))"
-./zig-out/bin/st-client --port $PORT vectors.model '{"text":"hello","model":"/rpf/tmp/opencode/model.json"}' | grep -q '"neural":true' && echo PASS
+python3 -c "import json; m={'input_dim':32,'hidden_dim':4,'output_dim':2,'W1':[0]*128,'b1':[0]*4,'W2':[1,0,0,0,0,1,0,0],'b2':[0,0]}; [exec(\"m['W1'].__setitem__(h*32+h,1)\") for h in range(4)]; json.dump(m, open('$TMP/opencode/model.json','w'))"
+./zig-out/bin/st-client --port $PORT vectors.model '{"text":"hello","model":"'"$TMP"'/opencode/model.json"}' | grep -q '"neural":true' && echo PASS
 ./zig-out/bin/st-client --port $PORT vectors.model '{"text":"hello","model":"/nonexistent.json"}' | grep -q 'model_not_found' && echo PASS
 echo "== browser extension runtime =="
 ./zig-out/bin/st-client --port $PORT extensions.execute_browser '{"code":"registerSlashCommand(\"hello\", ()=>{});"}' | grep -q 'hello' && echo PASS
 echo "== native provider =="
-cat > /rpf/tmp/opencode/mock_anthropic2.py <<'PYEOF'
+cat > $TMP/opencode/mock_anthropic2.py <<'PYEOF'
 import json
 from http.server import BaseHTTPRequestHandler, HTTPServer
 class H(BaseHTTPRequestHandler):
@@ -147,21 +152,21 @@ class H(BaseHTTPRequestHandler):
     def log_message(self,*a): pass
 HTTPServer(('127.0.0.1',18121),H).handle_request()
 PYEOF
-python3 /rpf/tmp/opencode/mock_anthropic2.py > /rpf/tmp/opencode/mock2.log 2>&1 & echo $! > /rpf/tmp/opencode/mock2.pid
+python3 $TMP/opencode/mock_anthropic2.py > $TMP/opencode/mock2.log 2>&1 & echo $! > $TMP/opencode/mock2.pid
 sleep 1
 ./zig-out/bin/st-client --port $PORT backend.native '{"provider":"anthropic","model":"claude-3","api_key":"k","base_url":"http://127.0.0.1:18121","path":"/v1/messages","messages":[{"role":"user","content":"hi"}]}' | grep -q 'mocked' && echo PASS || echo FAIL_NATIVE
-kill $(cat /rpf/tmp/opencode/mock2.pid) 2>/dev/null || true
+kill $(cat $TMP/opencode/mock2.pid) 2>/dev/null || true
 echo "== multi-model tokenizer =="
-curl -sL -o /rpf/tmp/opencode/p50k_base.tiktoken https://openaipublic.blob.core.windows.net/encodings/p50k_base.tiktoken 2>/dev/null || true
-if [ -s /rpf/tmp/opencode/p50k_base.tiktoken ]; then
-  ./zig-out/bin/st-client --port $PORT tokenizer.encode '{"text":"hello world","vocab":"/rpf/tmp/opencode/p50k_base.tiktoken"}' | grep -q '31373,995' && echo PASS_P50K || echo FAIL_P50K
+curl -sL -o $TMP/opencode/p50k_base.tiktoken https://openaipublic.blob.core.windows.net/encodings/p50k_base.tiktoken 2>/dev/null || true
+if [ -s $TMP/opencode/p50k_base.tiktoken ]; then
+  ./zig-out/bin/st-client --port $PORT tokenizer.encode '{"text":"hello world","vocab":"'"$TMP"'/opencode/p50k_base.tiktoken"}' | grep -q '31373,995' && echo PASS_P50K || echo FAIL_P50K
 else
   echo SKIP_NO_P50K
 fi
 echo "== REPL =="
 printf "/help\n/ping\n/exit\n" | timeout 5 ./zig-out/bin/st-client --port $PORT | grep -q '"pong":true' && echo PASS
 echo "== image gen save =="
-cat > /rpf/tmp/opencode/mock_sd.py <<'PYEOF'
+cat > $TMP/opencode/mock_sd.py <<'PYEOF'
 import json, base64
 from http.server import BaseHTTPRequestHandler, HTTPServer
 class H(BaseHTTPRequestHandler):
@@ -173,12 +178,12 @@ class H(BaseHTTPRequestHandler):
     def log_message(self,*a): pass
 HTTPServer(('127.0.0.1',18123),H).handle_request()
 PYEOF
-python3 /rpf/tmp/opencode/mock_sd.py > /rpf/tmp/opencode/sd.log 2>&1 & echo $! > /rpf/tmp/opencode/sd.pid
+python3 $TMP/opencode/mock_sd.py > $TMP/opencode/sd.log 2>&1 & echo $! > $TMP/opencode/sd.pid
 sleep 1
 ./zig-out/bin/st-client --port $PORT stable-diffusion.generate_and_save '{"name":"cat","host":"127.0.0.1","port":18123,"path":"/sdapi/v1/txt2img","body":{}}' | grep -q 'cat.png' && echo PASS
-kill $(cat /rpf/tmp/opencode/sd.pid) 2>/dev/null || true
+kill $(cat $TMP/opencode/sd.pid) 2>/dev/null || true
 echo "== remaining providers native =="
-cat > /rpf/tmp/opencode/mock_kobold.py <<'PYEOF'
+cat > $TMP/opencode/mock_kobold.py <<'PYEOF'
 import json
 from http.server import BaseHTTPRequestHandler, HTTPServer
 class H(BaseHTTPRequestHandler):
@@ -189,10 +194,10 @@ class H(BaseHTTPRequestHandler):
     def log_message(self,*a): pass
 HTTPServer(('127.0.0.1',18124),H).handle_request()
 PYEOF
-python3 /rpf/tmp/opencode/mock_kobold.py > /rpf/tmp/opencode/k.log 2>&1 & echo $! > /rpf/tmp/opencode/k.pid
+python3 $TMP/opencode/mock_kobold.py > $TMP/opencode/k.log 2>&1 & echo $! > $TMP/opencode/k.pid
 sleep 1
 ./zig-out/bin/st-client --port $PORT backend.native '{"provider":"kobold","model":"m","base_url":"http://127.0.0.1:18124","path":"/api/v1/generate","messages":[{"role":"user","content":"hi"}]}' | grep -q 'kobold mock out' && echo PASS
-kill $(cat /rpf/tmp/opencode/k.pid) 2>/dev/null || true
+kill $(cat $TMP/opencode/k.pid) 2>/dev/null || true
 echo "== llama tokenizer =="
 if [ -f ../SillyTavern/src/tokenizers/llama3.json ]; then
   ./zig-out/bin/st-client --port $PORT tokenizer.encode '{"text":"hello world","vocab":"../SillyTavern/src/tokenizers/llama3.json"}' | grep -q '15339,1917' && echo PASS_LLAMA || echo FAIL_LLAMA
@@ -208,12 +213,12 @@ else
   echo SKIP_NO_SP
 fi
 echo "== neural save integration =="
-python3 -c "import json; m={'input_dim':32,'hidden_dim':4,'output_dim':2,'W1':[0]*128,'b1':[0]*4,'W2':[1,0,0,0,0,1,0,0],'b2':[0,0]}; [exec(\"m['W1'].__setitem__(h*32+h,1)\") for h in range(4)]; json.dump(m, open('/rpf/tmp/opencode/model.json','w'))"
-./zig-out/bin/st-client --port $PORT vectors.save '{"collection":"nc","id":"n1","model":"/rpf/tmp/opencode/model.json","value":{"text":"hello"}}' | grep -q '"saved"' && echo PASS
+python3 -c "import json; m={'input_dim':32,'hidden_dim':4,'output_dim':2,'W1':[0]*128,'b1':[0]*4,'W2':[1,0,0,0,0,1,0,0],'b2':[0,0]}; [exec(\"m['W1'].__setitem__(h*32+h,1)\") for h in range(4)]; json.dump(m, open('$TMP/opencode/model.json','w'))"
+./zig-out/bin/st-client --port $PORT vectors.save '{"collection":"nc","id":"n1","model":"'"$TMP"'/opencode/model.json","value":{"text":"hello"}}' | grep -q '"saved"' && echo PASS
 echo "== frontend verify =="
 ./zig-out/bin/st-client --port $PORT frontend.verify | grep -q '"coverage":100' && echo PASS
 echo "== caption image =="
-cat > /rpf/tmp/opencode/mock_cap.py <<'PYEOF'
+cat > $TMP/opencode/mock_cap.py <<'PYEOF'
 import json
 from http.server import BaseHTTPRequestHandler, HTTPServer
 class H(BaseHTTPRequestHandler):
@@ -224,12 +229,12 @@ class H(BaseHTTPRequestHandler):
     def log_message(self,*a): pass
 HTTPServer(('127.0.0.1',18129),H).handle_request()
 PYEOF
-python3 /rpf/tmp/opencode/mock_cap.py > /rpf/tmp/opencode/cap.log 2>&1 & echo $! > /rpf/tmp/opencode/cap.pid
+python3 $TMP/opencode/mock_cap.py > $TMP/opencode/cap.log 2>&1 & echo $! > $TMP/opencode/cap.pid
 sleep 1
 ./zig-out/bin/st-client --port $PORT caption.image '{"image":"data:image/png;base64,iVBORw0KGgo=","prompt":"Describe","api_key":"k","base_url":"http://127.0.0.1:18129"}' | grep -q 'A cat sitting' && echo PASS
-kill $(cat /rpf/tmp/opencode/cap.pid) 2>/dev/null || true
+kill $(cat $TMP/opencode/cap.pid) 2>/dev/null || true
 echo "== speech tts =="
-cat > /rpf/tmp/opencode/mock_tts.py <<'PYEOF'
+cat > $TMP/opencode/mock_tts.py <<'PYEOF'
 from http.server import BaseHTTPRequestHandler, HTTPServer
 class H(BaseHTTPRequestHandler):
     def do_POST(self):
@@ -239,12 +244,12 @@ class H(BaseHTTPRequestHandler):
     def log_message(self,*a): pass
 HTTPServer(('127.0.0.1',18131),H).handle_request()
 PYEOF
-python3 /rpf/tmp/opencode/mock_tts.py > /rpf/tmp/opencode/tts.log 2>&1 & echo $! > /rpf/tmp/opencode/tts.pid
+python3 $TMP/opencode/mock_tts.py > $TMP/opencode/tts.log 2>&1 & echo $! > $TMP/opencode/tts.pid
 sleep 1
 ./zig-out/bin/st-client --port $PORT speech.tts '{"input":"Hello","name":"hello.mp3","api_key":"k","base_url":"http://127.0.0.1:18131"}' | grep -q 'hello.mp3' && echo PASS
-kill $(cat /rpf/tmp/opencode/tts.pid) 2>/dev/null || true
+kill $(cat $TMP/opencode/tts.pid) 2>/dev/null || true
 echo "== classify/translate full =="
-cat > /rpf/tmp/opencode/mock_ct.py <<'PYEOF'
+cat > $TMP/opencode/mock_ct.py <<'PYEOF'
 import json
 from http.server import BaseHTTPRequestHandler, HTTPServer
 class H(BaseHTTPRequestHandler):
@@ -255,13 +260,13 @@ class H(BaseHTTPRequestHandler):
     def log_message(self,*a): pass
 HTTPServer(('127.0.0.1',18133),H).serve_forever()
 PYEOF
-python3 /rpf/tmp/opencode/mock_ct.py > /rpf/tmp/opencode/ct.log 2>&1 & echo $! > /rpf/tmp/opencode/ct.pid
+python3 $TMP/opencode/mock_ct.py > $TMP/opencode/ct.log 2>&1 & echo $! > $TMP/opencode/ct.pid
 sleep 1
 ./zig-out/bin/st-client --port $PORT classify.classify '{"text":"I love this","base_url":"http://127.0.0.1:18133","path":"/classify"}' | grep -q 'positive' && echo PASS
 ./zig-out/bin/st-client --port $PORT translate.translate '{"text":"Hello","source":"en","target":"fr","base_url":"http://127.0.0.1:18133/translate"}' | grep -q 'Bonjour' && echo PASS
-kill $(cat /rpf/tmp/opencode/ct.pid) 2>/dev/null || true
+kill $(cat $TMP/opencode/ct.pid) 2>/dev/null || true
 echo "== speech transcribe =="
-cat > /rpf/tmp/opencode/mock_stt.py <<'PYEOF'
+cat > $TMP/opencode/mock_stt.py <<'PYEOF'
 import json
 from http.server import BaseHTTPRequestHandler, HTTPServer
 class H(BaseHTTPRequestHandler):
@@ -272,12 +277,12 @@ class H(BaseHTTPRequestHandler):
     def log_message(self,*a): pass
 HTTPServer(('127.0.0.1',18137),H).handle_request()
 PYEOF
-python3 /rpf/tmp/opencode/mock_stt.py > /rpf/tmp/opencode/stt.log 2>&1 & echo $! > /rpf/tmp/opencode/stt.pid
+python3 $TMP/opencode/mock_stt.py > $TMP/opencode/stt.log 2>&1 & echo $! > $TMP/opencode/stt.pid
 sleep 1
 ./zig-out/bin/st-client --port $PORT speech.transcribe '{"audio":"QUJD","base_url":"http://127.0.0.1:18137"}' | grep -q 'Hello spoken' && echo PASS
-kill $(cat /rpf/tmp/opencode/stt.pid) 2>/dev/null || true
+kill $(cat $TMP/opencode/stt.pid) 2>/dev/null || true
 echo "== onnx neural =="
-python3 /rpf/tmp/opencode/make_onnx.py 2>/dev/null || cat > /rpf/tmp/opencode/make_onnx.py <<'PYEOF'
+cat > $TMP/opencode/make_onnx.py <<PYEOF
 import struct
 def varint(n):
     out=b''
@@ -306,13 +311,14 @@ W=[0.0]*64
 for i in range(2): W[i*32+i]=1.0
 graph=fl(1,node())+fs(2,"g")+fl(5,tensor("W",[2,32],W))+fl(5,tensor("B",[2],[0.0,0.0]))+fl(11,vi("X",[1,32]))+fl(12,vi("Y",[1,2]))
 opset=fs(1,"")+fv(2,13)
-open('/rpf/tmp/opencode/test.onnx','wb').write(fv(1,8)+fl(8,opset)+fl(7,graph))
+open('$TMP/opencode/test.onnx','wb').write(fv(1,8)+fl(8,opset)+fl(7,graph))
 PYEOF
-./zig-out/bin/st-client --port $PORT vectors.onnx '{"text":"hello","model":"/rpf/tmp/opencode/test.onnx"}' | grep -q '"onnx":true' && echo PASS
-python3 - <<'PYEOF'
+python3 $TMP/opencode/make_onnx.py
+./zig-out/bin/st-client --port $PORT vectors.onnx '{"text":"hello","model":"'"$TMP"'/opencode/test.onnx"}' | grep -q '"onnx":true' && echo PASS
+python3 - <<PYEOF
 try:
     import onnxruntime as ort, numpy as np
-    s=ort.InferenceSession('/rpf/tmp/opencode/test.onnx', providers=['CPUExecutionProvider'])
+    s=ort.InferenceSession('$TMP/opencode/test.onnx', providers=['CPUExecutionProvider'])
     x=np.arange(32,dtype=np.float32).reshape(1,32)
     y=s.run(None,{s.get_inputs()[0].name:x})[0]
     assert abs(y[0,1]-1.0)<1e-5, y
@@ -323,7 +329,7 @@ PYEOF
 echo "== browser frontend verify =="
 ./zig-out/bin/st-client --port $PORT frontend.browser_verify | grep -q '"browser_equivalent":true' && echo PASS
 echo "== chat end-to-end =="
-cat > /rpf/tmp/opencode/mock_openai.py <<'PYEOF'
+cat > $TMP/opencode/mock_openai.py <<'PYEOF'
 import json
 from http.server import BaseHTTPRequestHandler, HTTPServer
 class H(BaseHTTPRequestHandler):
@@ -334,19 +340,19 @@ class H(BaseHTTPRequestHandler):
     def log_message(self,*a): pass
 HTTPServer(('127.0.0.1',18140),H).handle_request()
 PYEOF
-python3 /rpf/tmp/opencode/mock_openai.py > /rpf/tmp/opencode/o.log 2>&1 & echo $! > /rpf/tmp/opencode/o.pid
+python3 $TMP/opencode/mock_openai.py > $TMP/opencode/o.log 2>&1 & echo $! > $TMP/opencode/o.pid
 sleep 1
 ./zig-out/bin/st-client --port $PORT chat.generate_and_save '{"provider":"openai","model":"gpt-4","api_key":"k","base_url":"http://127.0.0.1:18140","path":"/v1/chat/completions","messages":[{"role":"user","content":"hi"}],"character":"Alice","chat":"main"}' | grep -q 'Hi from OpenAI' && echo PASS
-kill $(cat /rpf/tmp/opencode/o.pid) 2>/dev/null || true
+kill $(cat $TMP/opencode/o.pid) 2>/dev/null || true
 echo "== web UI HTTP =="
 curl -s http://127.0.0.1:$PORT/api/health | grep -q '"pong":true' && echo PASS
-ST_WEB_ROOT=../SillyTavern/public curl -s http://127.0.0.1:$PORT/ > /rpf/tmp/opencode/webui.html 2>/dev/null || true
+ST_WEB_ROOT=../SillyTavern/public curl -s http://127.0.0.1:$PORT/ > $TMP/opencode/webui.html 2>/dev/null || true
 # web root is relative to server cwd (repo root in tests), default ../SillyTavern/public works when run from repo parent? server cwd is repo, so check index served:
-grep -q 'SillyTavern' /rpf/tmp/opencode/webui.html && echo PASS_WEBUI || echo SKIP_WEBUI_PATH
+grep -q 'SillyTavern' $TMP/opencode/webui.html && echo PASS_WEBUI || echo SKIP_WEBUI_PATH
 echo "== web API bridge =="
-curl -s -m 5 -X POST -H 'Content-Type: application/json' -d '{}' http://127.0.0.1:$PORT/api/settings.get | grep -q '"settings"' && echo PASS
+curl -s -m 5 -X POST -H 'Content-Type: application/json' -H "X-ST-Token: $TOKEN" -d '{}' http://127.0.0.1:$PORT/api/settings.get | grep -q '"settings"' && echo PASS
 echo "== provider error parity =="
-cat > /rpf/tmp/opencode/mock_err.py <<'PYEOF'
+cat > $TMP/opencode/mock_err.py <<'PYEOF'
 import json
 from http.server import BaseHTTPRequestHandler, HTTPServer
 class H(BaseHTTPRequestHandler):
@@ -357,12 +363,12 @@ class H(BaseHTTPRequestHandler):
     def log_message(self,*a): pass
 HTTPServer(('127.0.0.1',18145),H).handle_request()
 PYEOF
-python3 /rpf/tmp/opencode/mock_err.py > /rpf/tmp/opencode/e.log 2>&1 & echo $! > /rpf/tmp/opencode/e.pid
+python3 $TMP/opencode/mock_err.py > $TMP/opencode/e.log 2>&1 & echo $! > $TMP/opencode/e.pid
 sleep 1
 ./zig-out/bin/st-client --port $PORT backend.native '{"provider":"openai","model":"gpt-4","api_key":"bad","base_url":"http://127.0.0.1:18145","path":"/v1/chat/completions","messages":[{"role":"user","content":"hi"}]}' | grep -q 'provider_error' && echo PASS
-kill $(cat /rpf/tmp/opencode/e.pid) 2>/dev/null || true
+kill $(cat $TMP/opencode/e.pid) 2>/dev/null || true
 echo "== onnx save integration =="
-./zig-out/bin/st-client --port $PORT vectors.save '{"collection":"oc","id":"o1","model":"/rpf/tmp/opencode/test.onnx","value":{"text":"hello onnx"}}' | grep -q '"saved"' && echo PASS
+./zig-out/bin/st-client --port $PORT vectors.save '{"collection":"oc","id":"o1","model":"'"$TMP"'/opencode/test.onnx","value":{"text":"hello onnx"}}' | grep -q '"saved"' && echo PASS
 echo "== claude tokenizer =="
 if [ -f ../SillyTavern/src/tokenizers/claude.json ]; then
   ./zig-out/bin/st-client --port $PORT tokenizer.encode '{"text":"hello world","vocab":"../SillyTavern/src/tokenizers/claude.json"}' | grep -q '9381,2253' && echo PASS_CLAUDE || echo FAIL_CLAUDE
@@ -370,13 +376,13 @@ else
   echo SKIP_NO_CLAUDE
 fi
 echo "== frontend API routes =="
-curl -s -m 5 -X POST -H 'Content-Type: application/json' -d '{}' http://127.0.0.1:$PORT/api/settings/load | grep -q '"settings"' && echo PASS
-curl -s -m 5 -X POST -H 'Content-Type: application/json' -d '{"name":"Alice","character":{"name":"Alice"}}' http://127.0.0.1:$PORT/api/characters/create | grep -q '"saved"' && echo PASS
-curl -s -m 5 -X POST -H 'Content-Type: application/json' -d '{}' http://127.0.0.1:$PORT/api/characters/list | grep -q 'Alice' && echo PASS
+curl -s -m 5 -X POST -H 'Content-Type: application/json' -H "X-ST-Token: $TOKEN" -d '{}' http://127.0.0.1:$PORT/api/settings/load | grep -q '"settings"' && echo PASS
+curl -s -m 5 -X POST -H 'Content-Type: application/json' -H "X-ST-Token: $TOKEN" -d '{"name":"Alice","character":{"name":"Alice"}}' http://127.0.0.1:$PORT/api/characters/create | grep -q '"saved"' && echo PASS
+curl -s -m 5 -X POST -H 'Content-Type: application/json' -H "X-ST-Token: $TOKEN" -d '{}' http://127.0.0.1:$PORT/api/characters/list | grep -q 'Alice' && echo PASS
 echo "== multipart frontend upload =="
-curl -s -m 5 -F "name=Bob" -F 'character={"name":"Bob"}' http://127.0.0.1:$PORT/api/characters/create | grep -q '"saved"' && echo PASS
+curl -s -m 5 -H "X-ST-Token: $TOKEN" -F "name=Bob" -F 'character={"name":"Bob"}' http://127.0.0.1:$PORT/api/characters/create | grep -q '"saved"' && echo PASS
 echo "== streaming provider =="
-cat > /rpf/tmp/opencode/mock_sse.py <<'PYEOF'
+cat > $TMP/opencode/mock_sse.py <<'PYEOF'
 from http.server import BaseHTTPRequestHandler, HTTPServer
 class H(BaseHTTPRequestHandler):
     def do_POST(self):
@@ -386,10 +392,10 @@ class H(BaseHTTPRequestHandler):
     def log_message(self,*a): pass
 HTTPServer(('127.0.0.1',18151),H).handle_request()
 PYEOF
-python3 /rpf/tmp/opencode/mock_sse.py > /rpf/tmp/opencode/sse.log 2>&1 & echo $! > /rpf/tmp/opencode/sse.pid
+python3 $TMP/opencode/mock_sse.py > $TMP/opencode/sse.log 2>&1 & echo $! > $TMP/opencode/sse.pid
 sleep 1
 ./zig-out/bin/st-client --port $PORT backend.stream '{"provider":"openai","model":"gpt-4","api_key":"k","base_url":"http://127.0.0.1:18151","path":"/v1/chat/completions","messages":[{"role":"user","content":"hi"}]}' | grep -q 'Hello stream' && echo PASS
-kill $(cat /rpf/tmp/opencode/sse.pid) 2>/dev/null || true
+kill $(cat $TMP/opencode/sse.pid) 2>/dev/null || true
 echo "== browser smoke =="
 ./zig-out/bin/st-client --port $PORT frontend.browser_smoke '{"script":"authors-note.js"}' | grep -q '"syntax_ok":true' && echo PASS
 echo "== real neural MiniLM =="
@@ -401,7 +407,7 @@ else
   echo SKIP_NO_MINILM
 fi
 echo "== anthropic streaming =="
-cat > /rpf/tmp/opencode/mock_sse_anth.py <<'PYEOF'
+cat > $TMP/opencode/mock_sse_anth.py <<'PYEOF'
 from http.server import BaseHTTPRequestHandler, HTTPServer
 class H(BaseHTTPRequestHandler):
     def do_POST(self):
@@ -411,14 +417,14 @@ class H(BaseHTTPRequestHandler):
     def log_message(self,*a): pass
 HTTPServer(('127.0.0.1',18156),H).handle_request()
 PYEOF
-python3 /rpf/tmp/opencode/mock_sse_anth.py > /rpf/tmp/opencode/sse2.log 2>&1 & echo $! > /rpf/tmp/opencode/sse2.pid
+python3 $TMP/opencode/mock_sse_anth.py > $TMP/opencode/sse2.log 2>&1 & echo $! > $TMP/opencode/sse2.pid
 sleep 1
 ./zig-out/bin/st-client --port $PORT backend.stream '{"provider":"anthropic","model":"claude-3","api_key":"k","base_url":"http://127.0.0.1:18156","path":"/v1/messages","messages":[{"role":"user","content":"hi"}]}' | grep -q 'Anthropic stream' && echo PASS
-kill $(cat /rpf/tmp/opencode/sse2.pid) 2>/dev/null || true
+kill $(cat $TMP/opencode/sse2.pid) 2>/dev/null || true
 echo "== frontend HTTP flow verify =="
 ./zig-out/bin/st-client --port $PORT frontend.http_verify | grep -q '"ok":3' && echo PASS
 echo "== streaming retry =="
-cat > /rpf/tmp/opencode/mock_retry.py <<'PYEOF'
+cat > $TMP/opencode/mock_retry.py <<'PYEOF'
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import threading
 count=[0]
@@ -439,14 +445,15 @@ threads=[threading.Thread(target=srv.handle_request,daemon=True) for _ in range(
 [t.start() for t in threads]
 import time; time.sleep(20)
 PYEOF
-timeout 25 python3 /rpf/tmp/opencode/mock_retry.py > /rpf/tmp/opencode/retry.log 2>&1 & echo $! > /rpf/tmp/opencode/retry.pid
+timeout 25 python3 $TMP/opencode/mock_retry.py > $TMP/opencode/retry.log 2>&1 & echo $! > $TMP/opencode/retry.pid
 sleep 1
 timeout 30 ./zig-out/bin/st-client --port $PORT backend.stream '{"provider":"openai","model":"gpt-4","api_key":"k","base_url":"http://127.0.0.1:18160","path":"/v1/chat/completions","messages":[{"role":"user","content":"hi"}]}' | grep -q 'Recovered' && echo PASS
-kill $(cat /rpf/tmp/opencode/retry.pid) 2>/dev/null || true
+kill $(cat $TMP/opencode/retry.pid) 2>/dev/null || true
 echo "== browser smoke all =="
 timeout 120 ./zig-out/bin/st-client --port $PORT frontend.browser_smoke_all | grep -q '"all_ok":true' && echo PASS
+if python3 -c "import onnxruntime, numpy" 2>/dev/null; then
 echo "== onnx ort equivalence =="
-python3 - <<'PYEOF'
+python3 - <<PYEOF
 import struct, random
 random.seed(7)
 def varint(n):
@@ -478,7 +485,7 @@ W1=[random.uniform(-0.5,0.5) for _ in range(96)]
 W2=[random.uniform(-0.5,0.5) for _ in range(6)]
 graph=fl(1,gemm_node("X","W1","B1","H"))+fl(1,relu_node("H","R"))+fl(1,gemm_node("R","W2","B2","Y"))+fs(2,"g")+fl(5,tensor("W1",[3,32],W1))+fl(5,tensor("B1",[3],[0.1,-0.1,0.0]))+fl(5,tensor("W2",[2,3],W2))+fl(5,tensor("B2",[2],[0.0,0.0]))+fl(11,vi("X",[1,32]))+fl(12,vi("Y",[1,2]))
 opset=fs(1,"")+fv(2,13)
-open('/rpf/tmp/opencode/test_relu32.onnx','wb').write(fv(1,8)+fl(8,opset)+fl(7,graph))
+open('$TMP/opencode/test_relu32.onnx','wb').write(fv(1,8)+fl(8,opset)+fl(7,graph))
 import hashlib
 out=[]
 c=0
@@ -489,19 +496,22 @@ while len(out)<32:
         if len(out)>=32: break
     c+=1
 import onnxruntime as ort, numpy as np, json
-sess=ort.InferenceSession('/rpf/tmp/opencode/test_relu32.onnx', providers=['CPUExecutionProvider'])
+sess=ort.InferenceSession('$TMP/opencode/test_relu32.onnx', providers=['CPUExecutionProvider'])
 y=sess.run(None,{sess.get_inputs()[0].name:np.array([out],dtype=np.float32)})[0]
-json.dump({"ort":y.tolist()}, open('/rpf/tmp/opencode/ort_ref.json','w'))
+json.dump({"ort":y.tolist()}, open('$TMP/opencode/ort_ref.json','w'))
 print("ORT_REF_OK", y.tolist())
 PYEOF
-./zig-out/bin/st-client --port $PORT vectors.onnx '{"text":"hello","model":"/rpf/tmp/opencode/test_relu32.onnx"}' > /rpf/tmp/opencode/zig_onnx.json
-python3 - <<'PYEOF'
+./zig-out/bin/st-client --port $PORT vectors.onnx '{"text":"hello","model":"'"$TMP"'/opencode/test_relu32.onnx"}' > $TMP/opencode/zig_onnx.json
+python3 - <<PYEOF
 import json
-z=json.load(open('/rpf/tmp/opencode/zig_onnx.json'))['result']['vector']
-o=json.load(open('/rpf/tmp/opencode/ort_ref.json'))['ort'][0]
+z=json.load(open('$TMP/opencode/zig_onnx.json'))['result']['vector']
+o=json.load(open('$TMP/opencode/ort_ref.json'))['ort'][0]
 assert abs(z[0]-o[0])<1e-4 and abs(z[1]-o[1])<1e-4, (z,o)
 print("ORT_EQUIV_2LAYER_PASS")
 PYEOF
+else
+  echo SKIP_NO_ONNXRUNTIME
+fi
 echo "== llama .model tokenizer =="
 if [ -f ../SillyTavern/src/tokenizers/llama.model ]; then
   ./zig-out/bin/st-client --port $PORT tokenizer.encode '{"text":"hello world","vocab":"../SillyTavern/src/tokenizers/llama.model"}' | grep -q '22172,3186' && echo PASS_LLAMA_MODEL || echo FAIL_LLAMA_MODEL
@@ -509,7 +519,7 @@ else
   echo SKIP_NO_LLAMA_MODEL
 fi
 echo "== google streaming =="
-cat > /rpf/tmp/opencode/mock_google.py <<'PYEOF'
+cat > $TMP/opencode/mock_google.py <<'PYEOF'
 from http.server import BaseHTTPRequestHandler, HTTPServer
 class H(BaseHTTPRequestHandler):
     def do_POST(self):
@@ -519,12 +529,12 @@ class H(BaseHTTPRequestHandler):
     def log_message(self,*a): pass
 HTTPServer(('127.0.0.1',18169),H).handle_request()
 PYEOF
-timeout 15 python3 /rpf/tmp/opencode/mock_google.py > /rpf/tmp/opencode/g.log 2>&1 & echo $! > /rpf/tmp/opencode/g.pid
+timeout 15 python3 $TMP/opencode/mock_google.py > $TMP/opencode/g.log 2>&1 & echo $! > $TMP/opencode/g.pid
 sleep 1
 ./zig-out/bin/st-client --port $PORT backend.stream '{"provider":"google","model":"gemini","api_key":"k","base_url":"http://127.0.0.1:18169","path":"/v1beta/models/gemini:streamGenerateContent","messages":[{"role":"user","content":"hi"}]}' | grep -q 'Google stream' && echo PASS
-kill $(cat /rpf/tmp/opencode/g.pid) 2>/dev/null || true
+kill $(cat $TMP/opencode/g.pid) 2>/dev/null || true
 echo "== provider error anthropic/google =="
-cat > /rpf/tmp/opencode/mock_403.py <<'PYEOF'
+cat > $TMP/opencode/mock_403.py <<'PYEOF'
 import json
 from http.server import BaseHTTPRequestHandler, HTTPServer
 class H(BaseHTTPRequestHandler):
@@ -535,24 +545,24 @@ class H(BaseHTTPRequestHandler):
     def log_message(self,*a): pass
 HTTPServer(('127.0.0.1',18171),H).handle_request()
 PYEOF
-timeout 15 python3 /rpf/tmp/opencode/mock_403.py > /rpf/tmp/opencode/e403.log 2>&1 & echo $! > /rpf/tmp/opencode/e403.pid
+timeout 15 python3 $TMP/opencode/mock_403.py > $TMP/opencode/e403.log 2>&1 & echo $! > $TMP/opencode/e403.pid
 sleep 1
 ./zig-out/bin/st-client --port $PORT backend.native '{"provider":"anthropic","model":"claude-3","api_key":"bad","base_url":"http://127.0.0.1:18171","path":"/v1/messages","messages":[]}' | grep -q '"status":403' && echo PASS
-kill $(cat /rpf/tmp/opencode/e403.pid) 2>/dev/null || true
+kill $(cat $TMP/opencode/e403.pid) 2>/dev/null || true
 echo "== semantic ranking =="
 SNAP=$(echo ~/.cache/huggingface/hub/models--sentence-transformers--all-MiniLM-L6-v2/snapshots/1110a243fdf4706b3f48f1d95db1a4f5529b4d41)
 if [ -f "$SNAP/onnx/model.onnx" ]; then
-  timeout 120 ./zig-out/bin/st-client --port $PORT vectors.neural_real "{\"text\":\"hello world\",\"model\":\"$SNAP/onnx/model.onnx\",\"vocab\":\"$SNAP/vocab.txt\"}" > /rpf/tmp/opencode/n1.json
-  timeout 120 ./zig-out/bin/st-client --port $PORT vectors.neural_real "{\"text\":\"quantum physics\",\"model\":\"$SNAP/onnx/model.onnx\",\"vocab\":\"$SNAP/vocab.txt\"}" > /rpf/tmp/opencode/n3.json
-  python3 - <<'PYEOF'
+  timeout 120 ./zig-out/bin/st-client --port $PORT vectors.neural_real "{\"text\":\"hello world\",\"model\":\"$SNAP/onnx/model.onnx\",\"vocab\":\"$SNAP/vocab.txt\"}" > $TMP/opencode/n1.json
+  timeout 120 ./zig-out/bin/st-client --port $PORT vectors.neural_real "{\"text\":\"quantum physics\",\"model\":\"$SNAP/onnx/model.onnx\",\"vocab\":\"$SNAP/vocab.txt\"}" > $TMP/opencode/n3.json
+  python3 - <<PYEOF
 import json, math
-a=json.load(open('/rpf/tmp/opencode/n1.json'))['result']['vector']
-c=json.load(open('/rpf/tmp/opencode/n3.json'))['result']['vector']
+a=json.load(open('$TMP/opencode/n1.json'))['result']['vector']
+c=json.load(open('$TMP/opencode/n3.json'))['result']['vector']
 def cos(x,y): return sum(i*j for i,j in zip(x,y))/(math.sqrt(sum(i*i for i in x))*math.sqrt(sum(j*j for j in y)))
 assert cos(a,a)==1.0 and cos(a,c)<0.5, (cos(a,a),cos(a,c))
 print("SEMANTIC_RANK_PASS")
 PYEOF
-  grep -q SEMANTIC_RANK_PASS /rpf/tmp/opencode/n1.json 2>/dev/null || python3 -c "import json,math; a=json.load(open('/rpf/tmp/opencode/n1.json'))['result']['vector']; c=json.load(open('/rpf/tmp/opencode/n3.json'))['result']['vector']; cos=sum(i*j for i,j in zip(a,c))/(math.sqrt(sum(i*i for i in a))*math.sqrt(sum(j*j for j in c))); assert cos<0.5; print('SEMANTIC_DIFF_OK',cos)" && echo PASS
+  grep -q SEMANTIC_RANK_PASS $TMP/opencode/n1.json 2>/dev/null || python3 -c "import json,math; a=json.load(open('$TMP/opencode/n1.json'))['result']['vector']; c=json.load(open('$TMP/opencode/n3.json'))['result']['vector']; cos=sum(i*j for i,j in zip(a,c))/(math.sqrt(sum(i*i for i in a))*math.sqrt(sum(j*j for j in c))); assert cos<0.5; print('SEMANTIC_DIFF_OK',cos)" && echo PASS
 else
   echo SKIP_NO_MINILM
 fi

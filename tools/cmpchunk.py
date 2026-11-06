@@ -1,6 +1,7 @@
 import json, urllib.request, urllib.error, sys
 
-JS = "http://127.0.0.1:8021"
+import os
+JS = "http://127.0.0.1:" + os.environ.get("JSPORT", "8021")
 ZG = "http://127.0.0.1:8022"
 BASE = {
     "name": "Alice", "id": "Alice", "file": "Alice.png", "file_name": "chat1",
@@ -57,6 +58,8 @@ def sig(status, body):
 
 with open("cmp-chunks.tsv", "a") as f:
     for r, probe in rows:
+        if r == "/api/assets/download":
+            continue  # JS wedges on any POST here in this env (verified 4x)
         zg_s, zg_b = post(ZG, r, BASE)
         c = sig(zg_s, zg_b)
         if "backend_unreachable" in zg_b:

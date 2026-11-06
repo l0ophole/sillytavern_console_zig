@@ -1,6 +1,7 @@
 const std = @import("std");
 const protocol = @import("common");
 const posix = std.posix;
+var unix_path: ?[]const u8 = null;
 
 fn printUsage() void {
     const e = std.fs.File.stderr();
@@ -9,19 +10,81 @@ fn printUsage() void {
     e.writeAll("  No method: interactive REPL (/help, /ping, /characters, /exit)\n") catch {};
 }
 
-fn sendRequest(alloc: std.mem.Allocator, host: []const u8, port: u16, method: []const u8, params: []const u8) ![]u8 {
-    const addr_str = try std.fmt.allocPrint(alloc, "{s}:{d}", .{ host, port });
-    defer alloc.free(addr_str);
-    const addr = try std.net.Address.parseIpAndPort(addr_str);
-    const sock = try posix.socket(addr.any.family, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP);
+fn loadToken(alloc: std.mem.Allocator) ?[]u8 {
+    if (std.posix.getenv("ST_TOKEN")) |v| {
+        if (v.len > 0) return alloc.dupe(u8, v) catch null;
+    }
+    const candidates = [_][]const u8{ std.posix.getenv("ST_TOKEN_FILE") orelse "", "./data/token" };
+    for (candidates) |c| {
+        if (c.len == 0) continue;
+        var buf: [256]u8 = undefined;
+        const f = std.fs.cwd().openFile(c, .{}) catch continue;
+        defer f.close();
+        const n = f.readAll(&buf) catch continue;
+        const t = std.mem.trim(u8, buf[0..n], " \t\r\n");
+        if (t.len >= 16) return alloc.dupe(u8, t) catch null;
+    }
+    return null;
+}
+
+fn sendRequest(alloc: std.mem.Allocator, host: []const u8, port: u16, method: []const u8, params_in: []const u8) ![]u8 {
+    // Inject auth token into params object if present
+    var params_owned: ?[]u8 = null;
+    defer if (params_owned) |p| alloc.free(p);
+    var params = params_in;
+    if (loadToken(alloc)) |tok| {
+        defer alloc.free(tok);
+        const t = std.mem.trim(u8, params_in, " \t\r\n");
+        if (std.mem.startsWith(u8, t, "{") and std.mem.indexOf(u8, t, "\"token\"") == null) {
+            const tq = try protocol.jsonQuote(alloc, tok);
+            defer alloc.free(tq);
+            if (t.len <= 2) {
+                params_owned = try std.fmt.allocPrint(alloc, "{{\"token\":{s}}}", .{tq});
+            } else {
+                params_owned = try std.fmt.allocPrint(alloc, "{{\"token\":{s},{s}", .{ tq, t[1..] });
+            }
+            params = params_owned.?;
+        }
+    }
+    const sock: posix.fd_t = blk: {
+        if (unix_path) |up| {
+            const s = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
+            var sa: posix.sockaddr.un = undefined;
+            sa.family = posix.AF.UNIX;
+            @memset(&sa.path, 0);
+            if (up.len >= sa.path.len) return error.PathTooLong;
+            @memcpy(sa.path[0..up.len], up);
+            try posix.connect(s, @as(*posix.sockaddr, @ptrCast(&sa)), @sizeOf(posix.sockaddr.un));
+            break :blk s;
+        }
+        const addr_str = try std.fmt.allocPrint(alloc, "{s}:{d}", .{ host, port });
+        defer alloc.free(addr_str);
+        const addr = try std.net.Address.parseIpAndPort(addr_str);
+        const s = try posix.socket(addr.any.family, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP);
+        try posix.connect(s, &addr.any, addr.getOsSockLen());
+        break :blk s;
+    };
     defer posix.close(sock);
-    try posix.connect(sock, &addr.any, addr.getOsSockLen());
-    const req_line = try std.fmt.allocPrint(alloc, "{{\"method\":\"{s}\",\"params\":{s}}}\n", .{ method, params });
+    const mq = try protocol.jsonQuote(alloc, method);
+    defer alloc.free(mq);
+    const req_line = try std.fmt.allocPrint(alloc, "{{\"method\":{s},\"params\":{s}}}\n", .{ mq, params });
     defer alloc.free(req_line);
-    _ = try posix.write(sock, req_line);
-    var buf: [65536]u8 = undefined;
-    const n = try posix.read(sock, &buf);
-    return alloc.dupe(u8, buf[0..n]);
+    var off: usize = 0;
+    while (off < req_line.len) {
+        const w = try posix.write(sock, req_line[off..]);
+        if (w == 0) return error.Closed;
+        off += w;
+    }
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(alloc);
+    var chunk: [8192]u8 = undefined;
+    while (true) {
+        const n = try posix.read(sock, &chunk);
+        if (n == 0) break;
+        try out.appendSlice(alloc, chunk[0..n]);
+        if (std.mem.indexOfScalar(u8, chunk[0..n], '\n') != null) break;
+    }
+    return out.toOwnedSlice(alloc);
 }
 
 fn repl(alloc: std.mem.Allocator, host: []const u8, port: u16) !void {
@@ -103,6 +166,9 @@ pub fn main() !void {
             return;
         } else if (std.mem.eql(u8, args[i], "--repl")) {
             method = null;
+        } else if (std.mem.eql(u8, args[i], "--unix") and i + 1 < args.len) {
+            unix_path = args[i + 1];
+            i += 1;
         } else if (std.mem.eql(u8, args[i], "--host") and i + 1 < args.len) {
             host = args[i + 1];
             i += 1;

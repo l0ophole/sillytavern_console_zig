@@ -1,7 +1,7 @@
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{});
+    const target = b.standardTargetOptions(.{ .default_target = .{ .cpu_model = .baseline } });
     const optimize = b.standardOptimizeOption(.{});
 
     const common = b.addModule("common", .{ .root_source_file = b.path("src/common/protocol.zig") });
