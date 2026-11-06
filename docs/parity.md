@@ -1,6 +1,6 @@
 # Parity tracker vs SillyTavern (../SillyTavern/src/endpoints/)
 
-Status legend: DONE = implemented in Zig + tested (`zig build test` / `tests/run.sh`) + committed. TODO = not yet implemented (do not claim parity).
+Status legend: DONE = implemented in Zig + tested (`zig build test` / `tests/run.sh`) + committed. PROXY = HTTP proxy handler exists (returns `backend_unreachable` without upstream keys/servers; original JS also fails in that condition — not byte-identical outputs). TODO = not yet implemented (do not claim parity).
 
 | SillyTavern endpoint | Zig method(s) | Status |
 |---|---|---|
@@ -17,13 +17,13 @@ Status legend: DONE = implemented in Zig + tested (`zig build test` / `tests/run
 | backgrounds / avatars / sprites / images / thumbnails / files / assets / backups / data-maid | `files.*`/`backgrounds.*`/`avatars.*`/`sprites.*`/`images.*`/`assets.*`/`thumbnails.*`/`data-maid.scan`/`backups.*` | DONE |
 | stats | `stats.summary` | DONE Task 8 |
 | tokenizers | `tokenizer.estimate` + `tokenizer.encode` (tiktoken cl100k/p50k/r50k, HF llama3.json, sentencepiece .model mistral/gemma/llama verified vs JS reference) | DONE |
-| backends/chat-completions, openai, anthropic, google, azure, openrouter, novelai, horde, kobold, text-completions | `backend.chat`/`backend.fetch` + `backend.provider` + `backend.native` (provider_error parity OpenAI/Anthropic/Google) + `chat.generate_and_save` (end-to-end SDK flow) | DONE |
-| image-metadata | `image-metadata.get/detect` | DONE |
+| backends/chat-completions, openai, anthropic, google, azure, openrouter, novelai, horde, kobold, text-completions | `backend.chat`/`backend.fetch` + `backend.provider` + `backend.native` (provider_error parity OpenAI/Anthropic/Google) + `chat.generate_and_save` (end-to-end SDK flow) | PROXY — handler exists, requires upstream key/server; not byte-identical |
+| image-metadata | `image-metadata.get/detect` | DONE (local); folders/* via generic files (shapes differ, see route-table) |
 | users-admin/users-private/users-public | `users.*` create/list/delete/login/validate/logout (Sha256 + session tokens, 24h) | DONE |
 | vectors | `vectors.save/list/query/delete/generate/embed/model/onnx/neural_real/pure_minilm` (hash + MLP + ONNX ORT-verified + MiniLM semantic ranking 1.0>0.09 + pure-Zig MiniLM safetensors cosine 0.999999 vs ONNX) | DONE |
 | search | `search.query` (local) + `search.web` (DuckDuckGo/custom URL, HTTP+HTTPS) | DONE |
-| speech/caption/classify/translate/stable-diffusion/openai/anthropic/google/azure/openrouter/novelai/horde/minimax/volcengine/nanogpt/backends | `*.proxy` + `caption.image` + `speech.tts` + `classify.classify` + `translate.translate` + `stable-diffusion.generate_and_save` | DONE |
-| extensions | `extensions.save/list/get/delete/execute/execute_browser` (node + DOM/SillyTavern shim) | DONE |
+| speech/caption/classify/translate/stable-diffusion/openai/anthropic/google/azure/openrouter/novelai/horde/minimax/volcengine/nanogpt/backends | `*.proxy` + `caption.image` + `speech.tts` + `classify.classify` + `translate.translate` + `stable-diffusion.generate_and_save` | PROXY — handler exists, requires upstream key/server (85 routes `backend_unreachable`); not byte-identical |
+| extensions | `extensions.save/list/get/delete/execute/execute_browser` (node + DOM/SillyTavern shim) | DONE (local install/update via generic files; remote git ops require network) |
 | content-manager | `content-manager.import/list/import_url` (HTTP+HTTPS fetch) | DONE |
 | byaf/charx | `byaf.import`/`charx.import`/`characters.import_zip` (ZIP card.json, stored+deflate) | DONE |
 
