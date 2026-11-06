@@ -444,6 +444,63 @@ timeout 30 ./zig-out/bin/st-client --port $PORT backend.stream '{"provider":"ope
 kill $(cat /rpf/tmp/opencode/retry.pid) 2>/dev/null || true
 echo "== browser smoke all =="
 timeout 120 ./zig-out/bin/st-client --port $PORT frontend.browser_smoke_all | grep -q '"all_ok":true' && echo PASS
+echo "== onnx ort equivalence =="
+python3 - <<'PYEOF'
+import struct, random
+random.seed(7)
+def varint(n):
+    out=b''
+    while True:
+        b=n & 0x7f; n>>=7
+        if n: out+=bytes([b|0x80])
+        else: out+=bytes([b]); break
+    return out
+def tag(f,w): return varint((f<<3)|w)
+def fv(f,v): return tag(f,0)+varint(v)
+def fl(f,d): return tag(f,2)+varint(len(d))+d
+def fs(f,s): return fl(f,s.encode())
+def pi64(f,vals): return fl(f,b''.join(varint(v) for v in vals))
+def pf32(f,vals): return fl(f,b''.join(struct.pack('<f',v) for v in vals))
+def tensor(n,dims,data): return pi64(1,dims)+fv(2,1)+pf32(4,data)+fs(8,n)
+def gemm_node(inp,w,b,out):
+    n=fs(1,inp)+fs(1,w)+fs(1,b)+fs(2,out)+fs(4,"Gemm")
+    attr=fs(1,"transB")+fv(20,2)+fv(3,1)
+    return n+fl(5,attr)
+def relu_node(inp,out):
+    return fs(1,inp)+fs(2,out)+fs(4,"Relu")
+def vi(n,dims):
+    shape=b''
+    for d in dims: shape+=fl(1,fv(1,d))
+    tt=fv(1,1)+fl(2,shape)
+    return fs(1,n)+fl(2,fl(1,tt))
+W1=[random.uniform(-0.5,0.5) for _ in range(96)]
+W2=[random.uniform(-0.5,0.5) for _ in range(6)]
+graph=fl(1,gemm_node("X","W1","B1","H"))+fl(1,relu_node("H","R"))+fl(1,gemm_node("R","W2","B2","Y"))+fs(2,"g")+fl(5,tensor("W1",[3,32],W1))+fl(5,tensor("B1",[3],[0.1,-0.1,0.0]))+fl(5,tensor("W2",[2,3],W2))+fl(5,tensor("B2",[2],[0.0,0.0]))+fl(11,vi("X",[1,32]))+fl(12,vi("Y",[1,2]))
+opset=fs(1,"")+fv(2,13)
+open('/rpf/tmp/opencode/test_relu32.onnx','wb').write(fv(1,8)+fl(8,opset)+fl(7,graph))
+import hashlib
+out=[]
+c=0
+while len(out)<32:
+    h=hashlib.sha256(f"hello:{c}".encode()).digest()
+    for b in h:
+        out.append(b/127.5-1.0)
+        if len(out)>=32: break
+    c+=1
+import onnxruntime as ort, numpy as np, json
+sess=ort.InferenceSession('/rpf/tmp/opencode/test_relu32.onnx', providers=['CPUExecutionProvider'])
+y=sess.run(None,{sess.get_inputs()[0].name:np.array([out],dtype=np.float32)})[0]
+json.dump({"ort":y.tolist()}, open('/rpf/tmp/opencode/ort_ref.json','w'))
+print("ORT_REF_OK", y.tolist())
+PYEOF
+./zig-out/bin/st-client --port $PORT vectors.onnx '{"text":"hello","model":"/rpf/tmp/opencode/test_relu32.onnx"}' > /rpf/tmp/opencode/zig_onnx.json
+python3 - <<'PYEOF'
+import json
+z=json.load(open('/rpf/tmp/opencode/zig_onnx.json'))['result']['vector']
+o=json.load(open('/rpf/tmp/opencode/ort_ref.json'))['ort'][0]
+assert abs(z[0]-o[0])<1e-4 and abs(z[1]-o[1])<1e-4, (z,o)
+print("ORT_EQUIV_2LAYER_PASS")
+PYEOF
 echo "== bad method =="
 ./zig-out/bin/st-client --port $PORT nope | grep -q '"ok":false' && echo PASS
 cat "$TMP/server.log"
