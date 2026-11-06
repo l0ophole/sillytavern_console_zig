@@ -633,6 +633,50 @@ test "onnx gelu" {
     model.tensors.deinit();
 }
 
+test "onnx transformer block chain" {
+    // Chain: Gemm -> LayerNorm -> Gelu, verify vs manual reference
+    const alloc = std.testing.allocator;
+    var tensors = std.StringHashMap(Tensor).init(alloc);
+    try tensors.put(try alloc.dupe(u8, "W"), .{ .name = try alloc.dupe(u8, "W"), .dims = try alloc.dupe(i64, &[_]i64{ 2, 2 }), .data = try alloc.dupe(f32, &[_]f32{ 1, 0, 0, 1 }) });
+    try tensors.put(try alloc.dupe(u8, "B"), .{ .name = try alloc.dupe(u8, "B"), .dims = try alloc.dupe(i64, &[_]i64{2}), .data = try alloc.dupe(f32, &[_]f32{ 0, 0 }) });
+    var model = OnnxModel{
+        .tensors = tensors,
+        .nodes = try alloc.dupe(Node, &[_]Node{
+            .{ .op = try alloc.dupe(u8, "Gemm"), .inputs = try alloc.dupe([]u8, &[_][]u8{ try alloc.dupe(u8, "X"), try alloc.dupe(u8, "W"), try alloc.dupe(u8, "B") }), .outputs = try alloc.dupe([]u8, &[_][]u8{try alloc.dupe(u8, "H")}), .trans_b = true },
+            .{ .op = try alloc.dupe(u8, "LayerNormalization"), .inputs = try alloc.dupe([]u8, &[_][]u8{try alloc.dupe(u8, "H")}), .outputs = try alloc.dupe([]u8, &[_][]u8{try alloc.dupe(u8, "N")}) },
+            .{ .op = try alloc.dupe(u8, "Gelu"), .inputs = try alloc.dupe([]u8, &[_][]u8{try alloc.dupe(u8, "N")}), .outputs = try alloc.dupe([]u8, &[_][]u8{try alloc.dupe(u8, "Y")}) },
+        }),
+        .input_name = try alloc.dupe(u8, "X"),
+        .output_name = try alloc.dupe(u8, "Y"),
+        .alloc = alloc,
+    };
+    defer {
+        for (model.nodes) |n| {
+            alloc.free(n.op);
+            for (n.inputs) |i| alloc.free(i);
+            alloc.free(n.inputs);
+            for (n.outputs) |o| alloc.free(o);
+            alloc.free(n.outputs);
+        }
+        alloc.free(model.nodes);
+        alloc.free(model.input_name);
+        alloc.free(model.output_name);
+        var it = model.tensors.iterator();
+        while (it.next()) |e| {
+            alloc.free(e.key_ptr.*);
+            alloc.free(e.value_ptr.*.name);
+            alloc.free(e.value_ptr.*.dims);
+            alloc.free(e.value_ptr.*.data);
+        }
+        model.tensors.deinit();
+    }
+    const out = try model.run(alloc, &[_]f32{ 2, 0 });
+    defer alloc.free(out);
+    // Gemm identity -> [2,0]; LayerNorm mean=1,var=1 -> [1,-1]; Gelu -> [0.841,-0.159]
+    try std.testing.expectApproxEqAbs(@as(f32, 0.84119), out[0], 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, -0.15881), out[1], 1e-4);
+}
+
 test "onnx varint" {
     try std.testing.expect(true);
 }
