@@ -1908,6 +1908,69 @@ fn handleClient(conn: posix.fd_t) void {
         const inner = std.fmt.allocPrint(alloc, "{{\"provider\":\"{s}\",\"url\":\"{s}\",\"status\":{d},\"body\":{s}}}", .{ prov.name, url, fetched.status, q }) catch return;
         defer alloc.free(inner);
         resp = protocol.encodeOk(alloc, inner) catch return;
+    } else if (std.mem.eql(u8, req.method, "backend.native")) {
+        const pname = getStr(req, "provider") orelse {
+            resp = protocol.encodeErr(alloc, "bad_request") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        const prov = providers_mod.getProvider(pname) orelse {
+            resp = protocol.encodeErr(alloc, "unknown_provider") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        const model_name = getStr(req, "model") orelse "gpt-4";
+        var max_tokens: u32 = 1024;
+        if (getObjValue(req, "max_tokens")) |mv| {
+            if (mv == .integer) max_tokens = @intCast(mv.integer);
+        }
+        var msgs_json: []u8 = undefined;
+        if (getObjValue(req, "messages")) |mv| {
+            msgs_json = store.stringifyValue(alloc, mv) catch return;
+        } else {
+            msgs_json = alloc.dupe(u8, "[]") catch return;
+        }
+        defer alloc.free(msgs_json);
+        const native_body = providers_mod.buildNativeBody(alloc, pname, model_name, msgs_json, max_tokens) catch {
+            resp = protocol.encodeErr(alloc, "bad_request") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        defer alloc.free(native_body);
+        const url = providers_mod.buildUrl(alloc, prov, getStr(req, "base_url"), getStr(req, "path")) catch return;
+        defer alloc.free(url);
+        const ak = getStr(req, "api_key") orelse "";
+        var headers_buf: [4]std.http.Header = undefined;
+        headers_buf[0] = .{ .name = "Content-Type", .value = "application/json" };
+        var nheaders: usize = 1;
+        var auth_val: ?[]u8 = null;
+        if (prov.auth_header.len > 0) {
+            auth_val = std.fmt.allocPrint(alloc, "{s}{s}", .{ prov.auth_prefix, ak }) catch return;
+            headers_buf[1] = .{ .name = prov.auth_header, .value = auth_val.? };
+            nheaders = 2;
+            if (std.mem.eql(u8, pname, "anthropic")) {
+                headers_buf[2] = .{ .name = "anthropic-version", .value = "2023-06-01" };
+                nheaders = 3;
+            }
+        }
+        defer if (auth_val) |av| alloc.free(av);
+        const fetched = backend.fetchUrlHeaders(alloc, url, "POST", native_body, headers_buf[0..nheaders]) catch {
+            resp = protocol.encodeErr(alloc, "backend_unreachable") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        defer alloc.free(fetched.body);
+        const text = providers_mod.parseNativeResponse(alloc, pname, fetched.body) catch return;
+        defer alloc.free(text);
+        const tq = protocol.jsonQuote(alloc, text) catch return;
+        defer alloc.free(tq);
+        const inner = std.fmt.allocPrint(alloc, "{{\"provider\":\"{s}\",\"status\":{d},\"text\":{s}}}", .{ prov.name, fetched.status, tq }) catch return;
+        defer alloc.free(inner);
+        resp = protocol.encodeOk(alloc, inner) catch return;
     } else if (std.mem.eql(u8, req.method, "ping")) {
         resp = protocol.encodeOk(alloc, "{\"pong\":true,\"version\":\"" ++ protocol.VERSION ++ "\"}") catch return;
     } else if (std.mem.eql(u8, req.method, "version")) {

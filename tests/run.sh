@@ -135,6 +135,11 @@ python3 -c "import json; m={'input_dim':32,'hidden_dim':4,'output_dim':2,'W1':[0
 ./zig-out/bin/st-client --port $PORT vectors.model '{"text":"hello","model":"/nonexistent.json"}' | grep -q 'model_not_found' && echo PASS
 echo "== browser extension runtime =="
 ./zig-out/bin/st-client --port $PORT extensions.execute_browser '{"code":"registerSlashCommand(\"hello\", ()=>{});"}' | grep -q 'hello' && echo PASS
+echo "== native provider =="
+python3 -c "import json; from http.server import BaseHTTPRequestHandler,HTTPServer; H=type('H',(BaseHTTPRequestHandler,),{'do_POST':lambda s: (s.send_response(200), s.send_header('Content-Type','application/json'), s.end_headers(), s.wfile.write(json.dumps({'content':[{'text':'mocked'}]}).encode())) if not s.headers.get('Content-Length') else None,'log_message':lambda s,*a: None}); HTTPServer(('127.0.0.1',18121),H).handle_request()" > /rpf/tmp/opencode/mock2.log 2>&1 & echo $! > /tmp/mock2.pid
+sleep 1
+./zig-out/bin/st-client --port $PORT backend.native '{"provider":"anthropic","model":"claude-3","api_key":"k","base_url":"http://127.0.0.1:18121","path":"/v1/messages","messages":[{"role":"user","content":"hi"}]}' | grep -q 'mocked' && echo PASS || echo FAIL_NATIVE
+kill $(cat /tmp/mock2.pid) 2>/dev/null || true
 echo "== bad method =="
 ./zig-out/bin/st-client --port $PORT nope | grep -q '"ok":false' && echo PASS
 cat "$TMP/server.log"

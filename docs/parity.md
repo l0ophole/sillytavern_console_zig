@@ -17,7 +17,7 @@ Status legend: DONE = implemented in Zig + tested (`zig build test` / `tests/run
 | backgrounds / avatars / sprites / images / thumbnails / files / assets / backups / data-maid | `files.*`/`backgrounds.*`/`avatars.*`/`sprites.*`/`images.*`/`assets.*`/`thumbnails.*`/`data-maid.scan`/`backups.*` | DONE |
 | stats | `stats.summary` | DONE Task 8 |
 | tokenizers | `tokenizer.estimate` + `tokenizer.encode` (exact cl100k BPE when vocab present) | DONE |
-| backends/chat-completions, openai, anthropic, google, azure, openrouter, novelai, horde, kobold, text-completions | `backend.chat`/`backend.fetch` + `backend.provider` (per-provider URL/auth table) | DONE |
+| backends/chat-completions, openai, anthropic, google, azure, openrouter, novelai, horde, kobold, text-completions | `backend.chat`/`backend.fetch` + `backend.provider` + `backend.native` (per-provider request/response normalization) | DONE |
 | image-metadata | `image-metadata.get/detect` | DONE |
 | users-admin/users-private/users-public | `users.*` create/list/delete/login/validate/logout (Sha256 + session tokens, 24h) | DONE |
 | vectors | `vectors.save/list/query/delete/generate/embed/model` (local hash + neural MLP model file + API proxy, cosine) | DONE |
