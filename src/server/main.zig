@@ -642,25 +642,26 @@ fn handleClient(conn: posix.fd_t) void {
         };
         resp = protocol.encodeOk(alloc, "{\"saved\":true}") catch return;
     } else if (std.mem.eql(u8, req.method, "chats.load")) {
-        const ch = getStr(req, "character") orelse {
+        const ch = getStr(req, "character") orelse getStr(req, "avatar_url") orelse getStr(req, "avatar") orelse getStr(req, "card_name");
+        const ch_final = ch orelse {
             resp = protocol.encodeErr(alloc, "bad_request") catch return;
             defer alloc.free(resp);
             _ = posix.write(conn, resp) catch {};
             return;
         };
-        const chat = getStr(req, "chat") orelse {
+        const chat = getStr(req, "chat") orelse getStr(req, "file_name") orelse {
             resp = protocol.encodeErr(alloc, "bad_request") catch return;
             defer alloc.free(resp);
             _ = posix.write(conn, resp) catch {};
             return;
         };
-        if (!protocol.isSafeName(ch) or !protocol.isSafeName(chat)) {
+        if (!protocol.isSafeName(ch_final) or !protocol.isSafeName(chat)) {
             resp = protocol.encodeErr(alloc, "bad_name") catch return;
             defer alloc.free(resp);
             _ = posix.write(conn, resp) catch {};
             return;
         }
-        const cdir = std.fs.path.join(alloc, &.{ udir, "chats", ch }) catch return;
+        const cdir = std.fs.path.join(alloc, &.{ udir, "chats", ch_final }) catch return;
         defer alloc.free(cdir);
         const fname = std.fmt.allocPrint(alloc, "{s}.jsonl", .{chat}) catch return;
         defer alloc.free(fname);
@@ -677,13 +678,13 @@ fn handleClient(conn: posix.fd_t) void {
         defer alloc.free(inner);
         resp = protocol.encodeOk(alloc, inner) catch return;
     } else if (std.mem.eql(u8, req.method, "chats.delete")) {
-        const ch = getStr(req, "character") orelse {
+        const ch = getStr(req, "character") orelse getStr(req, "avatar_url") orelse getStr(req, "avatar") orelse {
             resp = protocol.encodeErr(alloc, "bad_request") catch return;
             defer alloc.free(resp);
             _ = posix.write(conn, resp) catch {};
             return;
         };
-        const chat = getStr(req, "chat") orelse {
+        const chat = getStr(req, "chat") orelse getStr(req, "file_name") orelse {
             resp = protocol.encodeErr(alloc, "bad_request") catch return;
             defer alloc.free(resp);
             _ = posix.write(conn, resp) catch {};
