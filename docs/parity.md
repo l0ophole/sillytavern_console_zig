@@ -21,7 +21,7 @@ Status legend: DONE = implemented in Zig + tested (`zig build test` / `tests/run
 | image-metadata | `image-metadata.get/detect` | DONE |
 | users-admin/users-private/users-public | `users.*` create/list/delete/login/validate/logout (Sha256 + session tokens, 24h) | DONE |
 | vectors | `vectors.save/list/query/delete` (cosine, client-supplied embeddings) | DONE |
-| search | `search.query` (local substring over characters/worldinfo/presets) | DONE (local; web search TODO) |
+| search | `search.query` (local) + `search.web` (DuckDuckGo/custom URL, HTTP+HTTPS) | DONE |
 | speech/caption/classify/translate/stable-diffusion/openai/anthropic/google/azure/openrouter/novelai/horde/minimax/volcengine/nanogpt/backends | `*.proxy` + `backend.fetch` (HTTP+HTTPS) | DONE |
 | extensions | `extensions.save/list/get/delete` | DONE (text store; JS execution TODO) |
 | content-manager | `content-manager.import/list/import_url` (HTTP+HTTPS fetch) | DONE |

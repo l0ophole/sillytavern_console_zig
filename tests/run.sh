@@ -109,6 +109,9 @@ sleep 1
 ./zig-out/bin/st-client --port $PORT content-manager.import_url '{"url":"http://127.0.0.1:18105/card.json","name":"FromURL","kind":"characters"}' | grep -q '"saved"' && echo PASS
 ./zig-out/bin/st-client --port $PORT characters.get '{"name":"FromURL"}' | grep -q 'FromURL' && echo PASS
 kill $(cat /tmp/stwww.pid) 2>/dev/null || true
+echo "== web search =="
+./zig-out/bin/st-client --port $PORT search.web '{"query":"x","url":"http://127.0.0.1:9/"}' | grep -q 'backend_unreachable' && echo PASS
+timeout 20 ./zig-out/bin/st-client --port $PORT search.web '{"query":"zig"}' > /tmp/ws.txt 2>&1 && grep -q '"status":200' /tmp/ws.txt && echo PASS_WEB || echo SKIP_WEB_OFFLINE
 echo "== bad method =="
 ./zig-out/bin/st-client --port $PORT nope | grep -q '"ok":false' && echo PASS
 cat "$TMP/server.log"

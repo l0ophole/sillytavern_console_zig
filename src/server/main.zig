@@ -1560,6 +1560,50 @@ fn handleClient(conn: posix.fd_t) void {
         const inner = std.fmt.allocPrint(alloc, "{{\"status\":{d},\"body\":{s}}}", .{ fetched.status, q }) catch return;
         defer alloc.free(inner);
         resp = protocol.encodeOk(alloc, inner) catch return;
+    } else if (std.mem.eql(u8, req.method, "search.web")) {
+        const query = getStr(req, "query") orelse {
+            resp = protocol.encodeErr(alloc, "bad_request") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        var url: []u8 = undefined;
+        if (getStr(req, "url")) |u| {
+            url = alloc.dupe(u8, u) catch return;
+        } else {
+            // DuckDuckGo html endpoint, percent-encode query (space->+, alnum kept)
+            var enc: std.ArrayListUnmanaged(u8) = .empty;
+            defer enc.deinit(alloc);
+            for (query) |c| {
+                if ((c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '-' or c == '_' or c == '.') {
+                    enc.append(alloc, c) catch return;
+                } else if (c == ' ') {
+                    enc.append(alloc, '+') catch return;
+                } else {
+                    const hex = std.fmt.allocPrint(alloc, "%{x:0>2}", .{c}) catch return;
+                    defer alloc.free(hex);
+                    enc.appendSlice(alloc, hex) catch return;
+                }
+            }
+            const q = enc.toOwnedSlice(alloc) catch return;
+            defer alloc.free(q);
+            url = std.fmt.allocPrint(alloc, "https://html.duckduckgo.com/html/?q={s}", .{q}) catch return;
+        }
+        defer alloc.free(url);
+        const fetched = backend.fetchUrl(alloc, url, "GET", null) catch {
+            resp = protocol.encodeErr(alloc, "backend_unreachable") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        defer alloc.free(fetched.body);
+        // Truncate to first 64k to keep response sane
+        const body = if (fetched.body.len > 65536) fetched.body[0..65536] else fetched.body;
+        const q = protocol.jsonQuote(alloc, body) catch return;
+        defer alloc.free(q);
+        const inner = std.fmt.allocPrint(alloc, "{{\"status\":{d},\"body\":{s}}}", .{ fetched.status, q }) catch return;
+        defer alloc.free(inner);
+        resp = protocol.encodeOk(alloc, inner) catch return;
     } else if (std.mem.eql(u8, req.method, "ping")) {
         resp = protocol.encodeOk(alloc, "{\"pong\":true,\"version\":\"" ++ protocol.VERSION ++ "\"}") catch return;
     } else if (std.mem.eql(u8, req.method, "version")) {
