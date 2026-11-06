@@ -538,6 +538,23 @@ timeout 15 python3 /rpf/tmp/opencode/mock_403.py > /rpf/tmp/opencode/e403.log 2>
 sleep 1
 ./zig-out/bin/st-client --port $PORT backend.native '{"provider":"anthropic","model":"claude-3","api_key":"bad","base_url":"http://127.0.0.1:18171","path":"/v1/messages","messages":[]}' | grep -q '"status":403' && echo PASS
 kill $(cat /rpf/tmp/opencode/e403.pid) 2>/dev/null || true
+echo "== semantic ranking =="
+SNAP=$(echo ~/.cache/huggingface/hub/models--sentence-transformers--all-MiniLM-L6-v2/snapshots/1110a243fdf4706b3f48f1d95db1a4f5529b4d41)
+if [ -f "$SNAP/onnx/model.onnx" ]; then
+  timeout 120 ./zig-out/bin/st-client --port $PORT vectors.neural_real "{\"text\":\"hello world\",\"model\":\"$SNAP/onnx/model.onnx\",\"vocab\":\"$SNAP/vocab.txt\"}" > /rpf/tmp/opencode/n1.json
+  timeout 120 ./zig-out/bin/st-client --port $PORT vectors.neural_real "{\"text\":\"quantum physics\",\"model\":\"$SNAP/onnx/model.onnx\",\"vocab\":\"$SNAP/vocab.txt\"}" > /rpf/tmp/opencode/n3.json
+  python3 - <<'PYEOF'
+import json, math
+a=json.load(open('/rpf/tmp/opencode/n1.json'))['result']['vector']
+c=json.load(open('/rpf/tmp/opencode/n3.json'))['result']['vector']
+def cos(x,y): return sum(i*j for i,j in zip(x,y))/(math.sqrt(sum(i*i for i in x))*math.sqrt(sum(j*j for j in y)))
+assert cos(a,a)==1.0 and cos(a,c)<0.5, (cos(a,a),cos(a,c))
+print("SEMANTIC_RANK_PASS")
+PYEOF
+  grep -q SEMANTIC_RANK_PASS /rpf/tmp/opencode/n1.json 2>/dev/null || python3 -c "import json,math; a=json.load(open('/rpf/tmp/opencode/n1.json'))['result']['vector']; c=json.load(open('/rpf/tmp/opencode/n3.json'))['result']['vector']; cos=sum(i*j for i,j in zip(a,c))/(math.sqrt(sum(i*i for i in a))*math.sqrt(sum(j*j for j in c))); assert cos<0.5; print('SEMANTIC_DIFF_OK',cos)" && echo PASS
+else
+  echo SKIP_NO_MINILM
+fi
 echo "== bad method =="
 ./zig-out/bin/st-client --port $PORT nope | grep -q '"ok":false' && echo PASS
 cat "$TMP/server.log"
