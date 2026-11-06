@@ -372,6 +372,10 @@ echo "== prompt engine: worldinfo + author note + macros =="
 ./zig-out/bin/st-client --port $PORT prompt.preview '{"character":"Alice","chat":"turnchat","user_message":"I enter the tavern","worldinfo":"lore"}' | grep -q 'WI-ALWAYS' && echo PASS_WI_CONST
 ./zig-out/bin/st-client --port $PORT prompt.preview '{"character":"Alice","chat":"turnchat","user_message":"hi","author_note":"AN-TEXT","author_note_depth":1}' | grep -q 'AN-TEXT' && echo PASS_AN
 ./zig-out/bin/st-client --port $PORT prompt.macros | grep -q 'lastUserMessage' && echo PASS_MACROS
+./zig-out/bin/st-client --port $PORT presets.save '{"name":"inst1","value":{"system_sequence":"SYS {{name}}: ","input_sequence":"USER {{name}}: ","output_sequence":"CHAR {{name}}: "}}' | grep -q '"saved"' && echo PASS
+./zig-out/bin/st-client --port $PORT prompt.template '{"instruct":"inst1","character":"Alice","messages":[{"role":"system","content":"card"},{"role":"user","content":"hi"}]}' | grep -q 'USER User: hi' && echo PASS_TEMPLATE
+./zig-out/bin/st-client --port $PORT worldinfo.save '{"name":"lore2","value":{"entries":[{"key":["tavern"],"content":"Mentions the dragon.","disable":false,"constant":false},{"key":["dragon"],"content":"Dragon lore.","disable":false,"constant":false}]}}' | grep -q '"saved"' && echo PASS
+./zig-out/bin/st-client --port $PORT prompt.preview '{"character":"Alice","chat":"turnchat","user_message":"tavern","worldinfo":"lore2"}' | grep -q 'Dragon lore' && echo PASS_WI_RECURSION
 echo "== stage3: version, slash, groups, jobs =="
 ./zig-out/bin/st-client --port $PORT ping | grep -q '"version":1' && echo PASS_API_VERSION
 ./zig-out/bin/st-client --port $PORT slash.exec '{"command":"/echo","args":"hello zig"}' | grep -q 'hello zig' && echo PASS_SLASH

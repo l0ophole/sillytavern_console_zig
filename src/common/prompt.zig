@@ -332,6 +332,68 @@ pub fn applyInstructSystem(alloc: std.mem.Allocator, system_text: []const u8, pr
     return out.toOwnedSlice(alloc);
 }
 
+// World Info recursion: repeatedly scan selected content for new keys,
+// up to max_steps additional rounds (upstream world_info_max_recursion_steps).
+pub fn worldInfoSelectRecursive(alloc: std.mem.Allocator, entries_json: []const u8, scan_text: []const u8, max_steps: usize) ![]u8 {
+    var combined = try worldInfoSelect(alloc, entries_json, scan_text);
+    errdefer alloc.free(combined);
+    var step: usize = 0;
+    while (step < max_steps and combined.len > 0) : (step += 1) {
+        const more = try worldInfoSelect(alloc, entries_json, combined);
+        if (more.len == 0) {
+            alloc.free(more);
+            break;
+        }
+        // Only append entries not already present (avoid infinite loops)
+        if (std.mem.indexOf(u8, combined, more) != null) {
+            alloc.free(more);
+            break;
+        }
+        const next = try std.fmt.allocPrint(alloc, "{s}\n{s}", .{ combined, more });
+        alloc.free(combined);
+        alloc.free(more);
+        combined = next;
+    }
+    return combined;
+}
+
+// Instruct chat-template rendering: render messages into a single prompt
+// string using input_sequence/output_sequence/system_sequence (upstream
+// instruct-mode.js). {{name}} is replaced per role (System/User/<char>).
+pub fn renderInstructTemplate(alloc: std.mem.Allocator, preset_json: []const u8, messages_json: []const u8, char_name: []const u8) ![]u8 {
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, preset_json, .{}) catch return alloc.dupe(u8, messages_json);
+    if (parsed.value != .object) return alloc.dupe(u8, messages_json);
+    const get = struct {
+        fn f(obj: std.json.ObjectMap, key: []const u8) []const u8 {
+            if (obj.get(key)) |v| if (v == .string) return v.string;
+            return "";
+        }
+    }.f;
+    const in_seq = get(parsed.value.object, "input_sequence");
+    const out_seq = get(parsed.value.object, "output_sequence");
+    const sys_seq = get(parsed.value.object, "system_sequence");
+    if (in_seq.len == 0 and sys_seq.len == 0) return alloc.dupe(u8, messages_json);
+    const msgs_parsed = std.json.parseFromSlice(std.json.Value, alloc, messages_json, .{}) catch return alloc.dupe(u8, messages_json);
+    if (msgs_parsed.value != .array) return alloc.dupe(u8, messages_json);
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(alloc);
+    for (msgs_parsed.value.array.items) |m| {
+        if (m != .object) continue;
+        const role = get(m.object, "role");
+        const content = get(m.object, "content");
+        const name: []const u8 = if (std.mem.eql(u8, role, "system")) "System" else if (std.mem.eql(u8, role, "user")) "User" else char_name;
+        const seq: []const u8 = if (std.mem.eql(u8, role, "system")) sys_seq else if (std.mem.eql(u8, role, "user")) in_seq else out_seq;
+        const with_name = try std.mem.replaceOwned(u8, alloc, seq, "{{name}}", name);
+        defer alloc.free(with_name);
+        try out.appendSlice(alloc, with_name);
+        try out.appendSlice(alloc, content);
+        // Upstream appends the role's trailing sequence after content for
+        // the last message only via last_*_sequence; simplified: newline.
+        try out.append(alloc, '\n');
+    }
+    return out.toOwnedSlice(alloc);
+}
+
 test "macros char/user/time" {
     const alloc = std.testing.allocator;
     var vars = std.StringHashMap([]const u8).init(alloc);
@@ -401,4 +463,25 @@ test "instruct system sequence" {
     const out = try applyInstructSystem(alloc, "Card prompt.", preset);
     defer alloc.free(out);
     try std.testing.expectEqualStrings("You are System.\nCard prompt.", out);
+}
+
+test "worldinfo recursion" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const entries = "[{\"key\":[\"tavern\"],\"content\":\"Mentions the dragon.\",\"disable\":false,\"constant\":false},{\"key\":[\"dragon\"],\"content\":\"Dragon lore.\",\"disable\":false,\"constant\":false}]";
+    const out = try worldInfoSelectRecursive(alloc, entries, "tavern", 2);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Dragon lore.") != null);
+    const no_rec = try worldInfoSelectRecursive(alloc, entries, "tavern", 0);
+    try std.testing.expect(std.mem.indexOf(u8, no_rec, "Dragon lore.") == null);
+}
+
+test "instruct template rendering" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const preset = "{\"system_sequence\":\"SYS {{name}}: \",\"input_sequence\":\"USER {{name}}: \",\"output_sequence\":\"CHAR {{name}}: \"}";
+    const msgs = "[{\"role\":\"system\",\"content\":\"card\"},{\"role\":\"user\",\"content\":\"hi\"},{\"role\":\"assistant\",\"content\":\"hello\"}]";
+    const out = try renderInstructTemplate(alloc, preset, msgs, "Alice");
+    try std.testing.expectEqualStrings("SYS System: card\nUSER User: hi\nCHAR Alice: hello\n", out);
 }

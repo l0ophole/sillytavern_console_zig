@@ -3608,7 +3608,11 @@ fn handleClient(conn: posix.fd_t) void {
                     defer alloc.free(book_content);
                     const scan = std.fmt.allocPrint(alloc, "{s}\n{s}\n{s}", .{ sys_macro, user_expanded, last_char_mes }) catch return;
                     defer alloc.free(scan);
-                    if (prompt_mod.worldInfoSelect(alloc, book_content, scan) catch null) |wi_text| {
+                    var wi_steps: usize = 1;
+                    if (getObjValue(req, "worldinfo_recursion")) |rv| {
+                        if (rv == .integer) wi_steps = std.math.cast(usize, rv.integer) orelse 1;
+                    }
+                    if (prompt_mod.worldInfoSelectRecursive(alloc, book_content, scan, wi_steps) catch null) |wi_text| {
                         defer alloc.free(wi_text);
                         if (wi_text.len > 0) {
                             const with_wi = prompt_mod.insertAuthorNote(alloc, msgs_json, wi_text, history_count + 1) catch return;
@@ -3874,6 +3878,41 @@ fn handleClient(conn: posix.fd_t) void {
         resp = protocol.encodeOk(alloc, inner) catch return;
     } else if (std.mem.eql(u8, req.method, "slash.list")) {
         resp = protocol.encodeOk(alloc, "{\"commands\":[\"echo\",\"upper\",\"time\",\"roll\",\"help\"]}") catch return;
+    } else if (std.mem.eql(u8, req.method, "prompt.template")) {
+        // Render instruct chat template to a single prompt string.
+        const preset_name = getStr(req, "instruct") orelse getStr(req, "preset") orelse {
+            resp = protocol.encodeErr(alloc, "bad_request") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        if (!protocol.isSafeName(preset_name)) {
+            resp = protocol.encodeErr(alloc, "bad_name") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        }
+        const pdir = std.fs.path.join(alloc, &.{ udir, "presets" }) catch return;
+        defer alloc.free(pdir);
+        const pfname = std.fmt.allocPrint(alloc, "{s}.json", .{preset_name}) catch return;
+        defer alloc.free(pfname);
+        const preset_content = crud.loadFile(alloc, pdir, pfname) catch {
+            resp = protocol.encodeErr(alloc, "not_found") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        defer alloc.free(preset_content);
+        const msgs_json = if (getObjValue(req, "messages")) |mv| store.stringifyValue(alloc, mv) catch return else alloc.dupe(u8, "[]") catch return;
+        defer alloc.free(msgs_json);
+        const char_name = getStr(req, "character") orelse "Alice";
+        const rendered = prompt_mod.renderInstructTemplate(alloc, preset_content, msgs_json, char_name) catch return;
+        defer alloc.free(rendered);
+        const rq = protocol.jsonQuote(alloc, rendered) catch return;
+        defer alloc.free(rq);
+        const inner = std.fmt.allocPrint(alloc, "{{\"prompt\":{s}}}", .{rq}) catch return;
+        defer alloc.free(inner);
+        resp = protocol.encodeOk(alloc, inner) catch return;
     } else if (std.mem.eql(u8, req.method, "prompt.macros")) {
         resp = protocol.encodeOk(alloc, "{\"macros\":[\"char\",\"user\",\"time\",\"date\",\"weekday\",\"lastMessage\",\"lastUserMessage\",\"lastCharMessage\",\"space\",\"newline\",\"trim\",\"noop\",\"//\",\"random\",\"pick\",\"roll\",\"setvar\",\"getvar\",\"addvar\",\"incvar\",\"decvar\",\"hasvar\",\"deletevar\"],\"note\":\"Full upstream macro registry (26 definition sets) is larger; this is the implemented core subset. Unknown macros pass through unchanged.\"}") catch return;
     } else if (std.mem.eql(u8, req.method, "prompt.preview")) {
@@ -3982,7 +4021,7 @@ fn handleClient(conn: posix.fd_t) void {
                     defer alloc.free(book_content);
                     const scan = std.fmt.allocPrint(alloc, "{s}\\n{s}", .{ sys_text, user_msg }) catch return;
                     defer alloc.free(scan);
-                    if (prompt_mod.worldInfoSelect(alloc, book_content, scan) catch null) |wi_text| {
+                    if (prompt_mod.worldInfoSelectRecursive(alloc, book_content, scan, 2) catch null) |wi_text| {
                         defer alloc.free(wi_text);
                         if (wi_text.len > 0) {
                             const with_wi = prompt_mod.insertAuthorNote(alloc, msgs_json, wi_text, history_count + 1) catch return;
