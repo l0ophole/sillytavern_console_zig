@@ -7,6 +7,7 @@ const backend = @import("backend");
 const png = @import("png");
 const users_mod = @import("users");
 const vectors_mod = @import("vectors");
+const zipm = @import("zipm");
 const posix = std.posix;
 
 var data_root: []const u8 = "data";
@@ -1296,6 +1297,67 @@ fn handleClient(conn: posix.fd_t) void {
                 resp = protocol.encodeErr(alloc, "unknown_method") catch return;
             }
         }
+    } else if (std.mem.eql(u8, req.method, "charx.import") or std.mem.eql(u8, req.method, "byaf.import") or std.mem.eql(u8, req.method, "characters.import_zip")) {
+        const name = getStr(req, "name") orelse {
+            resp = protocol.encodeErr(alloc, "bad_request") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        if (!protocol.isSafeName(name)) {
+            resp = protocol.encodeErr(alloc, "bad_name") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        }
+        const content_b64 = getStr(req, "content") orelse {
+            resp = protocol.encodeErr(alloc, "bad_request") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        const dec = std.base64.standard.Decoder;
+        const sz = dec.calcSizeForSlice(content_b64) catch {
+            resp = protocol.encodeErr(alloc, "bad_base64") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        const raw = alloc.alloc(u8, sz) catch return;
+        dec.decode(raw, content_b64) catch {
+            resp = protocol.encodeErr(alloc, "bad_base64") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        if (!zipm.isZip(raw)) {
+            resp = protocol.encodeErr(alloc, "not_zip") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        }
+        var card: ?[]u8 = zipm.extractFile(alloc, raw, "card.json") catch null;
+        if (card == null) card = zipm.extractFile(alloc, raw, "character.json") catch null;
+        if (card == null) {
+            resp = protocol.encodeErr(alloc, "no_card") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        }
+        defer alloc.free(card.?);
+        const cdir = std.fs.path.join(alloc, &.{ udir, "characters" }) catch return;
+        defer alloc.free(cdir);
+        const fname = std.fmt.allocPrint(alloc, "{s}.json", .{name}) catch return;
+        defer alloc.free(fname);
+        const cpath = std.fs.path.join(alloc, &.{ cdir, fname }) catch return;
+        defer alloc.free(cpath);
+        store.writeAtomic(cpath, card.?) catch {
+            resp = protocol.encodeErr(alloc, "io_error") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        resp = protocol.encodeOk(alloc, "{\"saved\":true}") catch return;
     } else if (std.mem.eql(u8, req.method, "ping")) {
         resp = protocol.encodeOk(alloc, "{\"pong\":true,\"version\":\"" ++ protocol.VERSION ++ "\"}") catch return;
     } else if (std.mem.eql(u8, req.method, "version")) {
