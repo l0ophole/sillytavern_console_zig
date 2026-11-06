@@ -195,6 +195,148 @@ fn handleClient(conn: posix.fd_t) void {
             return;
         };
         resp = protocol.encodeOk(alloc, "{\"deleted\":true}") catch return;
+    } else if (std.mem.eql(u8, req.method, "chats.list")) {
+        const ch = getStr(req, "character") orelse {
+            resp = protocol.encodeErr(alloc, "bad_request") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        if (!protocol.isSafeName(ch)) {
+            resp = protocol.encodeErr(alloc, "bad_name") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        }
+        const cdir = std.fs.path.join(alloc, &.{ udir, "chats", ch }) catch return;
+        defer alloc.free(cdir);
+        std.fs.cwd().makePath(cdir) catch {};
+        const names = crud.listNames(alloc, cdir) catch {
+            resp = protocol.encodeOk(alloc, "[]") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        defer { for (names) |nm| alloc.free(nm); alloc.free(names); }
+        const arr = crud.jsonArrayOfNames(alloc, names) catch return;
+        defer alloc.free(arr);
+        resp = protocol.encodeOk(alloc, arr) catch return;
+    } else if (std.mem.eql(u8, req.method, "chats.save")) {
+        const ch = getStr(req, "character") orelse {
+            resp = protocol.encodeErr(alloc, "bad_request") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        const chat = getStr(req, "chat") orelse {
+            resp = protocol.encodeErr(alloc, "bad_request") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        if (!protocol.isSafeName(ch) or !protocol.isSafeName(chat)) {
+            resp = protocol.encodeErr(alloc, "bad_name") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        }
+        const cdir = std.fs.path.join(alloc, &.{ udir, "chats", ch }) catch return;
+        defer alloc.free(cdir);
+        std.fs.cwd().makePath(cdir) catch {};
+        const fname = std.fmt.allocPrint(alloc, "{s}.jsonl", .{chat}) catch return;
+        defer alloc.free(fname);
+        const path = std.fs.path.join(alloc, &.{ cdir, fname }) catch return;
+        defer alloc.free(path);
+        var content: []u8 = undefined;
+        if (getStr(req, "content")) |c| {
+            content = alloc.dupe(u8, c) catch return;
+        } else if (getObjValue(req, "data")) |d| {
+            if (d == .array) {
+                var out: std.ArrayListUnmanaged(u8) = .empty;
+                defer out.deinit(alloc);
+                for (d.array.items) |item| {
+                    const s = store.stringifyValue(alloc, item) catch return;
+                    defer alloc.free(s);
+                    out.appendSlice(alloc, s) catch return;
+                    out.append(alloc, '\n') catch return;
+                }
+                content = out.toOwnedSlice(alloc) catch return;
+            } else {
+                content = store.stringifyValue(alloc, d) catch return;
+            }
+        } else {
+            resp = protocol.encodeErr(alloc, "bad_request") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        }
+        defer alloc.free(content);
+        store.writeAtomic(path, content) catch {
+            resp = protocol.encodeErr(alloc, "io_error") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        resp = protocol.encodeOk(alloc, "{\"saved\":true}") catch return;
+    } else if (std.mem.eql(u8, req.method, "chats.load")) {
+        const ch = getStr(req, "character") orelse {
+            resp = protocol.encodeErr(alloc, "bad_request") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        const chat = getStr(req, "chat") orelse {
+            resp = protocol.encodeErr(alloc, "bad_request") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        if (!protocol.isSafeName(ch) or !protocol.isSafeName(chat)) {
+            resp = protocol.encodeErr(alloc, "bad_name") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        }
+        const cdir = std.fs.path.join(alloc, &.{ udir, "chats", ch }) catch return;
+        defer alloc.free(cdir);
+        const fname = std.fmt.allocPrint(alloc, "{s}.jsonl", .{chat}) catch return;
+        defer alloc.free(fname);
+        const content = crud.loadFile(alloc, cdir, fname) catch {
+            resp = protocol.encodeErr(alloc, "not_found") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        defer alloc.free(content);
+        const q = protocol.jsonQuote(alloc, content) catch return;
+        defer alloc.free(q);
+        const inner = std.fmt.allocPrint(alloc, "{{\"content\":{s}}}", .{q}) catch return;
+        defer alloc.free(inner);
+        resp = protocol.encodeOk(alloc, inner) catch return;
+    } else if (std.mem.eql(u8, req.method, "chats.delete")) {
+        const ch = getStr(req, "character") orelse {
+            resp = protocol.encodeErr(alloc, "bad_request") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        const chat = getStr(req, "chat") orelse {
+            resp = protocol.encodeErr(alloc, "bad_request") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        const cdir = std.fs.path.join(alloc, &.{ udir, "chats", ch }) catch return;
+        defer alloc.free(cdir);
+        const fname = std.fmt.allocPrint(alloc, "{s}.jsonl", .{chat}) catch return;
+        defer alloc.free(fname);
+        crud.deleteFile(alloc, cdir, fname) catch {
+            resp = protocol.encodeErr(alloc, "not_found") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        resp = protocol.encodeOk(alloc, "{\"deleted\":true}") catch return;
     } else if (std.mem.eql(u8, req.method, "ping")) {
         resp = protocol.encodeOk(alloc, "{\"pong\":true,\"version\":\"" ++ protocol.VERSION ++ "\"}") catch return;
     } else if (std.mem.eql(u8, req.method, "version")) {

@@ -35,6 +35,32 @@ pub fn isSafeName(name: []const u8) bool {
     return true;
 }
 
+pub fn jsonQuote(alloc: std.mem.Allocator, s: []const u8) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(alloc);
+    try out.append(alloc, '"');
+    for (s) |c| {
+        switch (c) {
+            '"' => try out.appendSlice(alloc, "\\\""),
+            '\\' => try out.appendSlice(alloc, "\\\\"),
+            '\n' => try out.appendSlice(alloc, "\\n"),
+            '\r' => try out.appendSlice(alloc, "\\r"),
+            '\t' => try out.appendSlice(alloc, "\\t"),
+            else => {
+                if (c < 0x20) {
+                    const hex = try std.fmt.allocPrint(alloc, "\\u{x:0>4}", .{c});
+                    defer alloc.free(hex);
+                    try out.appendSlice(alloc, hex);
+                } else {
+                    try out.append(alloc, c);
+                }
+            },
+        }
+    }
+    try out.append(alloc, '"');
+    return out.toOwnedSlice(alloc);
+}
+
 pub fn encodeOk(alloc: std.mem.Allocator, result_json: []const u8) ![]u8 {
     // result_json is raw JSON text (or "null").
     var out: std.ArrayListUnmanaged(u8) = .empty;
@@ -82,6 +108,13 @@ test "encode ok/err" {
     const err = try encodeErr(alloc, "bad_request");
     defer alloc.free(err);
     try std.testing.expect(std.mem.indexOf(u8, err, "\"ok\":false") != null);
+}
+
+test "jsonQuote escapes" {
+    const alloc = std.testing.allocator;
+    const q = try jsonQuote(alloc, "a\"b\nc");
+    defer alloc.free(q);
+    try std.testing.expectEqualStrings("\"a\\\"b\\nc\"", q);
 }
 
 test "safe name rejects traversal" {

@@ -8,7 +8,7 @@ Status legend: DONE = implemented in Zig + tested (`zig build test` / `tests/run
 | healthcheck | `ping`, `version`, `health` | DONE (Task 1) |
 | settings | `settings.get`, `settings.save` | DONE Task 2 |
 | characters | `characters.list/create/get/delete` | DONE Task 3 (JSON; PNG card TODO) |
-| chats | `chats.list/save/load/delete` | TODO Task 4 |
+| chats | `chats.list/save/load/delete` | DONE Task 4 |
 | presets (instruct/textgen) | `presets.list/save/load/delete` | TODO Task 5 |
 | worldinfo | `worldinfo.list/save/load/delete` | TODO Task 5 |
 | secrets | `secrets.set/get(list masked)` | TODO Task 6 |
