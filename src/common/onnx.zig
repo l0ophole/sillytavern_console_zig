@@ -154,6 +154,53 @@ pub const OnnxModel = struct {
                 const a = env.get(node.inputs[0]) orelse return error.MissingInput;
                 const out = try alloc.dupe(f32, a);
                 try env.put(node.outputs[0], out);
+            } else if (std.mem.eql(u8, node.op, "Attention")) {
+                // Simplified scaled dot-product attention: Q,K,V are [seq,dim] flat,
+                // dim from node attribute encoded in output? Use first tensor dim fallback:
+                // We infer dim from V length / seq. Assume Q,K,V same shape [seq,dim].
+                const q = env.get(node.inputs[0]) orelse (self.tensors.get(node.inputs[0]) orelse return error.MissingInput).data;
+                const k = env.get(node.inputs[1]) orelse (self.tensors.get(node.inputs[1]) orelse return error.MissingInput).data;
+                const v = env.get(node.inputs[2]) orelse (self.tensors.get(node.inputs[2]) orelse return error.MissingInput).data;
+                if (q.len == 0 or k.len == 0 or v.len == 0) return error.BadShape;
+                // Infer dim: use sqrt if square, else from V dims
+                var dim: usize = 0;
+                if (self.tensors.get(node.inputs[2])) |vt| {
+                    if (vt.dims.len == 2) dim = @intCast(vt.dims[1]);
+                }
+                if (dim == 0) {
+                    // Square assume
+                    dim = @intFromFloat(@sqrt(@as(f64, @floatFromInt(k.len))));
+                    if (dim * dim != k.len and k.len % 8 == 0) dim = 8;
+                }
+                if (dim == 0 or q.len % dim != 0) return error.BadShape;
+                const seq_q = q.len / dim;
+                const seq_k = k.len / dim;
+                const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(dim)));
+                const out = try alloc.alloc(f32, seq_q * dim);
+                var scores = try alloc.alloc(f32, seq_q * seq_k);
+                defer alloc.free(scores);
+                for (0..seq_q) |i| {
+                    var maxv: f32 = -1000000;
+                    for (0..seq_k) |j| {
+                        var dot: f32 = 0;
+                        for (0..dim) |d| dot += q[i * dim + d] * k[j * dim + d];
+                        dot *= scale;
+                        scores[i * seq_k + j] = dot;
+                        maxv = @max(maxv, dot);
+                    }
+                    var sum: f32 = 0;
+                    for (0..seq_k) |j| {
+                        scores[i * seq_k + j] = @exp(scores[i * seq_k + j] - maxv);
+                        sum += scores[i * seq_k + j];
+                    }
+                    for (0..seq_k) |j| scores[i * seq_k + j] /= sum;
+                    for (0..dim) |d| {
+                        var acc: f32 = 0;
+                        for (0..seq_k) |j| acc += scores[i * seq_k + j] * v[j * dim + d];
+                        out[i * dim + d] = acc;
+                    }
+                }
+                try env.put(node.outputs[0], out);
             } else if (std.mem.eql(u8, node.op, "Softmax")) {
                 const a = env.get(node.inputs[0]) orelse return error.MissingInput;
                 const out = try alloc.alloc(f32, a.len);
@@ -480,6 +527,49 @@ test "onnx gather/add/transpose" {
         alloc.free(e.value_ptr.*.data);
     }
     model.tensors.deinit();
+}
+
+test "onnx attention identity" {
+    const alloc = std.testing.allocator;
+    const tensors = std.StringHashMap(Tensor).init(alloc);
+    var model = OnnxModel{
+        .tensors = tensors,
+        .nodes = try alloc.dupe(Node, &[_]Node{
+            .{ .op = try alloc.dupe(u8, "Attention"), .inputs = try alloc.dupe([]u8, &[_][]u8{ try alloc.dupe(u8, "Q"), try alloc.dupe(u8, "K"), try alloc.dupe(u8, "V") }), .outputs = try alloc.dupe([]u8, &[_][]u8{try alloc.dupe(u8, "Y")}) },
+        }),
+        .input_name = try alloc.dupe(u8, "Q"),
+        .output_name = try alloc.dupe(u8, "Y"),
+        .alloc = alloc,
+    };
+    defer {
+        for (model.nodes) |n| {
+            alloc.free(n.op);
+            for (n.inputs) |i| alloc.free(i);
+            alloc.free(n.inputs);
+            for (n.outputs) |o| alloc.free(o);
+            alloc.free(n.outputs);
+        }
+        alloc.free(model.nodes);
+        alloc.free(model.input_name);
+        alloc.free(model.output_name);
+        var it = model.tensors.iterator();
+        while (it.next()) |e| {
+            alloc.free(e.key_ptr.*);
+            alloc.free(e.value_ptr.*.name);
+            alloc.free(e.value_ptr.*.dims);
+            alloc.free(e.value_ptr.*.data);
+        }
+        model.tensors.deinit();
+    }
+    // Q=K=V identity basis: attention output approx V (each token attends to itself with dim 1)
+    // Use tensors for K,V; Q comes from input
+    try model.tensors.put(try alloc.dupe(u8, "K"), .{ .name = try alloc.dupe(u8, "K"), .dims = try alloc.dupe(i64, &[_]i64{ 2, 1 }), .data = try alloc.dupe(f32, &[_]f32{ 1, 0 }) });
+    try model.tensors.put(try alloc.dupe(u8, "V"), .{ .name = try alloc.dupe(u8, "V"), .dims = try alloc.dupe(i64, &[_]i64{ 2, 1 }), .data = try alloc.dupe(f32, &[_]f32{ 10, 20 }) });
+    const out = try model.run(alloc, &[_]f32{ 1, 0 });
+    defer alloc.free(out);
+    // token0 attends mostly to K0 (dot 1 vs 0) -> out near 10; token1 (0,0) uniform -> 15
+    try std.testing.expect(out[0] > 10 and out[0] < 15);
+    try std.testing.expectApproxEqAbs(@as(f32, 15), out[1], 1e-4);
 }
 
 test "onnx varint" {
