@@ -333,6 +333,22 @@ ST_WEB_ROOT=../SillyTavern/public curl -s http://127.0.0.1:$PORT/ > /rpf/tmp/ope
 grep -q 'SillyTavern' /rpf/tmp/opencode/webui.html && echo PASS_WEBUI || echo SKIP_WEBUI_PATH
 echo "== web API bridge =="
 curl -s -m 5 -X POST -H 'Content-Type: application/json' -d '{}' http://127.0.0.1:$PORT/api/settings.get | grep -q '"ok":true' && echo PASS
+echo "== provider error parity =="
+cat > /rpf/tmp/opencode/mock_err.py <<'PYEOF'
+import json
+from http.server import BaseHTTPRequestHandler, HTTPServer
+class H(BaseHTTPRequestHandler):
+    def do_POST(self):
+        ln=int(self.headers.get('Content-Length',0)); self.rfile.read(ln)
+        data=json.dumps({"error":{"message":"bad key"}}).encode()
+        self.send_response(401); self.send_header('Content-Type','application/json'); self.send_header('Content-Length',str(len(data))); self.end_headers(); self.wfile.write(data)
+    def log_message(self,*a): pass
+HTTPServer(('127.0.0.1',18145),H).handle_request()
+PYEOF
+python3 /rpf/tmp/opencode/mock_err.py > /rpf/tmp/opencode/e.log 2>&1 & echo $! > /rpf/tmp/opencode/e.pid
+sleep 1
+./zig-out/bin/st-client --port $PORT backend.native '{"provider":"openai","model":"gpt-4","api_key":"bad","base_url":"http://127.0.0.1:18145","path":"/v1/chat/completions","messages":[{"role":"user","content":"hi"}]}' | grep -q 'provider_error' && echo PASS
+kill $(cat /rpf/tmp/opencode/e.pid) 2>/dev/null || true
 echo "== bad method =="
 ./zig-out/bin/st-client --port $PORT nope | grep -q '"ok":false' && echo PASS
 cat "$TMP/server.log"

@@ -2513,6 +2513,14 @@ fn handleClient(conn: posix.fd_t) void {
             return;
         };
         defer alloc.free(fetched.body);
+        if (fetched.status < 200 or fetched.status >= 300) {
+            const inner = std.fmt.allocPrint(alloc, "{{\"provider\":\"{s}\",\"status\":{d},\"error\":\"provider_error\"}}", .{ prov.name, fetched.status }) catch return;
+            defer alloc.free(inner);
+            resp = protocol.encodeOk(alloc, inner) catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        }
         const text = providers_mod.parseNativeResponse(alloc, pname, fetched.body) catch return;
         defer alloc.free(text);
         const tq = protocol.jsonQuote(alloc, text) catch return;
