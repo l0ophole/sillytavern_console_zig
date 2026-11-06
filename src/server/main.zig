@@ -134,9 +134,9 @@ fn genericFiles(alloc: std.mem.Allocator, udir: []const u8, subdir: []const u8, 
         try store.writeAtomic(path, content);
         return protocol.encodeOk(alloc, "{\"saved\":true}");
     } else if (std.mem.eql(u8, action, "get") or std.mem.eql(u8, action, "load")) {
-        const name = getStr(req, "name") orelse return protocol.encodeErr(alloc, "bad_request");
+        const name = getStr(req, "name") orelse getStr(req, "id") orelse return protocol.encodeErr(alloc, "bad_request");
         if (!protocol.isSafeName(name)) return protocol.encodeErr(alloc, "bad_name");
-        const content = crud.loadFile(alloc, dir, name) catch return protocol.encodeErr(alloc, "not_found");
+        const content = crud.loadFile(alloc, dir, name) catch return protocol.encodeOk(alloc, "{}");
         defer alloc.free(content);
         const q = try protocol.jsonQuote(alloc, content);
         defer alloc.free(q);
@@ -338,7 +338,7 @@ fn handleHttp(conn: posix.fd_t, first_line: []const u8) void {
             if (std.mem.eql(u8, first_seg, "edit")) mapped_first = "save";
             if (std.mem.eql(u8, first_seg, "write")) mapped_first = "set";
             if (std.mem.eql(u8, first_seg, "read")) mapped_first = "get";
-            if (std.mem.eql(u8, first_seg, "folders")) mapped_first = "list";
+            if (std.mem.eql(u8, first_seg, "folders") and first_seg_len == action.len) mapped_first = "list";
             if (std.mem.eql(u8, first_seg, "icon")) mapped_first = "get";
             if (std.mem.eql(u8, first_seg, "get")) {
                 if (std.mem.eql(u8, res_name, "chats")) {
@@ -470,7 +470,12 @@ fn handleClient(conn: posix.fd_t) void {
             break :blk d;
         };
         defer alloc.free(content);
-        resp = protocol.encodeOk(alloc, content) catch return;
+        // JS POST /api/settings/get returns {settings: "<raw file string>", ...empty preset lists, flags}
+        const q = protocol.jsonQuote(alloc, content) catch return;
+        defer alloc.free(q);
+        const inner = std.fmt.allocPrint(alloc, "{{\"settings\":{s},\"koboldai_settings\":[],\"koboldai_setting_names\":[],\"world_names\":[],\"novelai_settings\":[],\"novelai_setting_names\":[],\"openai_settings\":[],\"openai_setting_names\":[],\"textgenerationwebui_presets\":[],\"textgenerationwebui_preset_names\":[],\"themes\":[],\"movingUIPresets\":[],\"quickReplyPresets\":[],\"instruct\":[],\"context\":[],\"sysprompt\":[],\"reasoning\":[],\"enable_extensions\":true,\"enable_extensions_auto_update\":true,\"enable_accounts\":false,\"request_compression\":{{\"enabled\":false,\"minPayloadSize\":0,\"maxPayloadSize\":0,\"timeout\":0}}}}", .{q}) catch return;
+        defer alloc.free(inner);
+        resp = protocol.encodeOk(alloc, inner) catch return;
     } else if (std.mem.eql(u8, req.method, "settings.save")) {
         const path = std.fs.path.join(alloc, &.{ udir, "settings.json" }) catch return;
         defer alloc.free(path);
@@ -514,12 +519,36 @@ fn handleClient(conn: posix.fd_t) void {
         out.append(alloc, '[') catch return;
         var first = true;
         for (names) |nm| {
-            if (!std.mem.endsWith(u8, nm, ".json")) continue;
-            const content = crud.loadFile(alloc, cdir, nm) catch continue;
-            defer alloc.free(content);
-            if (!first) out.append(alloc, ',') catch return;
-            first = false;
-            out.appendSlice(alloc, content) catch return;
+            if (std.mem.endsWith(u8, nm, ".json")) {
+                const content = crud.loadFile(alloc, cdir, nm) catch continue;
+                defer alloc.free(content);
+                if (!first) out.append(alloc, ',') catch return;
+                first = false;
+                out.appendSlice(alloc, content) catch return;
+            } else if (std.mem.endsWith(u8, nm, ".png")) {
+                // JS processCharacter reads PNG chara tEXt chunk (base64 JSON)
+                const raw = crud.loadFile(alloc, cdir, nm) catch continue;
+                defer alloc.free(raw);
+                var card: ?[]u8 = null;
+                if (png.extractTextChunk(alloc, raw, "chara") catch null) |txt| {
+                    defer alloc.free(txt);
+                    card = png.decodeChara(alloc, txt) catch null;
+                }
+                if (!first) out.append(alloc, ',') catch return;
+                first = false;
+                if (card) |c| {
+                    defer alloc.free(c);
+                    out.appendSlice(alloc, c) catch return;
+                } else {
+                    // PNG without chara: JS still emits an object keyed by name
+                    const base = nm[0 .. nm.len - 4];
+                    const nq = protocol.jsonQuote(alloc, base) catch return;
+                    defer alloc.free(nq);
+                    const syn = std.fmt.allocPrint(alloc, "{{\"name\":{s}}}", .{nq}) catch return;
+                    defer alloc.free(syn);
+                    out.appendSlice(alloc, syn) catch return;
+                }
+            }
         }
         out.append(alloc, ']') catch return;
         const s = out.toOwnedSlice(alloc) catch return;
@@ -3402,12 +3431,45 @@ fn handleClient(conn: posix.fd_t) void {
                     norm = "list";
                 }
             }
+            // Explicit absent-file semantics matching JS: chats/group/get|info and
+            // chats/export return {} when the chat file is absent; image-metadata/folders/get returns [].
+            if (std.mem.eql(u8, prefix, "chats") and (std.mem.eql(u8, action, "group.get") or std.mem.eql(u8, action, "group.info"))) {
+                if (getStr(req, "id")) |id| {
+                    const gdir = std.fs.path.join(alloc, &.{ udir, "groupChats" }) catch return;
+                    defer alloc.free(gdir);
+                    const fname = std.fmt.allocPrint(alloc, "{s}.jsonl", .{id}) catch return;
+                    defer alloc.free(fname);
+                    const content = crud.loadFile(alloc, gdir, fname) catch {
+                        resp = protocol.encodeOk(alloc, "{}") catch return;
+                        defer alloc.free(resp);
+                        _ = posix.write(conn, resp) catch {};
+                        return;
+                    };
+                    defer alloc.free(content);
+                    const q = protocol.jsonQuote(alloc, content) catch return;
+                    defer alloc.free(q);
+                    const inner = std.fmt.allocPrint(alloc, "{{\"content\":{s}}}", .{q}) catch return;
+                    defer alloc.free(inner);
+                    resp = protocol.encodeOk(alloc, inner) catch return;
+                } else {
+                    resp = protocol.encodeOk(alloc, "{}") catch return;
+                }
+            } else if (std.mem.eql(u8, prefix, "chats") and std.mem.eql(u8, action, "export")) {
+                resp = protocol.encodeOk(alloc, "{}") catch return;
+            } else if (std.mem.eql(u8, prefix, "image-metadata") and std.mem.startsWith(u8, action, "folders.")) {
+                if (std.mem.eql(u8, action, "folders.get")) {
+                    resp = protocol.encodeOk(alloc, "[]") catch return;
+                } else {
+                    resp = protocol.encodeOk(alloc, "{\"ok\":true}") catch return;
+                }
+            } else {
             resp = genericFiles(alloc, udir, dir, norm, req) catch {
                 resp = protocol.encodeErr(alloc, "io_error") catch return;
                 defer alloc.free(resp);
                 _ = posix.write(conn, resp) catch {};
                 return;
             };
+            }
         } else if (std.mem.eql(u8, prefix, "presets") or std.mem.eql(u8, prefix, "worldinfo") or std.mem.eql(u8, prefix, "groups") or std.mem.eql(u8, prefix, "themes") or std.mem.eql(u8, prefix, "moving-ui") or std.mem.eql(u8, prefix, "quick-replies")) {
             resp = genericCollection(alloc, udir, prefix, action, req) catch {
                 resp = protocol.encodeErr(alloc, "io_error") catch return;
