@@ -232,6 +232,15 @@ pub const OnnxModel = struct {
             } else if (std.mem.eql(u8, node.op, "Unsqueeze") or std.mem.eql(u8, node.op, "Squeeze")) {
                 const a = env.get(node.inputs[0]) orelse return error.MissingInput;
                 try env.put(node.outputs[0], try alloc.dupe(f32, a));
+            } else if (std.mem.eql(u8, node.op, "Cast")) {
+                const a = env.get(node.inputs[0]) orelse (self.tensors.get(node.inputs[0]) orelse return error.MissingInput).data;
+                try env.put(node.outputs[0], try alloc.dupe(f32, a));
+            } else if (std.mem.eql(u8, node.op, "Expand")) {
+                const a = env.get(node.inputs[0]) orelse return error.MissingInput;
+                try env.put(node.outputs[0], try alloc.dupe(f32, a));
+            } else if (std.mem.eql(u8, node.op, "Slice")) {
+                const a = env.get(node.inputs[0]) orelse return error.MissingInput;
+                try env.put(node.outputs[0], try alloc.dupe(f32, a));
             } else if (std.mem.eql(u8, node.op, "Softmax")) {
                 const a = env.get(node.inputs[0]) orelse return error.MissingInput;
                 const out = try alloc.alloc(f32, a.len);
