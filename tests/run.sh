@@ -402,6 +402,29 @@ python3 $TMP/opencode/mock_model.py > $TMP/opencode/model.log 2>&1 & echo $! > $
 sleep 1
 ./zig-out/bin/st-client --port $PORT chat.turn '{"character":"Alice","chat":"modelchat","user_message":"model={{model}} orig={{original}}","provider":"openai","model":"gpt-4","base_url":"http://127.0.0.1:18144","path":"/v1/chat/completions","api_key":"k"}' | grep -q '"saved":true' && echo PASS_MODEL_E2E
 kill $(cat $TMP/opencode/model.pid) 2>/dev/null || true
+cat > $TMP/opencode/mock_state.py <<'PYEOF'
+import json
+from http.server import BaseHTTPRequestHandler, HTTPServer
+class H(BaseHTTPRequestHandler):
+    def do_POST(self):
+        ln=int(self.headers.get('Content-Length',0)); body=self.rfile.read(ln)
+        req=json.loads(body)
+        user_contents = [m['content'] for m in req['messages'] if m.get('role')=='user']
+        if any('range=' in c for c in user_contents):
+            assert user_contents[-1] == 'range=0-3 last=3 swipes=1/1', user_contents
+        out=b"data: "+json.dumps({"choices":[{"delta":{"content":"ok"}}]}).encode()+b"\n\ndata: [DONE]\n\n"
+        self.send_response(200); self.send_header('Content-Type','text/event-stream'); self.send_header('Content-Length',str(len(out))); self.end_headers(); self.wfile.write(out)
+    def log_message(self,*a): pass
+srv = HTTPServer(('127.0.0.1',18145),H)
+for _ in range(3):
+    srv.handle_request()
+PYEOF
+python3 $TMP/opencode/mock_state.py > $TMP/opencode/state.log 2>&1 & echo $! > $TMP/opencode/state.pid
+sleep 1
+./zig-out/bin/st-client --port $PORT chat.turn '{"character":"Alice","chat":"statechat","user_message":"one","provider":"openai","model":"gpt-4","base_url":"http://127.0.0.1:18145","path":"/v1/chat/completions","api_key":"k"}' > /dev/null
+./zig-out/bin/st-client --port $PORT chat.turn '{"character":"Alice","chat":"statechat","user_message":"two","provider":"openai","model":"gpt-4","base_url":"http://127.0.0.1:18145","path":"/v1/chat/completions","api_key":"k"}' > /dev/null
+./zig-out/bin/st-client --port $PORT chat.turn '{"character":"Alice","chat":"statechat","user_message":"range={{allChatRange}} last={{lastMessageId}} swipes={{lastSwipeId}}/{{currentSwipeId}}","provider":"openai","model":"gpt-4","base_url":"http://127.0.0.1:18145","path":"/v1/chat/completions","api_key":"k"}' | grep -q '"saved":true' && echo PASS_STATE_E2E
+kill $(cat $TMP/opencode/state.pid) 2>/dev/null || true
 echo "== prompt engine: worldinfo + author note + macros =="
 ./zig-out/bin/st-client --port $PORT worldinfo.save '{"name":"lore","value":{"entries":[{"key":["tavern"],"content":"WI-TAVERN-LORE","disable":false,"constant":false},{"key":[],"content":"WI-ALWAYS","disable":false,"constant":true}]}}' | grep -q '"saved"' && echo PASS
 ./zig-out/bin/st-client --port $PORT prompt.preview '{"character":"Alice","chat":"turnchat","user_message":"I enter the tavern","worldinfo":"lore"}' | grep -q 'WI-TAVERN-LORE' && echo PASS_WI

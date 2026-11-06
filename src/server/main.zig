@@ -3574,6 +3574,9 @@ fn handleClient(conn: posix.fd_t) void {
         var history_count: usize = 0;
         var last_user_mes: []const u8 = "";
         var last_char_mes: []const u8 = "";
+        var last_user_send_date: []const u8 = "";
+        var last_swipe_count: i64 = -1;
+        var current_swipe_id: i64 = -1;
         if (store.readFileAlloc(alloc, chat_path)) |hist| {
             defer alloc.free(hist);
             var it = std.mem.splitScalar(u8, hist, '\n');
@@ -3595,7 +3598,19 @@ fn handleClient(conn: posix.fd_t) void {
                 defer alloc.free(one);
                 msgs.appendSlice(alloc, one) catch return;
                 history_count += 1;
-                if (is_u) last_user_mes = mes else last_char_mes = mes;
+                if (is_u) {
+                    last_user_mes = mes;
+                    if (v.value.object.get("send_date")) |sd| {
+                        if (sd == .string and sd.string.len > 0) last_user_send_date = sd.string;
+                    }
+                } else last_char_mes = mes;
+                // Swipe state of the last message (upstream swipes/swipe_id)
+                if (v.value.object.get("swipes")) |sw| {
+                    if (sw == .array) last_swipe_count = @intCast(sw.array.items.len);
+                }
+                if (v.value.object.get("swipe_id")) |sid| {
+                    if (sid == .integer) current_swipe_id = sid.integer + 1;
+                }
             }
         } else |_| {}
         var macro_vars = std.StringHashMap([]const u8).init(alloc);
@@ -3617,7 +3632,7 @@ fn handleClient(conn: posix.fd_t) void {
         const creator_field: []const u8 = if (card_get(card_obj, "creatorcomment").len > 0) card_get(card_obj, "creatorcomment") else card_get(card_obj, "creatorNotes");
         const depth_field: []const u8 = if (card_get(card_obj, "depth_prompt").len > 0) card_get(card_obj, "depth_prompt") else card_get(card_obj, "charDepthPrompt");
         const persona_field: []const u8 = if (card_get(card_obj, "persona").len > 0) card_get(card_obj, "persona") else getStr(req, "persona") orelse "";
-        var macro_ctx = prompt_mod.MacroCtx{ .char = display_name, .user = "User", .last_message = last_char_mes, .last_user_message = last_user_mes, .last_char_message = last_char_mes, .group = group_members, .group_not_muted = group_members, .not_char = group_members, .char_description = card_get(card_obj, "description"), .char_personality = card_get(card_obj, "personality"), .char_scenario = card_get(card_obj, "scenario"), .char_first_message = card_get(card_obj, "first_mes"), .mes_examples = card_get(card_obj, "mes_example"), .alt_greetings = alt_greetings, .char_version = version_field, .char_creator_notes = creator_field, .char_depth_prompt = depth_field, .persona = persona_field, .model = model_name, .original = user_msg_raw, .chat_id = chat_name, .vars = macro_vars };
+        var macro_ctx = prompt_mod.MacroCtx{ .char = display_name, .user = "User", .last_message = last_char_mes, .last_user_message = last_user_mes, .last_char_message = last_char_mes, .group = group_members, .group_not_muted = group_members, .not_char = group_members, .char_description = card_get(card_obj, "description"), .char_personality = card_get(card_obj, "personality"), .char_scenario = card_get(card_obj, "scenario"), .char_first_message = card_get(card_obj, "first_mes"), .mes_examples = card_get(card_obj, "mes_example"), .alt_greetings = alt_greetings, .char_version = version_field, .char_creator_notes = creator_field, .char_depth_prompt = depth_field, .persona = persona_field, .model = model_name, .original = user_msg_raw, .last_message_id = if (history_count > 0) @intCast(history_count - 1) else -1, .first_included_id = if (history_count > 0) 0 else -1, .first_displayed_id = if (history_count > 0) 0 else -1, .last_swipe_count = last_swipe_count, .current_swipe_id = current_swipe_id, .chat_count = history_count, .last_user_send_date = last_user_send_date, .gen_type = "normal", .chat_id = chat_name, .vars = macro_vars };
         _ = muted_members;
         const user_expanded = prompt_mod.expandMacros(alloc, user_msg2, &macro_ctx) catch return;
         defer alloc.free(user_expanded);
@@ -3871,10 +3886,14 @@ fn handleClient(conn: posix.fd_t) void {
             defer alloc.free(meta);
             to_write.appendSlice(alloc, meta) catch return;
         }
-        const uline = std.fmt.allocPrint(alloc, "{{\"name\":\"User\",\"is_user\":true,\"mes\":{s},\"send_date\":\"\"}}\n", .{uq}) catch return;
+        const send_dt = prompt_mod.formatIsoNow(alloc) catch alloc.dupe(u8, "") catch return;
+        defer alloc.free(send_dt);
+        const sdq = protocol.jsonQuote(alloc, send_dt) catch return;
+        defer alloc.free(sdq);
+        const uline = std.fmt.allocPrint(alloc, "{{\"name\":\"User\",\"is_user\":true,\"mes\":{s},\"send_date\":{s},\"swipes\":[{s}],\"swipe_id\":0}}\n", .{ uq, sdq, uq }) catch return;
         defer alloc.free(uline);
         to_write.appendSlice(alloc, uline) catch return;
-        const aline = std.fmt.allocPrint(alloc, "{{\"name\":{s},\"is_user\":false,\"mes\":{s},\"send_date\":\"\"}}\n", .{ nq, aq }) catch return;
+        const aline = std.fmt.allocPrint(alloc, "{{\"name\":{s},\"is_user\":false,\"mes\":{s},\"send_date\":{s},\"swipes\":[{s}],\"swipe_id\":0}}\n", .{ nq, aq, sdq, aq }) catch return;
         defer alloc.free(aline);
         to_write.appendSlice(alloc, aline) catch return;
         store.writeAtomic(chat_path, to_write.items) catch {
@@ -4029,7 +4048,7 @@ fn handleClient(conn: posix.fd_t) void {
         defer alloc.free(inner);
         resp = protocol.encodeOk(alloc, inner) catch return;
     } else if (std.mem.eql(u8, req.method, "prompt.macros")) {
-        resp = protocol.encodeOk(alloc, "{\"macros\":[\"char\",\"user\",\"time\",\"date\",\"weekday\",\"isotime\",\"isodate\",\"datetimeformat\",\"timeDiff\",\"model\",\"original\",\"isMobile\",\"persona\",\"greeting\",\"charVersion\",\"charCreatorNotes\",\"charDepthPrompt\",\"lastMessage\",\"lastUserMessage\",\"lastCharMessage\",\"space\",\"newline\",\"trim\",\"noop\",\"//\",\"random\",\"pick\",\"roll\",\"if\",\"else\",\"input\",\"maxPrompt\",\"maxContext\",\"maxResponse\",\"reverse\",\"group\",\"groupNotMuted\",\"notChar\",\"charPrompt\",\"charInstruction\",\"charDescription\",\"charPersonality\",\"charScenario\",\"charFirstMessage\",\"mesExamples\",\"outlet\",\"banned\",\"comment\",\"setvar\",\"getvar\",\"addvar\",\"incvar\",\"decvar\",\"hasvar\",\"deletevar\",\"setvarkey\",\"getvarkey\",\"setvarindex\",\"getvarindex\",\"setglobalvar\",\"getglobalvar\",\"hasglobalvar\",\"deleteglobalvar\",\"setglobalvarkey\",\"getglobalvarkey\",\"setglobalvarindex\",\"getglobalvarindex\"],\"note\":\"Implemented subset of the upstream macro registry (definitions/*.js). Unknown macros pass through unchanged. Chat-state macros (firstIncludedMessageId, swipe ids, allChatRange) and hasExtension/lastGenerationType/idleDuration are not ported.\"}") catch return;
+        resp = protocol.encodeOk(alloc, "{\"macros\":[\"char\",\"user\",\"time\",\"date\",\"weekday\",\"isotime\",\"isodate\",\"datetimeformat\",\"timeDiff\",\"model\",\"original\",\"isMobile\",\"persona\",\"greeting\",\"charVersion\",\"charCreatorNotes\",\"charDepthPrompt\",\"lastMessage\",\"lastUserMessage\",\"lastCharMessage\",\"space\",\"newline\",\"trim\",\"noop\",\"//\",\"random\",\"pick\",\"roll\",\"if\",\"else\",\"input\",\"maxPrompt\",\"maxContext\",\"maxResponse\",\"reverse\",\"group\",\"groupNotMuted\",\"notChar\",\"charPrompt\",\"charInstruction\",\"charDescription\",\"charPersonality\",\"charScenario\",\"charFirstMessage\",\"mesExamples\",\"outlet\",\"banned\",\"comment\",\"setvar\",\"getvar\",\"addvar\",\"incvar\",\"decvar\",\"hasvar\",\"deletevar\",\"setvarkey\",\"getvarkey\",\"setvarindex\",\"getvarindex\",\"setglobalvar\",\"getglobalvar\",\"hasglobalvar\",\"deleteglobalvar\",\"setglobalvarkey\",\"getglobalvarkey\",\"setglobalvarindex\",\"getglobalvarindex\",\"lastMessageId\",\"firstIncludedMessageId\",\"firstDisplayedMessageId\",\"lastSwipeId\",\"currentSwipeId\",\"allChatRange\",\"idleDuration\",\"lastGenerationType\",\"hasExtension\"],\"note\":\"Implemented subset of the upstream macro registry (definitions/*.js). Unknown macros pass through unchanged. Chat-state macros are computed over saved history (pending turn excluded); hasExtension always returns false (extensions are never enabled in the console port).\"}") catch return;
     } else if (std.mem.eql(u8, req.method, "prompt.preview")) {
         // Prompt manager: show the ordered prompt entries without calling a backend.
         const ch_name = getStr(req, "character") orelse getStr(req, "name") orelse {

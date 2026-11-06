@@ -35,6 +35,14 @@ pub const MacroCtx = struct {
     persona: []const u8 = "",
     model: []const u8 = "",
     original: []const u8 = "",
+    last_message_id: i64 = -1,
+    first_included_id: i64 = -1,
+    first_displayed_id: i64 = -1,
+    last_swipe_count: i64 = -1,
+    current_swipe_id: i64 = -1,
+    chat_count: usize = 0,
+    last_user_send_date: []const u8 = "",
+    gen_type: []const u8 = "",
     chat_id: []const u8 = "",
     max_prompt: u32 = 0,
     max_context: u32 = 0,
@@ -58,7 +66,7 @@ fn civilFromDays(alloc: std.mem.Allocator, secs: i64) ![]u8 {
     const rem: i64 = @mod(secs, 86400);
     const hh: i64 = @divFloor(rem, 3600);
     const mm: i64 = @divFloor(@mod(rem, 3600), 60);
-    return std.fmt.allocPrint(alloc, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}", .{ y, m, d, hh, mm });
+    return std.fmt.allocPrint(alloc, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}", .{ @as(u64, @intCast(y)), m, d, @as(u64, @intCast(hh)), @as(u64, @intCast(mm)) });
 }
 const Civil = struct { year: i64, month: u64, day: u64, hour: i64, minute: i64, second: i64, weekday: u64 };
 
@@ -98,7 +106,7 @@ fn formatMoment(alloc: std.mem.Allocator, civil: Civil, fmt: []const u8) ![]u8 {
     while (i < fmt.len) {
         const rest = fmt[i..];
         if (std.mem.startsWith(u8, rest, "YYYY")) {
-            try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "{d:0>4}", .{civil.year}));
+            try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "{d:0>4}", .{@as(u64, @intCast(civil.year))}));
             i += 4;
         } else if (std.mem.startsWith(u8, rest, "MMMM")) {
             try out.appendSlice(alloc, month_names[civil.month - 1]);
@@ -119,17 +127,17 @@ fn formatMoment(alloc: std.mem.Allocator, civil: Civil, fmt: []const u8) ![]u8 {
             try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "{d:0>2}", .{civil.day}));
             i += 2;
         } else if (std.mem.startsWith(u8, rest, "HH")) {
-            try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "{d:0>2}", .{civil.hour}));
+            try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "{d:0>2}", .{@as(u64, @intCast(civil.hour))}));
             i += 2;
         } else if (std.mem.startsWith(u8, rest, "hh")) {
             const h12: i64 = @mod(civil.hour + 11, 12) + 1;
             try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "{d:0>2}", .{h12}));
             i += 2;
         } else if (std.mem.startsWith(u8, rest, "mm")) {
-            try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "{d:0>2}", .{civil.minute}));
+            try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "{d:0>2}", .{@as(u64, @intCast(civil.minute))}));
             i += 2;
         } else if (std.mem.startsWith(u8, rest, "ss")) {
-            try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "{d:0>2}", .{civil.second}));
+            try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "{d:0>2}", .{@as(u64, @intCast(civil.second))}));
             i += 2;
         } else if (rest[0] == 'M') {
             try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "{d}", .{civil.month}));
@@ -164,6 +172,12 @@ fn formatMoment(alloc: std.mem.Allocator, civil: Civil, fmt: []const u8) ![]u8 {
     return out.toOwnedSlice(alloc);
 }
 
+// ISO-8601 UTC timestamp for chat send_date (upstream chat message shape).
+pub fn formatIsoNow(alloc: std.mem.Allocator) ![]u8 {
+    const c = civilNow();
+    return std.fmt.allocPrint(alloc, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.000Z", .{ @as(u64, @intCast(c.year)), c.month, c.day, @as(u64, @intCast(c.hour)), @as(u64, @intCast(c.minute)), @as(u64, @intCast(c.second)) });
+}
+
 // Parse "YYYY-MM-DD [HH:mm[:ss]]" (also allows / and T separators) to epoch secs.
 fn parseDateTimeSecs(s: []const u8) ?i64 {
     var date_part: []const u8 = s;
@@ -186,6 +200,15 @@ fn parseDateTimeSecs(s: []const u8) ?i64 {
     var mm: i64 = 0;
     var ss: i64 = 0;
     if (time_part.len > 0) {
+        // Strip fractional seconds / timezone suffixes (e.g. ".000Z")
+        var tp_end = time_part.len;
+        for (time_part, 0..) |c, idx| {
+            if (!(c >= '0' and c <= '9') and c != ':') {
+                tp_end = idx;
+                break;
+            }
+        }
+        time_part = time_part[0..tp_end];
         var tit = std.mem.splitScalar(u8, time_part, ':');
         const hs = tit.next() orelse return null;
         const mis = tit.next() orelse return null;
@@ -482,6 +505,38 @@ fn expandOne(alloc: std.mem.Allocator, inner: []const u8, ctx: *MacroCtx) ?[]u8 
     if (std.mem.eql(u8, n, "lastMessage")) return alloc.dupe(u8, ctx.last_message) catch null;
     if (std.mem.eql(u8, n, "lastUserMessage")) return alloc.dupe(u8, ctx.last_user_message) catch null;
     if (std.mem.eql(u8, n, "lastCharMessage")) return alloc.dupe(u8, ctx.last_char_message) catch null;
+    if (std.mem.eql(u8, n, "lastMessageId")) {
+        if (ctx.last_message_id < 0) return alloc.dupe(u8, "") catch null;
+        return std.fmt.allocPrint(alloc, "{d}", .{ctx.last_message_id}) catch null;
+    }
+    if (std.mem.eql(u8, n, "firstIncludedMessageId")) {
+        if (ctx.first_included_id < 0) return alloc.dupe(u8, "") catch null;
+        return std.fmt.allocPrint(alloc, "{d}", .{ctx.first_included_id}) catch null;
+    }
+    if (std.mem.eql(u8, n, "firstDisplayedMessageId")) {
+        if (ctx.first_displayed_id < 0) return alloc.dupe(u8, "") catch null;
+        return std.fmt.allocPrint(alloc, "{d}", .{ctx.first_displayed_id}) catch null;
+    }
+    if (std.mem.eql(u8, n, "lastSwipeId")) {
+        if (ctx.last_swipe_count < 0) return alloc.dupe(u8, "") catch null;
+        return std.fmt.allocPrint(alloc, "{d}", .{ctx.last_swipe_count}) catch null;
+    }
+    if (std.mem.eql(u8, n, "currentSwipeId")) {
+        if (ctx.current_swipe_id < 0) return alloc.dupe(u8, "") catch null;
+        return std.fmt.allocPrint(alloc, "{d}", .{ctx.current_swipe_id}) catch null;
+    }
+    if (std.mem.eql(u8, n, "allChatRange")) {
+        if (ctx.chat_count == 0) return alloc.dupe(u8, "") catch null;
+        return std.fmt.allocPrint(alloc, "0-{d}", .{ctx.chat_count - 1}) catch null;
+    }
+    if (std.mem.eql(u8, n, "idleDuration") or std.mem.eql(u8, n, "idle_duration")) {
+        if (ctx.last_user_send_date.len == 0) return alloc.dupe(u8, "just now") catch null;
+        const then_secs = parseDateTimeSecs(ctx.last_user_send_date) orelse return alloc.dupe(u8, "just now") catch null;
+        const now_secs: i64 = @divFloor(std.time.milliTimestamp(), 1000);
+        return humanizeSecs(alloc, now_secs - then_secs) catch null;
+    }
+    if (std.mem.eql(u8, n, "lastGenerationType")) return alloc.dupe(u8, ctx.gen_type) catch null;
+    if (std.mem.eql(u8, n, "hasExtension")) return alloc.dupe(u8, "false") catch null; // console port never enables extensions
     if (std.mem.eql(u8, n, "time")) {
         if (ctx.time_str.len > 0) return alloc.dupe(u8, ctx.time_str) catch null;
         return nowTime(alloc);
@@ -1461,4 +1516,33 @@ test "model/original/greeting/card fields" {
     var ctx = MacroCtx{ .model = "openai/gpt-4o-mini", .original = "raw text", .char_first_message = "Hello!", .alt_greetings = &.{ "Alt one", "Alt two" }, .char_version = "1.2", .char_creator_notes = "made by x", .char_depth_prompt = "dep", .persona = "per", .vars = vars };
     const out = try expandMacros(alloc, "{{model}}|{{original}}|{{greeting}}|{{greeting::1}}|{{greeting::2}}|{{charVersion}}|{{charCreatorNotes}}|{{charDepthPrompt}}|{{persona}}|{{isMobile}}", &ctx);
     try std.testing.expectEqualStrings("openai/gpt-4o-mini|raw text|Hello!|Alt one|Alt two|1.2|made by x|dep|per|false", out);
+}
+
+test "chat-state macros" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const vars = std.StringHashMap([]const u8).init(alloc);
+    var ctx = MacroCtx{ .last_message_id = 4, .first_included_id = 0, .first_displayed_id = 0, .last_swipe_count = 3, .current_swipe_id = 2, .chat_count = 5, .last_user_send_date = "", .gen_type = "normal", .vars = vars };
+    const out = try expandMacros(alloc, "{{lastMessageId}}|{{firstIncludedMessageId}}|{{firstDisplayedMessageId}}|{{lastSwipeId}}|{{currentSwipeId}}|{{allChatRange}}|{{idleDuration}}|{{lastGenerationType}}|{{hasExtension::foo}}", &ctx);
+    // Empty chat: ids are empty strings
+    var ctx_empty = MacroCtx{ .vars = vars };
+    const out_empty = try expandMacros(alloc, "{{lastMessageId}}|{{allChatRange}}|{{idleDuration}}", &ctx_empty);
+    try std.testing.expectEqualStrings("4|0|0|3|2|0-4|just now|normal|false", out);
+    try std.testing.expectEqualStrings("||just now", out_empty);
+    // Old send_date: idleDuration humanizes to years
+    ctx.last_user_send_date = "2020-01-01T00:00:00.000Z";
+    const out_old = try expandMacros(alloc, "{{idleDuration}}", &ctx);
+    try std.testing.expect(std.mem.indexOf(u8, out_old, "years") != null);
+}
+
+test "iso now round-trip" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const iso = try formatIsoNow(alloc);
+    try std.testing.expect(iso.len == 24);
+    const secs = parseDateTimeSecs(iso) orelse return error.TestUnexpectedResult;
+    const now: i64 = @divFloor(std.time.milliTimestamp(), 1000);
+    try std.testing.expect(@abs(now - secs) < 5);
 }
