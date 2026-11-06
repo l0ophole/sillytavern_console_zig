@@ -402,6 +402,8 @@ python3 /rpf/tmp/opencode/mock_sse_anth.py > /rpf/tmp/opencode/sse2.log 2>&1 & e
 sleep 1
 ./zig-out/bin/st-client --port $PORT backend.stream '{"provider":"anthropic","model":"claude-3","api_key":"k","base_url":"http://127.0.0.1:18156","path":"/v1/messages","messages":[{"role":"user","content":"hi"}]}' | grep -q 'Anthropic stream' && echo PASS
 kill $(cat /rpf/tmp/opencode/sse2.pid) 2>/dev/null || true
+echo "== frontend HTTP flow verify =="
+./zig-out/bin/st-client --port $PORT frontend.http_verify | grep -q '"ok":3' && echo PASS
 echo "== bad method =="
 ./zig-out/bin/st-client --port $PORT nope | grep -q '"ok":false' && echo PASS
 cat "$TMP/server.log"

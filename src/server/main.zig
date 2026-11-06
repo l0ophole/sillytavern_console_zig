@@ -2987,6 +2987,68 @@ fn handleClient(conn: posix.fd_t) void {
         const inner = std.fmt.allocPrint(alloc, "{{\"script\":\"{s}\",\"syntax_ok\":{s},\"exit_code\":{d},\"stderr\":{s}}}", .{ script, if (result.term.Exited == 0) "true" else "false", result.term.Exited, eq }) catch return;
         defer alloc.free(inner);
         resp = protocol.encodeOk(alloc, inner) catch return;
+    } else if (std.mem.eql(u8, req.method, "frontend.http_verify")) {
+        // Simulate browser frontend HTTP flow against own API bridge:
+        // POST /api/settings/load, /api/characters/create, /api/chats/save via loopback HTTP.
+        const steps = [_]struct { path: []const u8, body: []const u8 }{
+            .{ .path = "/api/settings/load", .body = "{}" },
+            .{ .path = "/api/characters/create", .body = "{\"name\":\"FlowCheck\",\"character\":{\"name\":\"FlowCheck\"}}" },
+            .{ .path = "/api/characters/list", .body = "{}" },
+        };
+        var ok_count: usize = 0;
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        defer out.deinit(alloc);
+        out.append(alloc, '{') catch return;
+        for (steps, 0..) |st, idx| {
+            // Build HTTP request
+            const req_str = std.fmt.allocPrint(alloc, "POST {s} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ st.path, st.body.len, st.body }) catch return;
+            defer alloc.free(req_str);
+            const addr_str = std.fmt.allocPrint(alloc, "127.0.0.1:{d}", .{port}) catch return;
+            defer alloc.free(addr_str);
+            const addr = std.net.Address.parseIpAndPort(addr_str) catch {
+                resp = protocol.encodeErr(alloc, "http_failed") catch return;
+                defer alloc.free(resp);
+                _ = posix.write(conn, resp) catch {};
+                return;
+            };
+            const sock = posix.socket(addr.any.family, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP) catch {
+                resp = protocol.encodeErr(alloc, "http_failed") catch return;
+                defer alloc.free(resp);
+                _ = posix.write(conn, resp) catch {};
+                return;
+            };
+            posix.connect(sock, &addr.any, addr.getOsSockLen()) catch {
+                posix.close(sock);
+                resp = protocol.encodeErr(alloc, "http_failed") catch return;
+                defer alloc.free(resp);
+                _ = posix.write(conn, resp) catch {};
+                return;
+            };
+            _ = posix.write(sock, req_str) catch {};
+            var rbuf: [65536]u8 = undefined;
+            var rn: usize = 0;
+            // Read until server closes (Connection: close) or buffer full
+            while (rn < rbuf.len) {
+                const part = posix.read(sock, rbuf[rn..]) catch break;
+                if (part == 0) break;
+                rn += part;
+            }
+            posix.close(sock);
+            const ok = rn > 0 and std.mem.indexOf(u8, rbuf[0..rn], "\"ok\":true") != null;
+            if (ok) ok_count += 1;
+            if (idx > 0) out.append(alloc, ',') catch return;
+            const pq = protocol.jsonQuote(alloc, st.path) catch return;
+            defer alloc.free(pq);
+            out.appendSlice(alloc, pq) catch return;
+            out.append(alloc, ':') catch return;
+            out.appendSlice(alloc, if (ok) "true" else "false") catch return;
+        }
+        const cs = std.fmt.allocPrint(alloc, ",\"ok\":{d},\"total\":{d}}}", .{ ok_count, steps.len }) catch return;
+        defer alloc.free(cs);
+        out.appendSlice(alloc, cs) catch return;
+        const s = out.toOwnedSlice(alloc) catch return;
+        defer alloc.free(s);
+        resp = protocol.encodeOk(alloc, s) catch return;
     } else if (std.mem.eql(u8, req.method, "ping")) {
         resp = protocol.encodeOk(alloc, "{\"pong\":true,\"version\":\"" ++ protocol.VERSION ++ "\"}") catch return;
     } else if (std.mem.eql(u8, req.method, "version")) {
