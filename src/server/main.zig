@@ -1532,6 +1532,62 @@ fn handleClient(conn: posix.fd_t) void {
         const inner = std.fmt.allocPrint(alloc, "{{\"saved\":{s},\"status\":{d}}}", .{ q, split.status }) catch return;
         defer alloc.free(inner);
         resp = protocol.encodeOk(alloc, inner) catch return;
+    } else if (std.mem.eql(u8, req.method, "caption.image")) {
+        // Full caption flow (mirrors SillyTavern anthropic.js /caption-image):
+        // image=data URI base64 + prompt -> anthropic messages with image -> text
+        const image = getStr(req, "image") orelse {
+            resp = protocol.encodeErr(alloc, "bad_request") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        const prompt = getStr(req, "prompt") orelse "Describe this image.";
+        // Split data URI: data:<mime>;base64,<data>
+        var mime: []const u8 = "image/png";
+        var b64data: []const u8 = image;
+        if (std.mem.indexOf(u8, image, ";base64,")) |sep| {
+            const header = image[0..sep];
+            if (std.mem.indexOfScalar(u8, header, ':')) |colon| {
+                mime = header[colon + 1 ..];
+            }
+            b64data = image[sep + 8 ..];
+        }
+        const model_name = getStr(req, "model") orelse "claude-3";
+        var body_builder: std.ArrayListUnmanaged(u8) = .empty;
+        defer body_builder.deinit(alloc);
+        body_builder.appendSlice(alloc, "{\"model\":\"") catch return;
+        body_builder.appendSlice(alloc, model_name) catch return;
+        body_builder.appendSlice(alloc, "\",\"max_tokens\":1024,\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":\"") catch return;
+        body_builder.appendSlice(alloc, mime) catch return;
+        body_builder.appendSlice(alloc, "\",\"data\":\"") catch return;
+        body_builder.appendSlice(alloc, b64data) catch return;
+        body_builder.appendSlice(alloc, "\"}},{\"type\":\"text\",\"text\":\"") catch return;
+        body_builder.appendSlice(alloc, prompt) catch return;
+        body_builder.appendSlice(alloc, "\"}]}]}") catch return;
+        const body = body_builder.toOwnedSlice(alloc) catch return;
+        defer alloc.free(body);
+        const ak = getStr(req, "api_key") orelse "";
+        var headers_buf: [4]std.http.Header = undefined;
+        headers_buf[0] = .{ .name = "Content-Type", .value = "application/json" };
+        headers_buf[1] = .{ .name = "x-api-key", .value = ak };
+        headers_buf[2] = .{ .name = "anthropic-version", .value = "2023-06-01" };
+        const base = getStr(req, "base_url") orelse "https://api.anthropic.com/v1";
+        const url = std.fmt.allocPrint(alloc, "{s}/messages", .{base}) catch return;
+        defer alloc.free(url);
+        const fetched = backend.fetchUrlHeaders(alloc, url, "POST", body, headers_buf[0..3]) catch {
+            resp = protocol.encodeErr(alloc, "backend_unreachable") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        defer alloc.free(fetched.body);
+        const text = providers_mod.parseNativeResponse(alloc, "anthropic", fetched.body) catch return;
+        defer alloc.free(text);
+        const tq = protocol.jsonQuote(alloc, text) catch return;
+        defer alloc.free(tq);
+        const inner = std.fmt.allocPrint(alloc, "{{\"caption\":{s},\"status\":{d}}}", .{ tq, fetched.status }) catch return;
+        defer alloc.free(inner);
+        resp = protocol.encodeOk(alloc, inner) catch return;
     } else if (std.mem.startsWith(u8, req.method, "speech.") or std.mem.startsWith(u8, req.method, "caption.") or std.mem.startsWith(u8, req.method, "classify.") or std.mem.startsWith(u8, req.method, "translate.") or std.mem.startsWith(u8, req.method, "stable-diffusion.") or std.mem.startsWith(u8, req.method, "openai.") or std.mem.startsWith(u8, req.method, "anthropic.") or std.mem.startsWith(u8, req.method, "google.") or std.mem.startsWith(u8, req.method, "azure.") or std.mem.startsWith(u8, req.method, "openrouter.") or std.mem.startsWith(u8, req.method, "novelai.") or std.mem.startsWith(u8, req.method, "horde.") or std.mem.startsWith(u8, req.method, "minimax.") or std.mem.startsWith(u8, req.method, "volcengine.") or std.mem.startsWith(u8, req.method, "nanogpt.") or std.mem.startsWith(u8, req.method, "backends.")) {
         // Generic HTTP proxy to third-party APIs (speech TTS/STT, caption, classify,
         // translate, SD image gen, LLM providers, horde, backends/*).
