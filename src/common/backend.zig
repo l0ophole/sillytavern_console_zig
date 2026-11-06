@@ -42,6 +42,28 @@ pub fn forwardHttp(alloc: std.mem.Allocator, host: []const u8, port: u16, path: 
     return out.toOwnedSlice(alloc);
 }
 
+pub const FetchResult = struct { status: u16, body: []u8 };
+
+/// Fetch via std.http.Client (supports http and https/TLS).
+pub fn fetchUrl(alloc: std.mem.Allocator, url: []const u8, method: []const u8, payload: ?[]const u8) !FetchResult {
+    var client: std.http.Client = .{ .allocator = alloc };
+    defer client.deinit();
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    var m: std.http.Method = .GET;
+    if (std.mem.eql(u8, method, "POST")) m = .POST;
+    if (std.mem.eql(u8, method, "PUT")) m = .PUT;
+    if (std.mem.eql(u8, method, "DELETE")) m = .DELETE;
+    const res = try client.fetch(.{
+        .location = .{ .url = url },
+        .method = m,
+        .payload = payload,
+        .response_writer = &out.writer,
+        .keep_alive = false,
+    });
+    return .{ .status = @intFromEnum(res.status), .body = try alloc.dupe(u8, out.written()) };
+}
+
 test "buildHttpRequest" {
     const alloc = std.testing.allocator;
     const r = try buildHttpRequest(alloc, "example.com", "/v1/chat", "{}");

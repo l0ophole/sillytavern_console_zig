@@ -617,6 +617,25 @@ fn handleClient(conn: posix.fd_t) void {
             body_str = alloc.dupe(u8, "{}") catch return;
         }
         defer alloc.free(body_str);
+        if (getStr(req, "url")) |u| {
+            // HTTPS-capable path via std.http.Client
+            const fetched = backend.fetchUrl(alloc, u, "POST", body_str) catch {
+                resp = protocol.encodeErr(alloc, "backend_unreachable") catch return;
+                defer alloc.free(resp);
+                _ = posix.write(conn, resp) catch {};
+                return;
+            };
+            defer alloc.free(fetched.body);
+            const q2 = protocol.jsonQuote(alloc, fetched.body) catch return;
+            defer alloc.free(q2);
+            const inner2 = std.fmt.allocPrint(alloc, "{{\"status\":{d},\"body\":{s}}}", .{ fetched.status, q2 }) catch return;
+            defer alloc.free(inner2);
+            resp = protocol.encodeOk(alloc, inner2) catch return;
+            // fall through to common write below (resp already set; skip forwardHttp by returning via goto-like)
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        }
         const raw = backend.forwardHttp(alloc, bhost, bport, bpath, body_str) catch |ferr| {
             const emsg = std.fmt.allocPrint(alloc, "backend {s}:{d}{s} err={}\n", .{ bhost, bport, bpath, ferr }) catch "";
             std.fs.File.stderr().writeAll(emsg) catch {};
@@ -1468,6 +1487,32 @@ fn handleClient(conn: posix.fd_t) void {
             return;
         };
         resp = protocol.encodeOk(alloc, "{\"saved\":true}") catch return;
+    } else if (std.mem.eql(u8, req.method, "backend.fetch")) {
+        const url = getStr(req, "url") orelse {
+            resp = protocol.encodeErr(alloc, "bad_request") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        const fmethod = getStr(req, "method") orelse "GET";
+        var payload: ?[]const u8 = null;
+        if (getObjValue(req, "body")) |bv| {
+            payload = store.stringifyValue(alloc, bv) catch return;
+        } else if (getStr(req, "text")) |tx| {
+            payload = tx;
+        }
+        const fetched = backend.fetchUrl(alloc, url, fmethod, payload) catch {
+            resp = protocol.encodeErr(alloc, "backend_unreachable") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        defer alloc.free(fetched.body);
+        const q = protocol.jsonQuote(alloc, fetched.body) catch return;
+        defer alloc.free(q);
+        const inner = std.fmt.allocPrint(alloc, "{{\"status\":{d},\"body\":{s}}}", .{ fetched.status, q }) catch return;
+        defer alloc.free(inner);
+        resp = protocol.encodeOk(alloc, inner) catch return;
     } else if (std.mem.eql(u8, req.method, "ping")) {
         resp = protocol.encodeOk(alloc, "{\"pong\":true,\"version\":\"" ++ protocol.VERSION ++ "\"}") catch return;
     } else if (std.mem.eql(u8, req.method, "version")) {
