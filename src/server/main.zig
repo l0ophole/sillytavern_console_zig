@@ -194,6 +194,50 @@ fn handleHttp(conn: posix.fd_t, first_line: []const u8) void {
         }
     }
     const clean_path = std.mem.trim(u8, path, " ");
+    if (std.mem.startsWith(u8, clean_path, "/api/")) {
+        const method = clean_path[5..];
+        if (method.len == 0 or std.mem.indexOf(u8, method, "/") != null or std.mem.indexOf(u8, method, ".") != null and false) {}
+        // Read Content-Length from drained headers, then body
+        var content_len: usize = 0;
+        if (std.mem.indexOf(u8, header_buf[0..drain_pos], "Content-Length:")) |cl| {
+            const rest = header_buf[cl + 15 .. drain_pos];
+            const num_end = std.mem.indexOfAny(u8, rest, "\r\n") orelse rest.len;
+            content_len = std.fmt.parseInt(usize, std.mem.trim(u8, rest[0..num_end], " "), 10) catch 0;
+        }
+        var body: std.ArrayListUnmanaged(u8) = .empty;
+        defer body.deinit(alloc);
+        var remaining = content_len;
+        while (remaining > 0) {
+            var chunk: [4096]u8 = undefined;
+            const want = @min(remaining, chunk.len);
+            const r = posix.read(conn, chunk[0..want]) catch break;
+            if (r == 0) break;
+            body.appendSlice(alloc, chunk[0..r]) catch break;
+            remaining -= r;
+        }
+        const params_json = if (body.items.len == 0) "{}" else body.items;
+        // Bridge to TCP dispatch via loopback self-connection
+        const line = std.fmt.allocPrint(alloc, "{{\"method\":\"{s}\",\"params\":{s}}}\n", .{ method, params_json }) catch return;
+        defer alloc.free(line);
+        const addr_str = std.fmt.allocPrint(alloc, "127.0.0.1:{d}", .{port}) catch return;
+        defer alloc.free(addr_str);
+        const addr = std.net.Address.parseIpAndPort(addr_str) catch return;
+        const sock = posix.socket(addr.any.family, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP) catch return;
+        defer posix.close(sock);
+        posix.connect(sock, &addr.any, addr.getOsSockLen()) catch {
+            _ = posix.write(conn, "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n") catch {};
+            return;
+        };
+        _ = posix.write(sock, line) catch return;
+        var rbuf: [65536]u8 = undefined;
+        const rn = posix.read(sock, &rbuf) catch 0;
+        const resp_body = rbuf[0..rn];
+        const hdr = std.fmt.allocPrint(alloc, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{resp_body.len}) catch return;
+        defer alloc.free(hdr);
+        _ = posix.write(conn, hdr) catch {};
+        _ = posix.write(conn, resp_body) catch {};
+        return;
+    }
     if (std.mem.eql(u8, clean_path, "/api/health") or std.mem.eql(u8, clean_path, "/api/ping")) {
         const body = "{\"ok\":true,\"result\":{\"pong\":true}}";
         const hdr = std.fmt.allocPrint(alloc, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{body.len}) catch return;
@@ -2703,6 +2747,10 @@ pub fn main() !void {
         var cli_addr: posix.sockaddr = undefined;
         var cli_len: posix.socklen_t = @sizeOf(posix.sockaddr);
         const conn = posix.accept(sock, &cli_addr, &cli_len, posix.SOCK.CLOEXEC) catch continue;
-        handleClient(conn);
+        const th = std.Thread.spawn(.{}, handleClient, .{conn}) catch {
+            handleClient(conn);
+            continue;
+        };
+        th.detach();
     }
 }

@@ -331,6 +331,8 @@ curl -s http://127.0.0.1:$PORT/api/health | grep -q '"pong":true' && echo PASS
 ST_WEB_ROOT=../SillyTavern/public curl -s http://127.0.0.1:$PORT/ > /rpf/tmp/opencode/webui.html 2>/dev/null || true
 # web root is relative to server cwd (repo root in tests), default ../SillyTavern/public works when run from repo parent? server cwd is repo, so check index served:
 grep -q 'SillyTavern' /rpf/tmp/opencode/webui.html && echo PASS_WEBUI || echo SKIP_WEBUI_PATH
+echo "== web API bridge =="
+curl -s -m 5 -X POST -H 'Content-Type: application/json' -d '{}' http://127.0.0.1:$PORT/api/settings.get | grep -q '"ok":true' && echo PASS
 echo "== bad method =="
 ./zig-out/bin/st-client --port $PORT nope | grep -q '"ok":false' && echo PASS
 cat "$TMP/server.log"
