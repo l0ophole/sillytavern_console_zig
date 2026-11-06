@@ -309,6 +309,39 @@ fn expandOne(alloc: std.mem.Allocator, inner: []const u8, ctx: *MacroCtx) ?[]u8 
         if (ctx.vars.get(prefixed)) |v| return alloc.dupe(u8, v) catch null;
         return alloc.dupe(u8, "") catch null;
     }
+    if (std.mem.eql(u8, n, "banned") or std.mem.eql(u8, n, "comment")) return alloc.dupe(u8, "") catch null;
+    if (std.mem.eql(u8, n, "setglobalvar")) {
+        const k = arg(args, 0);
+        const v = arg(args, 1);
+        if (k.len > 0) {
+            var buf: [128]u8 = undefined;
+            const prefixed = std.fmt.bufPrint(&buf, "${s}", .{k}) catch return alloc.dupe(u8, "") catch null;
+            if (ctx.vars.getPtr(prefixed)) |old| alloc.free(old.*);
+            const key_copy = if (ctx.vars.contains(prefixed)) prefixed else alloc.dupe(u8, prefixed) catch return null;
+            _ = ctx.vars.put(key_copy, alloc.dupe(u8, v) catch return null) catch {};
+        }
+        return alloc.dupe(u8, "") catch null;
+    }
+    if (std.mem.eql(u8, n, "getglobalvar")) {
+        const k = arg(args, 0);
+        var buf: [128]u8 = undefined;
+        const prefixed = std.fmt.bufPrint(&buf, "${s}", .{k}) catch return alloc.dupe(u8, "") catch null;
+        if (ctx.vars.get(prefixed)) |v| return alloc.dupe(u8, v) catch null;
+        return alloc.dupe(u8, "") catch null;
+    }
+    if (std.mem.eql(u8, n, "hasglobalvar")) {
+        const k = arg(args, 0);
+        var buf: [128]u8 = undefined;
+        const prefixed = std.fmt.bufPrint(&buf, "${s}", .{k}) catch return alloc.dupe(u8, "") catch null;
+        return alloc.dupe(u8, if (ctx.vars.contains(prefixed)) "true" else "false") catch null;
+    }
+    if (std.mem.eql(u8, n, "deleteglobalvar")) {
+        const k = arg(args, 0);
+        var buf: [128]u8 = undefined;
+        const prefixed = std.fmt.bufPrint(&buf, "${s}", .{k}) catch return alloc.dupe(u8, "") catch null;
+        _ = ctx.vars.remove(prefixed);
+        return alloc.dupe(u8, "") catch null;
+    }
     return null; // unknown macro: leave original text untouched
 }
 
@@ -997,4 +1030,14 @@ test "pick determinism stable across calls" {
     const b = try expandMacros(alloc, "{{pick::blonde::brown::red}}", &ctx);
     try std.testing.expectEqualStrings(a, b);
     try std.testing.expect(a.len > 0);
+}
+
+test "global vars" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const vars = std.StringHashMap([]const u8).init(alloc);
+    var ctx = MacroCtx{ .vars = vars };
+    const out = try expandMacros(alloc, "{{setglobalvar::flag::on}}{{getglobalvar::flag}} {{hasglobalvar::flag}} {{banned secret}}x", &ctx);
+    try std.testing.expectEqualStrings("on true x", out);
 }
