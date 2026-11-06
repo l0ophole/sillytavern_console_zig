@@ -10,6 +10,7 @@ const vectors_mod = @import("vectors");
 const zipm = @import("zipm");
 const providers_mod = @import("providers");
 const model_mod = @import("model");
+const onnx_mod = @import("onnx");
 const posix = std.posix;
 
 var data_root: []const u8 = "data";
@@ -1239,6 +1240,54 @@ fn handleClient(conn: posix.fd_t) void {
         const arr = out.toOwnedSlice(alloc) catch return;
         defer alloc.free(arr);
         const inner = std.fmt.allocPrint(alloc, "{{\"vector\":{s},\"neural\":true}}", .{arr}) catch return;
+        defer alloc.free(inner);
+        resp = protocol.encodeOk(alloc, inner) catch return;
+    } else if (std.mem.eql(u8, req.method, "vectors.onnx")) {
+        const text = getStr(req, "text") orelse {
+            resp = protocol.encodeErr(alloc, "bad_request") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        const onnx_path = getStr(req, "model") orelse {
+            resp = protocol.encodeErr(alloc, "bad_request") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        var om = onnx_mod.loadOnnx(alloc, onnx_path) catch {
+            resp = protocol.encodeErr(alloc, "model_not_found") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        defer om.deinit();
+        // Input dim from model: embed text to 32 (or detect via input tensor? use 32 fixed, error if mismatch)
+        const inp = vectors_mod.localEmbed(alloc, text, 32) catch return;
+        defer alloc.free(inp);
+        var inp_f32 = alloc.alloc(f32, inp.len) catch return;
+        defer alloc.free(inp_f32);
+        for (inp, 0..) |v, i| inp_f32[i] = @floatCast(v);
+        const outv = om.run(alloc, inp_f32) catch {
+            resp = protocol.encodeErr(alloc, "model_failed") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        defer alloc.free(outv);
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        defer out.deinit(alloc);
+        out.append(alloc, '[') catch return;
+        for (outv, 0..) |v, idx| {
+            if (idx > 0) out.append(alloc, ',') catch return;
+            const vs = std.fmt.allocPrint(alloc, "{d}", .{v}) catch return;
+            defer alloc.free(vs);
+            out.appendSlice(alloc, vs) catch return;
+        }
+        out.append(alloc, ']') catch return;
+        const arr = out.toOwnedSlice(alloc) catch return;
+        defer alloc.free(arr);
+        const inner = std.fmt.allocPrint(alloc, "{{\"vector\":{s},\"onnx\":true}}", .{arr}) catch return;
         defer alloc.free(inner);
         resp = protocol.encodeOk(alloc, inner) catch return;
     } else if (std.mem.startsWith(u8, req.method, "vectors.")) {

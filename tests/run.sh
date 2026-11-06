@@ -276,6 +276,38 @@ python3 /rpf/tmp/opencode/mock_stt.py > /rpf/tmp/opencode/stt.log 2>&1 & echo $!
 sleep 1
 ./zig-out/bin/st-client --port $PORT speech.transcribe '{"audio":"QUJD","base_url":"http://127.0.0.1:18137"}' | grep -q 'Hello spoken' && echo PASS
 kill $(cat /rpf/tmp/opencode/stt.pid) 2>/dev/null || true
+echo "== onnx neural =="
+python3 /rpf/tmp/opencode/make_onnx.py 2>/dev/null || cat > /rpf/tmp/opencode/make_onnx.py <<'PYEOF'
+import struct
+def varint(n):
+    out=b''
+    while True:
+        b=n & 0x7f; n>>=7
+        if n: out+=bytes([b|0x80])
+        else: out+=bytes([b]); break
+    return out
+def tag(f,w): return varint((f<<3)|w)
+def fv(f,v): return tag(f,0)+varint(v)
+def fl(f,d): return tag(f,2)+varint(len(d))+d
+def fs(f,s): return fl(f,s.encode())
+def pi64(f,vals): return fl(f,b''.join(varint(v) for v in vals))
+def pf32(f,vals): return fl(f,b''.join(struct.pack('<f',v) for v in vals))
+def tensor(n,dims,data): return pi64(1,dims)+fv(2,1)+pf32(4,data)+fs(8,n)
+def node():
+    n=fs(1,"X")+fs(1,"W")+fs(1,"B")+fs(2,"Y")+fs(4,"Gemm")
+    attr=fs(1,"transB")+fv(7,2)+fv(3,1)
+    return n+fl(5,attr)
+def vi(n,dims):
+    shape=b''
+    for d in dims: shape+=fl(1,fv(1,d))
+    tt=fv(1,1)+fl(2,shape)
+    return fs(1,n)+fl(2,fl(1,tt))
+W=[0.0]*64
+for i in range(2): W[i*32+i]=1.0
+graph=fl(1,node())+fs(2,"g")+fl(5,tensor("W",[2,32],W))+fl(5,tensor("B",[2],[0.0,0.0]))+fl(11,vi("X",[1,32]))+fl(12,vi("Y",[1,2]))
+open('/rpf/tmp/opencode/test.onnx','wb').write(fv(1,8)+fl(8,fv(1,13))+fl(7,graph))
+PYEOF
+./zig-out/bin/st-client --port $PORT vectors.onnx '{"text":"hello","model":"/rpf/tmp/opencode/test.onnx"}' | grep -q '"onnx":true' && echo PASS
 echo "== bad method =="
 ./zig-out/bin/st-client --port $PORT nope | grep -q '"ok":false' && echo PASS
 cat "$TMP/server.log"

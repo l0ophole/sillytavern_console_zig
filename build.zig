@@ -18,6 +18,7 @@ pub fn build(b: *std.Build) void {
     const zipm = b.addModule("zipm", .{ .root_source_file = b.path("src/common/zip.zig") });
     const providers = b.addModule("providers", .{ .root_source_file = b.path("src/common/providers.zig") });
     const model = b.addModule("model", .{ .root_source_file = b.path("src/common/model.zig") });
+    const onnx = b.addModule("onnx", .{ .root_source_file = b.path("src/common/onnx.zig") });
 
     const server_mod = b.createModule(.{ .root_source_file = b.path("src/server/main.zig"), .target = target, .optimize = optimize });
     server_mod.addImport("common", common);
@@ -31,6 +32,7 @@ pub fn build(b: *std.Build) void {
     server_mod.addImport("zipm", zipm);
     server_mod.addImport("providers", providers);
     server_mod.addImport("model", model);
+    server_mod.addImport("onnx", onnx);
     const server = b.addExecutable(.{ .name = "st-server", .root_module = server_mod });
     b.installArtifact(server);
 
@@ -74,6 +76,8 @@ pub fn build(b: *std.Build) void {
     const prov_tests = b.addTest(.{ .root_module = prov_test_mod });
     const model_test_mod = b.createModule(.{ .root_source_file = b.path("src/common/model.zig"), .target = target, .optimize = optimize });
     const model_tests = b.addTest(.{ .root_module = model_test_mod });
+    const onnx_test_mod = b.createModule(.{ .root_source_file = b.path("src/common/onnx.zig"), .target = target, .optimize = optimize });
+    const onnx_tests = b.addTest(.{ .root_module = onnx_test_mod });
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&b.addRunArtifact(unit_tests).step);
     test_step.dependOn(&b.addRunArtifact(store_tests).step);
@@ -86,4 +90,5 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(zip_tests).step);
     test_step.dependOn(&b.addRunArtifact(prov_tests).step);
     test_step.dependOn(&b.addRunArtifact(model_tests).step);
+    test_step.dependOn(&b.addRunArtifact(onnx_tests).step);
 }
