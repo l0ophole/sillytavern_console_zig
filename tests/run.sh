@@ -207,6 +207,9 @@ if [ -f ../SillyTavern/src/tokenizers/mistral.model ]; then
 else
   echo SKIP_NO_SP
 fi
+echo "== neural save integration =="
+python3 -c "import json; m={'input_dim':32,'hidden_dim':4,'output_dim':2,'W1':[0]*128,'b1':[0]*4,'W2':[1,0,0,0,0,1,0,0],'b2':[0,0]}; [exec(\"m['W1'].__setitem__(h*32+h,1)\") for h in range(4)]; json.dump(m, open('/rpf/tmp/opencode/model.json','w'))"
+./zig-out/bin/st-client --port $PORT vectors.save '{"collection":"nc","id":"n1","model":"/rpf/tmp/opencode/model.json","value":{"text":"hello"}}' | grep -q '"saved"' && echo PASS
 echo "== bad method =="
 ./zig-out/bin/st-client --port $PORT nope | grep -q '"ok":false' && echo PASS
 cat "$TMP/server.log"

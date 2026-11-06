@@ -20,7 +20,7 @@ Status legend: DONE = implemented in Zig + tested (`zig build test` / `tests/run
 | backends/chat-completions, openai, anthropic, google, azure, openrouter, novelai, horde, kobold, text-completions | `backend.chat`/`backend.fetch` + `backend.provider` + `backend.native` (native normalization for all 12: anthropic/google/openai/azure/openrouter/novelai/horde/kobold/minimax/volcengine/nanogpt) | DONE |
 | image-metadata | `image-metadata.get/detect` | DONE |
 | users-admin/users-private/users-public | `users.*` create/list/delete/login/validate/logout (Sha256 + session tokens, 24h) | DONE |
-| vectors | `vectors.save/list/query/delete/generate/embed/model` (local hash + neural MLP model file + API proxy, cosine) | DONE |
+| vectors | `vectors.save/list/query/delete/generate/embed/model` (hash + neural MLP integrated in save/query, API proxy, cosine) | DONE |
 | search | `search.query` (local) + `search.web` (DuckDuckGo/custom URL, HTTP+HTTPS) | DONE |
 | speech/caption/classify/translate/stable-diffusion/openai/anthropic/google/azure/openrouter/novelai/horde/minimax/volcengine/nanogpt/backends | `*.proxy` + `backend.fetch` + `stable-diffusion.generate_and_save` (saves PNG to images/) | DONE |
 | extensions | `extensions.save/list/get/delete/execute/execute_browser` (node + DOM/SillyTavern shim) | DONE |

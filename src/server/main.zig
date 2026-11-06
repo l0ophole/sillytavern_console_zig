@@ -1275,12 +1275,28 @@ fn handleClient(conn: posix.fd_t) void {
             var val: std.json.Value = req.params.?;
             if (getObjValue(req, "value")) |v| val = v;
             if (getObjValue(req, "data")) |v| val = v;
-            // Auto-generate local embedding if text given without vector
+            // Auto-generate embedding if text given without vector.
+            // If "model" param present, use neural MLP (vectors.model path); else local hash.
             if (val == .object and val.object.get("vector") == null) {
                 if (val.object.get("text")) |tv| {
                     if (tv == .string) {
-                        const gen = vectors_mod.localEmbed(alloc, tv.string, 32) catch return;
-                        defer alloc.free(gen);
+                        var gen: []f64 = undefined;
+                        const gen_owned = true;
+                        if (getStr(req, "model")) |mpath| {
+                            var mlp = model_mod.loadModel(alloc, mpath) catch {
+                                resp = protocol.encodeErr(alloc, "model_not_found") catch return;
+                                defer alloc.free(resp);
+                                _ = posix.write(conn, resp) catch {};
+                                return;
+                            };
+                            defer mlp.deinit();
+                            const inp = vectors_mod.localEmbed(alloc, tv.string, mlp.input_dim) catch return;
+                            defer alloc.free(inp);
+                            gen = mlp.forward(alloc, inp) catch return;
+                        } else {
+                            gen = vectors_mod.localEmbed(alloc, tv.string, 32) catch return;
+                        }
+                        defer if (gen_owned) alloc.free(gen);
                         var arr = std.json.Array.init(alloc);
                         for (gen) |f| arr.append(.{ .float = f }) catch return;
                         val.object.put("vector", .{ .array = arr }) catch return;
