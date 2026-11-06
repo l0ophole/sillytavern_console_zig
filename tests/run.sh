@@ -260,6 +260,22 @@ sleep 1
 ./zig-out/bin/st-client --port $PORT classify.classify '{"text":"I love this","base_url":"http://127.0.0.1:18133","path":"/classify"}' | grep -q 'positive' && echo PASS
 ./zig-out/bin/st-client --port $PORT translate.translate '{"text":"Hello","source":"en","target":"fr","base_url":"http://127.0.0.1:18133/translate"}' | grep -q 'Bonjour' && echo PASS
 kill $(cat /rpf/tmp/opencode/ct.pid) 2>/dev/null || true
+echo "== speech transcribe =="
+cat > /rpf/tmp/opencode/mock_stt.py <<'PYEOF'
+import json
+from http.server import BaseHTTPRequestHandler, HTTPServer
+class H(BaseHTTPRequestHandler):
+    def do_POST(self):
+        ln=int(self.headers.get('Content-Length',0)); self.rfile.read(ln)
+        data=json.dumps({"text":"Hello spoken world"}).encode()
+        self.send_response(200); self.send_header('Content-Type','application/json'); self.send_header('Content-Length',str(len(data))); self.end_headers(); self.wfile.write(data)
+    def log_message(self,*a): pass
+HTTPServer(('127.0.0.1',18137),H).handle_request()
+PYEOF
+python3 /rpf/tmp/opencode/mock_stt.py > /rpf/tmp/opencode/stt.log 2>&1 & echo $! > /rpf/tmp/opencode/stt.pid
+sleep 1
+./zig-out/bin/st-client --port $PORT speech.transcribe '{"audio":"QUJD","base_url":"http://127.0.0.1:18137"}' | grep -q 'Hello spoken' && echo PASS
+kill $(cat /rpf/tmp/opencode/stt.pid) 2>/dev/null || true
 echo "== bad method =="
 ./zig-out/bin/st-client --port $PORT nope | grep -q '"ok":false' && echo PASS
 cat "$TMP/server.log"
