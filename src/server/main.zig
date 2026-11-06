@@ -686,7 +686,8 @@ fn handleClient(conn: posix.fd_t) void {
         const fname = std.fmt.allocPrint(alloc, "{s}.jsonl", .{chat}) catch return;
         defer alloc.free(fname);
         const content = crud.loadFile(alloc, cdir, fname) catch {
-            resp = protocol.encodeErr(alloc, "not_found") catch return;
+            // JS /api/chats/get returns {} (empty object) when chat dir/file absent, not 404
+            resp = protocol.encodeOk(alloc, "{}") catch return;
             defer alloc.free(resp);
             _ = posix.write(conn, resp) catch {};
             return;
