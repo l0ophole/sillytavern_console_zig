@@ -332,7 +332,15 @@ fn handleHttp(conn: posix.fd_t, first_line: []const u8) void {
             if (std.mem.eql(u8, first_seg, "read")) mapped_first = "get";
             if (std.mem.eql(u8, first_seg, "folders")) mapped_first = "list";
             if (std.mem.eql(u8, first_seg, "icon")) mapped_first = "get";
-            if (std.mem.eql(u8, first_seg, "get")) mapped_first = "get";
+            if (std.mem.eql(u8, first_seg, "get")) {
+                if (std.mem.eql(u8, res_name, "chats")) {
+                    mapped_first = "load";
+                } else if (std.mem.eql(u8, res_name, "characters")) {
+                    mapped_first = "get";
+                } else {
+                    mapped_first = "get";
+                }
+            }
             if (std.mem.eql(u8, first_seg, "importURL") or std.mem.eql(u8, first_seg, "importUUID")) mapped_first = "import_url";
             if (first_seg_len < action.len) {
                 mapped_method = std.fmt.allocPrint(alloc, "{s}.{s}{s}", .{ res_name, mapped_first, action[first_seg_len..] }) catch return;
