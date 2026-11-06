@@ -4,6 +4,7 @@ const store = @import("store");
 const crud = @import("crud");
 const tokenizer = @import("tokenizer");
 const backend = @import("backend");
+const png = @import("png");
 const posix = std.posix;
 
 var data_root: []const u8 = "data";
@@ -712,6 +713,131 @@ fn handleClient(conn: posix.fd_t) void {
         const arr = crud.jsonArrayOfNames(alloc, names) catch return;
         defer alloc.free(arr);
         resp = protocol.encodeOk(alloc, arr) catch return;
+    } else if (std.mem.eql(u8, req.method, "characters.import_png") or std.mem.eql(u8, req.method, "characters.import")) {
+        const name = getStr(req, "name") orelse {
+            resp = protocol.encodeErr(alloc, "bad_request") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        if (!protocol.isSafeName(name)) {
+            resp = protocol.encodeErr(alloc, "bad_name") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        }
+        const content_b64 = getStr(req, "content") orelse {
+            resp = protocol.encodeErr(alloc, "bad_request") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        // content may be base64 PNG or plain JSON card
+        var card_json: []u8 = undefined;
+        if (std.mem.startsWith(u8, std.mem.trim(u8, content_b64, " \t\r\n"), "{")) {
+            card_json = alloc.dupe(u8, content_b64) catch return;
+        } else {
+            const dec = std.base64.standard.Decoder;
+            const sz = dec.calcSizeForSlice(content_b64) catch {
+                resp = protocol.encodeErr(alloc, "bad_base64") catch return;
+                defer alloc.free(resp);
+                _ = posix.write(conn, resp) catch {};
+                return;
+            };
+            const raw = alloc.alloc(u8, sz) catch return;
+            defer alloc.free(raw);
+            dec.decode(raw, content_b64) catch {
+                resp = protocol.encodeErr(alloc, "bad_base64") catch return;
+                defer alloc.free(resp);
+                _ = posix.write(conn, resp) catch {};
+                return;
+            };
+            if (png.isPng(raw)) {
+                const txt = png.extractTextChunk(alloc, raw, "chara") catch {
+                    resp = protocol.encodeErr(alloc, "no_chara") catch return;
+                    defer alloc.free(resp);
+                    _ = posix.write(conn, resp) catch {};
+                    return;
+                };
+                if (txt == null) {
+                    resp = protocol.encodeErr(alloc, "no_chara") catch return;
+                    defer alloc.free(resp);
+                    _ = posix.write(conn, resp) catch {};
+                    return;
+                }
+                defer alloc.free(txt.?);
+                card_json = png.decodeChara(alloc, txt.?) catch {
+                    resp = protocol.encodeErr(alloc, "bad_card") catch return;
+                    defer alloc.free(resp);
+                    _ = posix.write(conn, resp) catch {};
+                    return;
+                };
+            } else {
+                card_json = alloc.dupe(u8, raw) catch return;
+            }
+        }
+        defer alloc.free(card_json);
+        const cdir = std.fs.path.join(alloc, &.{ udir, "characters" }) catch return;
+        defer alloc.free(cdir);
+        const fname = std.fmt.allocPrint(alloc, "{s}.json", .{name}) catch return;
+        defer alloc.free(fname);
+        const cpath = std.fs.path.join(alloc, &.{ cdir, fname }) catch return;
+        defer alloc.free(cpath);
+        store.writeAtomic(cpath, card_json) catch {
+            resp = protocol.encodeErr(alloc, "io_error") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        resp = protocol.encodeOk(alloc, "{\"saved\":true}") catch return;
+    } else if (std.mem.eql(u8, req.method, "image-metadata.get") or std.mem.eql(u8, req.method, "image-metadata.detect")) {
+        var raw: []u8 = undefined;
+        if (getStr(req, "content")) |cb64| {
+            const dec = std.base64.standard.Decoder;
+            const sz = dec.calcSizeForSlice(cb64) catch {
+                resp = protocol.encodeErr(alloc, "bad_base64") catch return;
+                defer alloc.free(resp);
+                _ = posix.write(conn, resp) catch {};
+                return;
+            };
+            raw = alloc.alloc(u8, sz) catch return;
+            dec.decode(raw, cb64) catch {
+                resp = protocol.encodeErr(alloc, "bad_base64") catch return;
+                defer alloc.free(resp);
+                _ = posix.write(conn, resp) catch {};
+                return;
+            };
+        } else if (getStr(req, "name")) |fname| {
+            if (!protocol.isSafeName(fname)) {
+                resp = protocol.encodeErr(alloc, "bad_name") catch return;
+                defer alloc.free(resp);
+                _ = posix.write(conn, resp) catch {};
+                return;
+            }
+            const idir = std.fs.path.join(alloc, &.{ udir, "images" }) catch return;
+            defer alloc.free(idir);
+            raw = crud.loadFile(alloc, idir, fname) catch {
+                resp = protocol.encodeErr(alloc, "not_found") catch return;
+                defer alloc.free(resp);
+                _ = posix.write(conn, resp) catch {};
+                return;
+            };
+        } else {
+            resp = protocol.encodeErr(alloc, "bad_request") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        }
+        const fmt = png.detectFormat(raw);
+        var w: u32 = 0;
+        var h: u32 = 0;
+        if (png.pngSize(raw)) |sz| {
+            w = sz[0];
+            h = sz[1];
+        }
+        const inner = std.fmt.allocPrint(alloc, "{{\"format\":\"{s}\",\"width\":{d},\"height\":{d},\"bytes\":{d}}}", .{ fmt, w, h, raw.len }) catch return;
+        defer alloc.free(inner);
+        resp = protocol.encodeOk(alloc, inner) catch return;
     } else if (std.mem.eql(u8, req.method, "ping")) {
         resp = protocol.encodeOk(alloc, "{\"pong\":true,\"version\":\"" ++ protocol.VERSION ++ "\"}") catch return;
     } else if (std.mem.eql(u8, req.method, "version")) {
