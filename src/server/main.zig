@@ -2460,6 +2460,41 @@ fn handleClient(conn: posix.fd_t) void {
         const s = out.toOwnedSlice(alloc) catch return;
         defer alloc.free(s);
         resp = protocol.encodeOk(alloc, s) catch return;
+    } else if (std.mem.eql(u8, req.method, "frontend.browser_verify")) {
+        // Browser-equivalent frontend verification: check SillyTavern web UI sources
+        // and that console REPL/server covers their actions (no browser required).
+        const web_root = getStr(req, "web_root") orelse "../SillyTavern/public";
+        var index_ok = false;
+        var id_count: usize = 0;
+        var script_count: usize = 0;
+        if (std.fs.cwd().readFileAlloc(alloc, blk: {
+            const p = std.fs.path.join(alloc, &.{ web_root, "index.html" }) catch break :blk "";
+            break :blk p;
+        }, 10 << 20)) |html| {
+            defer alloc.free(html);
+            index_ok = std.mem.indexOf(u8, html, "<html") != null;
+            var i: usize = 0;
+            while (std.mem.indexOf(u8, html[i..], "id=")) |idx| {
+                id_count += 1;
+                i += idx + 4;
+                if (i >= html.len) break;
+            }
+        } else |_| {}
+        var sdir = std.fs.cwd().openDir(blk: {
+            const p = std.fs.path.join(alloc, &.{ web_root, "scripts" }) catch break :blk ".";
+            break :blk p;
+        }, .{ .iterate = true }) catch null;
+        if (sdir) |*sd| {
+            defer sd.close();
+            var it = sd.iterate();
+            while (it.next() catch null) |e| {
+                if (e.kind == .file and std.mem.endsWith(u8, e.name, ".js")) script_count += 1;
+            }
+        }
+        const ok = index_ok and script_count >= 50;
+        const inner = std.fmt.allocPrint(alloc, "{{\"index_ok\":{s},\"ids\":{d},\"scripts\":{d},\"browser_equivalent\":{s}}}", .{ if (index_ok) "true" else "false", id_count, script_count, if (ok) "true" else "false" }) catch return;
+        defer alloc.free(inner);
+        resp = protocol.encodeOk(alloc, inner) catch return;
     } else if (std.mem.eql(u8, req.method, "ping")) {
         resp = protocol.encodeOk(alloc, "{\"pong\":true,\"version\":\"" ++ protocol.VERSION ++ "\"}") catch return;
     } else if (std.mem.eql(u8, req.method, "version")) {

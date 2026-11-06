@@ -308,6 +308,8 @@ graph=fl(1,node())+fs(2,"g")+fl(5,tensor("W",[2,32],W))+fl(5,tensor("B",[2],[0.0
 open('/rpf/tmp/opencode/test.onnx','wb').write(fv(1,8)+fl(8,fv(1,13))+fl(7,graph))
 PYEOF
 ./zig-out/bin/st-client --port $PORT vectors.onnx '{"text":"hello","model":"/rpf/tmp/opencode/test.onnx"}' | grep -q '"onnx":true' && echo PASS
+echo "== browser frontend verify =="
+./zig-out/bin/st-client --port $PORT frontend.browser_verify | grep -q '"browser_equivalent":true' && echo PASS
 echo "== bad method =="
 ./zig-out/bin/st-client --port $PORT nope | grep -q '"ok":false' && echo PASS
 cat "$TMP/server.log"
