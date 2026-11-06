@@ -351,6 +351,12 @@ sleep 1
 kill $(cat /rpf/tmp/opencode/e.pid) 2>/dev/null || true
 echo "== onnx save integration =="
 ./zig-out/bin/st-client --port $PORT vectors.save '{"collection":"oc","id":"o1","model":"/rpf/tmp/opencode/test.onnx","value":{"text":"hello onnx"}}' | grep -q '"saved"' && echo PASS
+echo "== claude tokenizer =="
+if [ -f ../SillyTavern/src/tokenizers/claude.json ]; then
+  ./zig-out/bin/st-client --port $PORT tokenizer.encode '{"text":"hello world","vocab":"../SillyTavern/src/tokenizers/claude.json"}' | grep -q '9381,2253' && echo PASS_CLAUDE || echo FAIL_CLAUDE
+else
+  echo SKIP_NO_CLAUDE
+fi
 echo "== bad method =="
 ./zig-out/bin/st-client --port $PORT nope | grep -q '"ok":false' && echo PASS
 cat "$TMP/server.log"
