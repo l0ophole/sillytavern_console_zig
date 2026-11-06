@@ -22,7 +22,7 @@ Status legend: DONE = implemented in Zig + tested (`zig build test` / `tests/run
 | users-admin/users-private/users-public | `users.*` create/list/delete/login/validate/logout (Sha256 + session tokens, 24h) | DONE |
 | vectors | `vectors.save/list/query/delete/generate/embed/model` (hash + neural MLP integrated in save/query, API proxy, cosine) | DONE |
 | search | `search.query` (local) + `search.web` (DuckDuckGo/custom URL, HTTP+HTTPS) | DONE |
-| speech/caption/classify/translate/stable-diffusion/openai/anthropic/google/azure/openrouter/novelai/horde/minimax/volcengine/nanogpt/backends | `*.proxy` + `backend.fetch` + `caption.image` (anthropic image flow) + `stable-diffusion.generate_and_save` | DONE |
+| speech/caption/classify/translate/stable-diffusion/openai/anthropic/google/azure/openrouter/novelai/horde/minimax/volcengine/nanogpt/backends | `*.proxy` + `backend.fetch` + `caption.image` + `speech.tts` (saves mp3) + `stable-diffusion.generate_and_save` | DONE |
 | extensions | `extensions.save/list/get/delete/execute/execute_browser` (node + DOM/SillyTavern shim) | DONE |
 | content-manager | `content-manager.import/list/import_url` (HTTP+HTTPS fetch) | DONE |
 | byaf/charx | `byaf.import`/`charx.import`/`characters.import_zip` (ZIP card.json, stored+deflate) | DONE |

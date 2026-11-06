@@ -228,6 +228,21 @@ python3 /rpf/tmp/opencode/mock_cap.py > /rpf/tmp/opencode/cap.log 2>&1 & echo $!
 sleep 1
 ./zig-out/bin/st-client --port $PORT caption.image '{"image":"data:image/png;base64,iVBORw0KGgo=","prompt":"Describe","api_key":"k","base_url":"http://127.0.0.1:18129"}' | grep -q 'A cat sitting' && echo PASS
 kill $(cat /rpf/tmp/opencode/cap.pid) 2>/dev/null || true
+echo "== speech tts =="
+cat > /rpf/tmp/opencode/mock_tts.py <<'PYEOF'
+from http.server import BaseHTTPRequestHandler, HTTPServer
+class H(BaseHTTPRequestHandler):
+    def do_POST(self):
+        ln=int(self.headers.get('Content-Length',0)); self.rfile.read(ln)
+        data=b'ID3FAKEAUDIOBYTES'
+        self.send_response(200); self.send_header('Content-Type','audio/mpeg'); self.send_header('Content-Length',str(len(data))); self.end_headers(); self.wfile.write(data)
+    def log_message(self,*a): pass
+HTTPServer(('127.0.0.1',18131),H).handle_request()
+PYEOF
+python3 /rpf/tmp/opencode/mock_tts.py > /rpf/tmp/opencode/tts.log 2>&1 & echo $! > /rpf/tmp/opencode/tts.pid
+sleep 1
+./zig-out/bin/st-client --port $PORT speech.tts '{"input":"Hello","name":"hello.mp3","api_key":"k","base_url":"http://127.0.0.1:18131"}' | grep -q 'hello.mp3' && echo PASS
+kill $(cat /rpf/tmp/opencode/tts.pid) 2>/dev/null || true
 echo "== bad method =="
 ./zig-out/bin/st-client --port $PORT nope | grep -q '"ok":false' && echo PASS
 cat "$TMP/server.log"

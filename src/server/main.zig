@@ -1588,6 +1588,84 @@ fn handleClient(conn: posix.fd_t) void {
         const inner = std.fmt.allocPrint(alloc, "{{\"caption\":{s},\"status\":{d}}}", .{ tq, fetched.status }) catch return;
         defer alloc.free(inner);
         resp = protocol.encodeOk(alloc, inner) catch return;
+    } else if (std.mem.eql(u8, req.method, "speech.tts")) {
+        // Full TTS flow: {input, model, voice, name} -> POST /v1/audio/speech -> save mp3 to files/
+        const input = getStr(req, "input") orelse {
+            resp = protocol.encodeErr(alloc, "bad_request") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        const tts_model = getStr(req, "model") orelse "tts-1";
+        const voice = getStr(req, "voice") orelse "alloy";
+        const name = getStr(req, "name") orelse "speech.mp3";
+        if (!protocol.isSafeName(name)) {
+            resp = protocol.encodeErr(alloc, "bad_name") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        }
+        var bb: std.ArrayListUnmanaged(u8) = .empty;
+        defer bb.deinit(alloc);
+        bb.appendSlice(alloc, "{\"model\":\"") catch return;
+        bb.appendSlice(alloc, tts_model) catch return;
+        bb.appendSlice(alloc, "\",\"input\":\"") catch return;
+        for (input) |c| {
+            if (c == '"' or c == '\\') bb.append(alloc, '\\') catch return;
+            if (c == '\n') {
+                bb.appendSlice(alloc, "\\n") catch return;
+            } else {
+                bb.append(alloc, c) catch return;
+            }
+        }
+        bb.appendSlice(alloc, "\",\"voice\":\"") catch return;
+        bb.appendSlice(alloc, voice) catch return;
+        bb.appendSlice(alloc, "\"}") catch return;
+        const body = bb.toOwnedSlice(alloc) catch return;
+        defer alloc.free(body);
+        const ak = getStr(req, "api_key") orelse "";
+        var headers_buf: [3]std.http.Header = undefined;
+        headers_buf[0] = .{ .name = "Content-Type", .value = "application/json" };
+        var auth_val: ?[]u8 = null;
+        var nheaders: usize = 1;
+        if (ak.len > 0) {
+            auth_val = std.fmt.allocPrint(alloc, "Bearer {s}", .{ak}) catch return;
+            headers_buf[1] = .{ .name = "Authorization", .value = auth_val.? };
+            nheaders = 2;
+        }
+        defer if (auth_val) |av| alloc.free(av);
+        const base = getStr(req, "base_url") orelse "https://api.openai.com/v1";
+        const url = std.fmt.allocPrint(alloc, "{s}/audio/speech", .{base}) catch return;
+        defer alloc.free(url);
+        const fetched = backend.fetchUrlHeaders(alloc, url, "POST", body, headers_buf[0..nheaders]) catch {
+            resp = protocol.encodeErr(alloc, "backend_unreachable") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        defer alloc.free(fetched.body);
+        if (fetched.status < 200 or fetched.status >= 300) {
+            resp = protocol.encodeErr(alloc, "http_error") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        }
+        const fdir = std.fs.path.join(alloc, &.{ udir, "files" }) catch return;
+        defer alloc.free(fdir);
+        std.fs.cwd().makePath(fdir) catch {};
+        const fpath = std.fs.path.join(alloc, &.{ fdir, name }) catch return;
+        defer alloc.free(fpath);
+        store.writeAtomic(fpath, fetched.body) catch {
+            resp = protocol.encodeErr(alloc, "io_error") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        const q = protocol.jsonQuote(alloc, name) catch return;
+        defer alloc.free(q);
+        const inner = std.fmt.allocPrint(alloc, "{{\"saved\":{s},\"bytes\":{d},\"status\":{d}}}", .{ q, fetched.body.len, fetched.status }) catch return;
+        defer alloc.free(inner);
+        resp = protocol.encodeOk(alloc, inner) catch return;
     } else if (std.mem.startsWith(u8, req.method, "speech.") or std.mem.startsWith(u8, req.method, "caption.") or std.mem.startsWith(u8, req.method, "classify.") or std.mem.startsWith(u8, req.method, "translate.") or std.mem.startsWith(u8, req.method, "stable-diffusion.") or std.mem.startsWith(u8, req.method, "openai.") or std.mem.startsWith(u8, req.method, "anthropic.") or std.mem.startsWith(u8, req.method, "google.") or std.mem.startsWith(u8, req.method, "azure.") or std.mem.startsWith(u8, req.method, "openrouter.") or std.mem.startsWith(u8, req.method, "novelai.") or std.mem.startsWith(u8, req.method, "horde.") or std.mem.startsWith(u8, req.method, "minimax.") or std.mem.startsWith(u8, req.method, "volcengine.") or std.mem.startsWith(u8, req.method, "nanogpt.") or std.mem.startsWith(u8, req.method, "backends.")) {
         // Generic HTTP proxy to third-party APIs (speech TTS/STT, caption, classify,
         // translate, SD image gen, LLM providers, horde, backends/*).
