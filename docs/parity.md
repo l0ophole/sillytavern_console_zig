@@ -4,7 +4,7 @@ Status legend: DONE = implemented in Zig + tested (`zig build test` / `tests/run
 
 | SillyTavern endpoint | Zig method(s) | Status |
 |---|---|---|
-| server-main (listen, config) | `st-server --host/--port/--data-dir` | DONE (Task 1) |
+| server-main (listen, config) | `st-server --host/--port/--data-dir` | DONE — verified on Arch (glibc) + Alpine 3.20 container (musl build+run, Zig 0.15 build inside Alpine) |
 | healthcheck | `ping`, `version`, `health` | DONE (Task 1) |
 | settings | `settings.get`, `settings.save` | DONE Task 2 |
 | characters | `characters.list/create/get/delete/import_png/import` | DONE (JSON+PNG) |
