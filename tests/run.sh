@@ -381,6 +381,8 @@ echo "== prompt engine: worldinfo + author note + macros =="
 ./zig-out/bin/st-client --port $PORT prompt.preview '{"character":"Alice","chat":"turnchat","user_message":"a","worldinfo":"lore3"}' | grep -qv 'A2' && echo PASS_WI_GROUP_EXCL
 ./zig-out/bin/st-client --port $PORT worldinfo.save '{"name":"lore4","value":{"entries":[{"uid":"s1","key":["dragon"],"content":"Sticky dragon.","disable":false,"constant":false,"sticky":5}]}}' | grep -q '"saved"' && echo PASS
 ./zig-out/bin/st-client --port $PORT prompt.preview '{"character":"Alice","chat":"turnchat","user_message":"dragon","worldinfo":"lore4"}' | grep -q 'Sticky dragon' && echo PASS_WI_STICKY
+./zig-out/bin/st-client --port $PORT worldinfo.save '{"name":"lore5","value":{"entries":[{"uid":"d1","key":["delaykey"],"content":"Delayed entry","disable":false,"constant":false,"delay":99}]}}' | grep -q '"saved"' && echo PASS
+./zig-out/bin/st-client --port $PORT prompt.preview '{"character":"Alice","chat":"turnchat","user_message":"delaykey","worldinfo":"lore5"}' | grep -qv 'Delayed entry' && echo PASS_WI_DELAY
 echo "== stage3: version, slash, groups, jobs =="
 ./zig-out/bin/st-client --port $PORT ping | grep -q '"version":1' && echo PASS_API_VERSION
 ./zig-out/bin/st-client --port $PORT slash.exec '{"command":"/echo","args":"hello zig"}' | grep -q 'hello zig' && echo PASS_SLASH

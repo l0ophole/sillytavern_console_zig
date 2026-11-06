@@ -378,6 +378,106 @@ pub fn worldInfoSelect(alloc: std.mem.Allocator, entries_json: []const u8, scan_
     return out.toOwnedSlice(alloc);
 }
 
+// Full timed selection in the main scan path: delay (only when
+// msg_count >= delay), cooldown (skipped until msg_count >= cooldown_until,
+// updated to msg_count + cooldown on match), grouping, constant-first.
+// Returns text and updated cooldown JSON object string.
+pub fn worldInfoSelectTimed(alloc: std.mem.Allocator, entries_json: []const u8, scan_text: []const u8, msg_count: usize, cooldown_json: []const u8) !struct { text: []u8, cooldown: []u8 } {
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, entries_json, .{});
+    var entries: []const std.json.Value = &.{};
+    if (parsed.value == .array) {
+        entries = parsed.value.array.items;
+    } else if (parsed.value == .object) {
+        if (parsed.value.object.get("entries")) |e| {
+            if (e == .array) entries = e.array.items;
+        }
+    }
+    var cooldowns = std.StringHashMap(i64).init(alloc);
+    defer cooldowns.deinit();
+    if (std.json.parseFromSlice(std.json.Value, alloc, cooldown_json, .{})) |cp| {
+        if (cp.value == .object) {
+            var it = cp.value.object.iterator();
+            while (it.next()) |kv| {
+                if (kv.value_ptr.* == .integer) cooldowns.put(kv.key_ptr.*, kv.value_ptr.*.integer) catch {};
+            }
+        }
+    } else |_| {}
+    const scan_lower = try lowerCaseCopy(alloc, scan_text);
+    defer alloc.free(scan_lower);
+    var seen_groups = std.StringHashMap(void).init(alloc);
+    defer seen_groups.deinit();
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(alloc);
+    for ([_]u8{ 0, 1 }) |pass| {
+        for (entries) |e| {
+            if (e != .object) continue;
+            const disable = if (e.object.get("disable")) |v| v == .bool and v.bool else false;
+            if (disable) continue;
+            const pos: i64 = if (e.object.get("position")) |v| if (v == .integer) v.integer else 0 else 0;
+            const outlet_name = if (e.object.get("outletName")) |v| if (v == .string) v.string else "" else "";
+            if (pos == 7 or outlet_name.len > 0) continue; // outlets handled separately
+            const constant = if (e.object.get("constant")) |v| v == .bool and v.bool else false;
+            const cls: u8 = if (constant) 0 else 1;
+            if (cls != pass) continue;
+            const delay_n: i64 = if (e.object.get("delay")) |v| if (v == .integer) v.integer else 0 else 0;
+            if (delay_n > 0 and @as(i64, @intCast(msg_count)) < delay_n) continue;
+            const uid: []const u8 = if (e.object.get("uid")) |v| if (v == .string) v.string else "" else "";
+            if (uid.len > 0) {
+                if (cooldowns.get(uid)) |until| {
+                    if (@as(i64, @intCast(msg_count)) < until) continue;
+                }
+            }
+            const content = if (e.object.get("content")) |v| if (v == .string) v.string else "" else "";
+            if (content.len == 0) continue;
+            var matched = constant;
+            if (!matched) {
+                if (e.object.get("key")) |k| {
+                    if (k == .array) {
+                        for (k.array.items) |kv| {
+                            if (kv != .string or kv.string.len == 0) continue;
+                            const kl = try lowerCaseCopy(alloc, kv.string);
+                            defer alloc.free(kl);
+                            if (std.mem.indexOf(u8, scan_lower, kl) != null) matched = true;
+                        }
+                    }
+                }
+            }
+            if (!matched) continue;
+            if (e.object.get("group")) |gv| {
+                if (gv == .string and gv.string.len > 0) {
+                    if (seen_groups.contains(gv.string)) continue;
+                    try seen_groups.put(gv.string, {});
+                }
+            }
+            if (out.items.len > 0) try out.append(alloc, '\n');
+            try out.appendSlice(alloc, content);
+            // Arm cooldown on match
+            const cd_n: i64 = if (e.object.get("cooldown")) |v| if (v == .integer) v.integer else 0 else 0;
+            if (cd_n > 0 and uid.len > 0) {
+                cooldowns.put(uid, @as(i64, @intCast(msg_count)) + cd_n) catch {};
+            }
+        }
+    }
+    var cd_out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer cd_out.deinit(alloc);
+    try cd_out.append(alloc, '{');
+    var cit = cooldowns.iterator();
+    var cfirst = true;
+    while (cit.next()) |kv| {
+        if (!cfirst) try cd_out.append(alloc, ',');
+        cfirst = false;
+        const kq = try quote(alloc, kv.key_ptr.*);
+        defer alloc.free(kq);
+        const vs = try std.fmt.allocPrint(alloc, "{d}", .{kv.value_ptr.*});
+        defer alloc.free(vs);
+        try cd_out.appendSlice(alloc, kq);
+        try cd_out.append(alloc, ':');
+        try cd_out.appendSlice(alloc, vs);
+    }
+    try cd_out.append(alloc, '}');
+    return .{ .text = try out.toOwnedSlice(alloc), .cooldown = try cd_out.toOwnedSlice(alloc) };
+}
+
 // World Info sticky effects: entries with sticky > 0, once matched, stay
 // included on later scans. sticky_uids is the persisted set (JSON array of
 // uids); returns selected text and the updated uid set as JSON array string.
@@ -865,4 +965,23 @@ test "worldinfo outlets collected" {
     const r = try worldInfoTimed(alloc, entries, "ach", 0, "{}");
     try std.testing.expect(std.mem.indexOf(u8, r.outlets, "Achievement text") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.outlets, "achievements") != null);
+}
+
+test "worldinfo delay and cooldown in main scan" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const entries = "[{\"uid\":\"d1\",\"key\":[\"a\"],\"content\":\"Delayed\",\"disable\":false,\"constant\":false,\"delay\":5},{\"uid\":\"c1\",\"key\":[\"b\"],\"content\":\"Cool\",\"disable\":false,\"constant\":false,\"cooldown\":3},{\"key\":[\"c\"],\"content\":\"Normal\",\"disable\":false,\"constant\":false}]";
+    // msg_count 0: delayed excluded, cool+normal included
+    const r0 = try worldInfoSelectTimed(alloc, entries, "a b c", 0, "{}");
+    try std.testing.expect(std.mem.indexOf(u8, r0.text, "Delayed") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r0.text, "Cool") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r0.text, "Normal") != null);
+    // msg_count 5 with cooldown armed at 0+3=3: cool excluded (5>=3? no, 5>=3 means expired) -> use count 2
+    const r2 = try worldInfoSelectTimed(alloc, entries, "a b c", 2, r0.cooldown);
+    try std.testing.expect(std.mem.indexOf(u8, r2.text, "Cool") == null);
+    // msg_count 6: delayed included, cooldown expired
+    const r6 = try worldInfoSelectTimed(alloc, entries, "a b c", 6, r0.cooldown);
+    try std.testing.expect(std.mem.indexOf(u8, r6.text, "Delayed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r6.text, "Cool") != null);
 }

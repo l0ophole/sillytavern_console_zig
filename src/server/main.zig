@@ -3628,13 +3628,36 @@ fn handleClient(conn: posix.fd_t) void {
                     if (getObjValue(req, "worldinfo_recursion")) |rv| {
                         if (rv == .integer) wi_steps = std.math.cast(usize, rv.integer) orelse 1;
                     }
-                    if (prompt_mod.worldInfoSelectRecursive(alloc, book_content, scan, wi_steps) catch null) |wi_text| {
-                        defer alloc.free(wi_text);
+                    // Timed selection (delay/cooldown) with persisted cooldown state
+                    const cd_path = std.fs.path.join(alloc, &.{ chat_dir, "cooldown.json" }) catch return;
+                    defer alloc.free(cd_path);
+                    const prev_cd = store.readFileAlloc(alloc, cd_path) catch alloc.dupe(u8, "{}") catch return;
+                    defer alloc.free(prev_cd);
+                    if (prompt_mod.worldInfoSelectTimed(alloc, book_content, scan, history_count, prev_cd) catch null) |tr| {
+                        store.writeAtomic(cd_path, tr.cooldown) catch {};
+                        alloc.free(tr.cooldown);
+                        // Recursion: rescan with selected text for chained keys
+                        var wi_text = tr.text;
+                        var rstep: usize = 0;
+                        while (rstep < wi_steps and wi_text.len > 0) : (rstep += 1) {
+                            const more = prompt_mod.worldInfoSelectTimed(alloc, book_content, wi_text, history_count, prev_cd) catch break;
+                            if (more.text.len == 0 or std.mem.indexOf(u8, wi_text, more.text) != null) {
+                                alloc.free(more.text);
+                                alloc.free(more.cooldown);
+                                break;
+                            }
+                            const next = std.fmt.allocPrint(alloc, "{s}\n{s}", .{ wi_text, more.text }) catch break;
+                            alloc.free(wi_text);
+                            alloc.free(more.text);
+                            alloc.free(more.cooldown);
+                            wi_text = next;
+                        }
                         if (wi_text.len > 0) {
                             const with_wi = prompt_mod.insertAuthorNote(alloc, msgs_json, wi_text, history_count + 1) catch return;
                             alloc.free(msgs_json);
                             msgs_json = with_wi;
                         }
+                        alloc.free(wi_text);
                     }
                 }
             }
@@ -4097,13 +4120,29 @@ fn handleClient(conn: posix.fd_t) void {
                     defer alloc.free(book_content);
                     const scan = std.fmt.allocPrint(alloc, "{s}\\n{s}", .{ sys_text, user_msg }) catch return;
                     defer alloc.free(scan);
-                    if (prompt_mod.worldInfoSelectRecursive(alloc, book_content, scan, 2) catch null) |wi_text| {
-                        defer alloc.free(wi_text);
+                    if (prompt_mod.worldInfoSelectTimed(alloc, book_content, scan, history_count, "{}") catch null) |tr0| {
+                        var wi_text = tr0.text;
+                        var rstep: usize = 0;
+                        while (rstep < 2 and wi_text.len > 0) : (rstep += 1) {
+                            const more = prompt_mod.worldInfoSelectTimed(alloc, book_content, wi_text, history_count, "{}") catch break;
+                            if (more.text.len == 0 or std.mem.indexOf(u8, wi_text, more.text) != null) {
+                                alloc.free(more.text);
+                                alloc.free(more.cooldown);
+                                break;
+                            }
+                            const next = std.fmt.allocPrint(alloc, "{s}\n{s}", .{ wi_text, more.text }) catch break;
+                            alloc.free(wi_text);
+                            alloc.free(more.text);
+                            alloc.free(more.cooldown);
+                            wi_text = next;
+                        }
                         if (wi_text.len > 0) {
                             const with_wi = prompt_mod.insertAuthorNote(alloc, msgs_json, wi_text, history_count + 1) catch return;
                             alloc.free(msgs_json);
                             msgs_json = with_wi;
                         }
+                        alloc.free(wi_text);
+                        alloc.free(tr0.cooldown);
                     }
                 }
             }
