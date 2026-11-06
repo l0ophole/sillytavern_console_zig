@@ -24,7 +24,7 @@ Status legend: DONE = implemented in Zig + tested (`zig build test` / `tests/run
 | search | `search.query` (local substring over characters/worldinfo/presets) | DONE (local; web search TODO) |
 | speech/caption/classify/translate/stable-diffusion/openai/anthropic/google/azure/openrouter/novelai/horde/minimax/volcengine/nanogpt/backends | `*.proxy` + `backend.fetch` (HTTP+HTTPS) | DONE |
 | extensions | `extensions.save/list/get/delete` | DONE (text store; JS execution TODO) |
-| content-manager | `content-manager.import/list` | DONE (local import; URL fetch TODO) |
+| content-manager | `content-manager.import/list/import_url` (HTTP+HTTPS fetch) | DONE |
 | byaf/charx | `byaf.import`/`charx.import`/`characters.import_zip` (ZIP card.json, stored+deflate) | DONE |
 
 All SillyTavern `src/endpoints/*.js` endpoints (42 files) have a Zig method counterpart (see table). Known depth gaps vs Node original: tokenizers use chars/4 estimate (not exact tiktoken/BPE), third-party proxies are HTTP-only (no TLS/native SDKs), search is local substring (not web), vectors use client-supplied embeddings (no embedding model), extensions are stored not executed, content-manager imports local content (not URL fetch), users use token login (not session cookies). These are documented per-row; endpoints themselves are implemented and tested.

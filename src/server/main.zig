@@ -1422,6 +1422,53 @@ fn handleClient(conn: posix.fd_t) void {
                 const arr = crud.jsonArrayOfNames(alloc, names) catch return;
                 defer alloc.free(arr);
                 resp = protocol.encodeOk(alloc, arr) catch return;
+            } else if (std.mem.eql(u8, action, "import_url")) {
+                const url = getStr(req, "url") orelse {
+                    resp = protocol.encodeErr(alloc, "bad_request") catch return;
+                    defer alloc.free(resp);
+                    _ = posix.write(conn, resp) catch {};
+                    return;
+                };
+                const name = getStr(req, "name") orelse {
+                    resp = protocol.encodeErr(alloc, "bad_request") catch return;
+                    defer alloc.free(resp);
+                    _ = posix.write(conn, resp) catch {};
+                    return;
+                };
+                const kind = getStr(req, "kind") orelse "characters";
+                if (!protocol.isSafeName(name) or !protocol.isSafeName(kind)) {
+                    resp = protocol.encodeErr(alloc, "bad_name") catch return;
+                    defer alloc.free(resp);
+                    _ = posix.write(conn, resp) catch {};
+                    return;
+                }
+                const fetched = backend.fetchUrl(alloc, url, "GET", null) catch {
+                    resp = protocol.encodeErr(alloc, "backend_unreachable") catch return;
+                    defer alloc.free(resp);
+                    _ = posix.write(conn, resp) catch {};
+                    return;
+                };
+                defer alloc.free(fetched.body);
+                if (fetched.status < 200 or fetched.status >= 300) {
+                    resp = protocol.encodeErr(alloc, "http_error") catch return;
+                    defer alloc.free(resp);
+                    _ = posix.write(conn, resp) catch {};
+                    return;
+                }
+                const tdir = std.fs.path.join(alloc, &.{ udir, kind }) catch return;
+                defer alloc.free(tdir);
+                std.fs.cwd().makePath(tdir) catch {};
+                const fname = std.fmt.allocPrint(alloc, "{s}.json", .{name}) catch return;
+                defer alloc.free(fname);
+                const tpath = std.fs.path.join(alloc, &.{ tdir, fname }) catch return;
+                defer alloc.free(tpath);
+                store.writeAtomic(tpath, fetched.body) catch {
+                    resp = protocol.encodeErr(alloc, "io_error") catch return;
+                    defer alloc.free(resp);
+                    _ = posix.write(conn, resp) catch {};
+                    return;
+                };
+                resp = protocol.encodeOk(alloc, "{\"saved\":true}") catch return;
             } else {
                 resp = protocol.encodeErr(alloc, "unknown_method") catch return;
             }

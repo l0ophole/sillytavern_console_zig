@@ -102,6 +102,13 @@ echo "== https backend =="
 ./zig-out/bin/st-client --port $PORT backend.fetch '{"url":"http://127.0.0.1:9/","method":"GET"}' | grep -q 'backend_unreachable' && echo PASS
 # HTTPS test requires network; skip gracefully if offline
 timeout 15 ./zig-out/bin/st-client --port $PORT backend.fetch '{"url":"https://example.com/","method":"GET"}' > /tmp/https_out.txt 2>&1 && grep -q '"status":200' /tmp/https_out.txt && echo PASS_HTTPS || echo SKIP_HTTPS_OFFLINE
+echo "== content-manager url =="
+mkdir -p /tmp/stwww && echo "{\"name\":\"FromURL\"}" > /tmp/stwww/card.json
+python3 -m http.server 18105 --directory /tmp/stwww --bind 127.0.0.1 >/tmp/stwww.log 2>&1 & echo $! > /tmp/stwww.pid
+sleep 1
+./zig-out/bin/st-client --port $PORT content-manager.import_url '{"url":"http://127.0.0.1:18105/card.json","name":"FromURL","kind":"characters"}' | grep -q '"saved"' && echo PASS
+./zig-out/bin/st-client --port $PORT characters.get '{"name":"FromURL"}' | grep -q 'FromURL' && echo PASS
+kill $(cat /tmp/stwww.pid) 2>/dev/null || true
 echo "== bad method =="
 ./zig-out/bin/st-client --port $PORT nope | grep -q '"ok":false' && echo PASS
 cat "$TMP/server.log"
