@@ -508,9 +508,23 @@ fn handleClient(conn: posix.fd_t) void {
             return;
         };
         defer { for (names) |nm| alloc.free(nm); alloc.free(names); }
-        const arr = crud.jsonArrayOfNames(alloc, names) catch return;
-        defer alloc.free(arr);
-        resp = protocol.encodeOk(alloc, arr) catch return;
+        // Return parsed character objects (JS /api/characters/all returns objects with .name)
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        defer out.deinit(alloc);
+        out.append(alloc, '[') catch return;
+        var first = true;
+        for (names) |nm| {
+            if (!std.mem.endsWith(u8, nm, ".json")) continue;
+            const content = crud.loadFile(alloc, cdir, nm) catch continue;
+            defer alloc.free(content);
+            if (!first) out.append(alloc, ',') catch return;
+            first = false;
+            out.appendSlice(alloc, content) catch return;
+        }
+        out.append(alloc, ']') catch return;
+        const s = out.toOwnedSlice(alloc) catch return;
+        defer alloc.free(s);
+        resp = protocol.encodeOk(alloc, s) catch return;
     } else if (std.mem.eql(u8, req.method, "characters.create") or std.mem.eql(u8, req.method, "characters.save")) {
         const name = getStr(req, "name") orelse {
             resp = protocol.encodeErr(alloc, "bad_request") catch return;
