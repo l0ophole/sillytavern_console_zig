@@ -3659,30 +3659,37 @@ fn handleClient(conn: posix.fd_t) void {
                     if (getObjValue(req, "worldinfo_recursion")) |rv| {
                         if (rv == .integer) wi_steps = std.math.cast(usize, rv.integer) orelse 1;
                     }
-                    // Timed selection (delay/cooldown) with persisted cooldown state
+                    // Timed selection (delay/cooldown) with persisted cooldown state.
+                    // Cooldown state is threaded through recursive rounds so an
+                    // entry armed in round 1 stays on cooldown in later rounds,
+                    // and the final state (all rounds merged) is persisted.
                     const cd_path = std.fs.path.join(alloc, &.{ chat_dir, "cooldown.json" }) catch return;
                     defer alloc.free(cd_path);
-                    const prev_cd = store.readFileAlloc(alloc, cd_path) catch alloc.dupe(u8, "{}") catch return;
-                    defer alloc.free(prev_cd);
-                    if (prompt_mod.worldInfoSelectTimed(alloc, book_content, scan, history_count, prev_cd) catch null) |tr| {
-                        store.writeAtomic(cd_path, tr.cooldown) catch {};
-                        alloc.free(tr.cooldown);
+                    var cd_state = store.readFileAlloc(alloc, cd_path) catch alloc.dupe(u8, "{}") catch return;
+                    defer alloc.free(cd_state);
+                    if (prompt_mod.worldInfoSelectTimed(alloc, book_content, scan, history_count, cd_state) catch null) |tr| {
+                        alloc.free(cd_state);
+                        cd_state = tr.cooldown;
                         // Recursion: rescan with selected text for chained keys
                         var wi_text = tr.text;
                         var rstep: usize = 0;
                         while (rstep < wi_steps and wi_text.len > 0) : (rstep += 1) {
-                            const more = prompt_mod.worldInfoSelectTimed(alloc, book_content, wi_text, history_count, prev_cd) catch break;
+                            const more = prompt_mod.worldInfoSelectTimed(alloc, book_content, wi_text, history_count, cd_state) catch break;
                             if (more.text.len == 0 or std.mem.indexOf(u8, wi_text, more.text) != null) {
                                 alloc.free(more.text);
-                                alloc.free(more.cooldown);
+                                alloc.free(cd_state);
+                                cd_state = more.cooldown;
                                 break;
                             }
+                            alloc.free(cd_state);
+                            cd_state = more.cooldown;
                             const next = std.fmt.allocPrint(alloc, "{s}\n{s}", .{ wi_text, more.text }) catch break;
                             alloc.free(wi_text);
                             alloc.free(more.text);
-                            alloc.free(more.cooldown);
                             wi_text = next;
                         }
+                        // Persist the merged cooldown state from all rounds
+                        store.writeAtomic(cd_path, cd_state) catch {};
                         if (wi_text.len > 0) {
                             const with_wi = prompt_mod.insertAuthorNote(alloc, msgs_json, wi_text, history_count + 1) catch return;
                             alloc.free(msgs_json);
@@ -4157,18 +4164,22 @@ fn handleClient(conn: posix.fd_t) void {
                     defer alloc.free(scan);
                     if (prompt_mod.worldInfoSelectTimed(alloc, book_content, scan, history_count, "{}") catch null) |tr0| {
                         var wi_text = tr0.text;
+                        var cd_state2 = tr0.cooldown;
+                        defer alloc.free(cd_state2);
                         var rstep: usize = 0;
                         while (rstep < 2 and wi_text.len > 0) : (rstep += 1) {
-                            const more = prompt_mod.worldInfoSelectTimed(alloc, book_content, wi_text, history_count, "{}") catch break;
+                            const more = prompt_mod.worldInfoSelectTimed(alloc, book_content, wi_text, history_count, cd_state2) catch break;
                             if (more.text.len == 0 or std.mem.indexOf(u8, wi_text, more.text) != null) {
                                 alloc.free(more.text);
-                                alloc.free(more.cooldown);
+                                alloc.free(cd_state2);
+                                cd_state2 = more.cooldown;
                                 break;
                             }
+                            alloc.free(cd_state2);
+                            cd_state2 = more.cooldown;
                             const next = std.fmt.allocPrint(alloc, "{s}\n{s}", .{ wi_text, more.text }) catch break;
                             alloc.free(wi_text);
                             alloc.free(more.text);
-                            alloc.free(more.cooldown);
                             wi_text = next;
                         }
                         if (wi_text.len > 0) {
@@ -4177,7 +4188,6 @@ fn handleClient(conn: posix.fd_t) void {
                             msgs_json = with_wi;
                         }
                         alloc.free(wi_text);
-                        alloc.free(tr0.cooldown);
                     }
                 }
             }

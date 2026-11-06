@@ -38,3 +38,5 @@ Verified matches (JS → Zig, same request):
 - `POST /api/chats/get` present → JS parsed chat array → Zig parsed JSONL array (match); absent → JS `[]` when chat dir exists (`getChatData`), `{}` when dir missing — Zig returns `{}` (state-dependent variance)
 - `POST /api/chats/save|get` JS-style `{avatar_url,file_name,chat:[...]}` roundtrip verified on Zig
 Known variances: proxy routes (85) remain upstream-dependent PROXY, not byte-identical; empty/timeout responses for `chats/group/get`, `chats/export`, `assets/get`, `groups/all` on JS during capture (server still loading extensions) — Zig returns `{}`/`[]` absent-class responses.
+
+WI cooldown threading: cooldown state is threaded through recursive rounds in `chat.turn`/`prompt.preview` (entry armed in round 1 stays on cooldown in later rounds; final merged `cooldown.json` persisted). Verified by `PASS_WI_CD_THREAD` (cooldown entry text appears exactly once after recursion).

@@ -442,6 +442,9 @@ echo "== prompt engine: worldinfo + author note + macros =="
 ./zig-out/bin/st-client --port $PORT prompt.preview '{"character":"Alice","chat":"turnchat","user_message":"dragon","worldinfo":"lore4"}' | grep -q 'Sticky dragon' && echo PASS_WI_STICKY
 ./zig-out/bin/st-client --port $PORT worldinfo.save '{"name":"lore5","value":{"entries":[{"uid":"d1","key":["delaykey"],"content":"Delayed entry","disable":false,"constant":false,"delay":99}]}}' | grep -q '"saved"' && echo PASS
 ./zig-out/bin/st-client --port $PORT prompt.preview '{"character":"Alice","chat":"turnchat","user_message":"delaykey","worldinfo":"lore5"}' | grep -qv 'Delayed entry' && echo PASS_WI_DELAY
+./zig-out/bin/st-client --port $PORT worldinfo.save '{"name":"lore6","value":{"entries":[{"uid":"c1","key":["b"],"content":"Cool b content","disable":false,"constant":false,"cooldown":99}]}}' | grep -q '"saved"' && echo PASS
+OUT_CD=$(./zig-out/bin/st-client --port $PORT prompt.preview '{"character":"Alice","chat":"turnchat","user_message":"b","worldinfo":"lore6"}')
+echo "$OUT_CD" | grep -q 'Cool b content' && [ "$(echo "$OUT_CD" | grep -o 'Cool b content' | wc -l)" -eq 1 ] && echo PASS_WI_CD_THREAD
 echo "== stage3: version, slash, groups, jobs =="
 ./zig-out/bin/st-client --port $PORT ping | grep -q '"version":1' && echo PASS_API_VERSION
 ./zig-out/bin/st-client --port $PORT slash.exec '{"command":"/echo","args":"hello zig"}' | grep -q 'hello zig' && echo PASS_SLASH
