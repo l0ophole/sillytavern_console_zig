@@ -361,6 +361,8 @@ echo "== frontend API routes =="
 curl -s -m 5 -X POST -H 'Content-Type: application/json' -d '{}' http://127.0.0.1:$PORT/api/settings/load | grep -q '"ok":true' && echo PASS
 curl -s -m 5 -X POST -H 'Content-Type: application/json' -d '{"name":"Alice","character":{"name":"Alice"}}' http://127.0.0.1:$PORT/api/characters/create | grep -q '"saved"' && echo PASS
 curl -s -m 5 -X POST -H 'Content-Type: application/json' -d '{}' http://127.0.0.1:$PORT/api/characters/list | grep -q 'Alice' && echo PASS
+echo "== multipart frontend upload =="
+curl -s -m 5 -F "name=Bob" -F 'character={"name":"Bob"}' http://127.0.0.1:$PORT/api/characters/create | grep -q '"saved"' && echo PASS
 echo "== bad method =="
 ./zig-out/bin/st-client --port $PORT nope | grep -q '"ok":false' && echo PASS
 cat "$TMP/server.log"

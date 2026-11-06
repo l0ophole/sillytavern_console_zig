@@ -215,7 +215,61 @@ fn handleHttp(conn: posix.fd_t, first_line: []const u8) void {
             body.appendSlice(alloc, chunk[0..r]) catch break;
             remaining -= r;
         }
-        const params_json = if (body.items.len == 0) "{}" else body.items;
+        // Frontend multipart/form-data (multer) compatibility: extract text fields to JSON params
+        var multipart_params: ?[]u8 = null;
+        defer if (multipart_params) |mp| alloc.free(mp);
+        if (body.items.len > 0) {
+            const headers_slice = header_buf[0..drain_pos];
+            if (std.mem.indexOf(u8, headers_slice, "multipart/form-data")) |_ct| {
+                var boundary: []const u8 = "";
+                if (std.mem.indexOf(u8, headers_slice[_ct..], "boundary=")) |bo| {
+                    const rest = headers_slice[_ct + bo + 9 ..];
+                    const end = std.mem.indexOfAny(u8, rest, "\r\n; ") orelse rest.len;
+                    boundary = std.mem.trim(u8, rest[0..end], "\" ");
+                }
+                if (boundary.len > 0) {
+                    const delim = std.fmt.allocPrint(alloc, "--{s}", .{boundary}) catch return;
+                    defer alloc.free(delim);
+                    var pout: std.ArrayListUnmanaged(u8) = .empty;
+                    defer pout.deinit(alloc);
+                    pout.append(alloc, '{') catch return;
+                    var first_field = true;
+                    var search_pos: usize = 0;
+                    while (std.mem.indexOf(u8, body.items[search_pos..], delim)) |rel| {
+                        const part_start = search_pos + rel + delim.len;
+                        // Skip CRLF after boundary
+                        var hs = part_start;
+                        if (hs + 1 < body.items.len and body.items[hs] == '\r' and body.items[hs + 1] == '\n') hs += 2;
+                        if (std.mem.indexOf(u8, body.items[hs..], "\r\n\r\n")) |hend| {
+                            const part_headers = body.items[hs .. hs + hend];
+                            const content_start = hs + hend + 4;
+                            const end_marker = std.fmt.allocPrint(alloc, "\r\n{s}", .{delim}) catch return;
+                            defer alloc.free(end_marker);
+                            const content_end = std.mem.indexOf(u8, body.items[content_start..], end_marker) orelse break;
+                            const content = body.items[content_start .. content_start + content_end];
+                            if (std.mem.indexOf(u8, part_headers, "name=\"")) |no| {
+                                const nrest = part_headers[no + 6 ..];
+                                const nend = std.mem.indexOfScalar(u8, nrest, '"') orelse continue;
+                                const fname = nrest[0..nend];
+                                if (!first_field) pout.append(alloc, ',') catch return;
+                                first_field = false;
+                                const fq = protocol.jsonQuote(alloc, fname) catch return;
+                                defer alloc.free(fq);
+                                const vq = protocol.jsonQuote(alloc, content) catch return;
+                                defer alloc.free(vq);
+                                pout.appendSlice(alloc, fq) catch return;
+                                pout.append(alloc, ':') catch return;
+                                pout.appendSlice(alloc, vq) catch return;
+                            }
+                            search_pos = content_start + content_end;
+                        } else break;
+                    }
+                    pout.append(alloc, '}') catch return;
+                    multipart_params = pout.toOwnedSlice(alloc) catch return;
+                }
+            }
+        }
+        const params_json = if (multipart_params) |mp| mp else if (body.items.len == 0) "{}" else body.items;
         // Frontend Express route mapping: /api/<res>/<action> -> <res>.<action>
         var mapped_method: []u8 = undefined;
         defer alloc.free(mapped_method);
