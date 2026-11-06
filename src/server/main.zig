@@ -395,6 +395,79 @@ fn handleClient(conn: posix.fd_t) void {
             _ = posix.write(conn, resp) catch {};
             return;
         };
+    } else if (std.mem.eql(u8, req.method, "secrets.set")) {
+        const key = getStr(req, "key") orelse {
+            resp = protocol.encodeErr(alloc, "bad_request") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        const val = getStr(req, "value") orelse {
+            resp = protocol.encodeErr(alloc, "bad_request") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        if (!protocol.isSafeName(key)) {
+            resp = protocol.encodeErr(alloc, "bad_name") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        }
+        const spath = std.fs.path.join(alloc, &.{ udir, "secrets.json" }) catch return;
+        defer alloc.free(spath);
+        // Load existing or {}
+        var obj_map = std.json.ObjectMap.init(alloc);
+        if (store.readFileAlloc(alloc, spath)) |existing| {
+            defer alloc.free(existing);
+            if (std.json.parseFromSlice(std.json.Value, alloc, existing, .{})) |parsed| {
+                if (parsed.value == .object) obj_map = parsed.value.object;
+            } else |_| {}
+        } else |_| {}
+        obj_map.put(key, .{ .string = val }) catch return;
+        const tmp_val: std.json.Value = .{ .object = obj_map };
+        const s = store.stringifyValue(alloc, tmp_val) catch return;
+        defer alloc.free(s);
+        store.writeAtomic(spath, s) catch {
+            resp = protocol.encodeErr(alloc, "io_error") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        // chmod 0600 best-effort
+        if (std.fs.cwd().openFile(spath, .{})) |f| {
+            defer f.close();
+            posix.fchmod(f.handle, 0o600) catch {};
+        } else |_| {}
+        resp = protocol.encodeOk(alloc, "{\"saved\":true}") catch return;
+    } else if (std.mem.eql(u8, req.method, "secrets.list") or std.mem.eql(u8, req.method, "secrets.get")) {
+        const spath = std.fs.path.join(alloc, &.{ udir, "secrets.json" }) catch return;
+        defer alloc.free(spath);
+        const content = store.readFileAlloc(alloc, spath) catch {
+            resp = protocol.encodeOk(alloc, "{}") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        defer alloc.free(content);
+        // Mask values: parse and rebuild with "****"
+        if (std.json.parseFromSlice(std.json.Value, alloc, content, .{})) |parsed| {
+            if (parsed.value == .object) {
+                var masked = std.json.ObjectMap.init(alloc);
+                var it = parsed.value.object.iterator();
+                while (it.next()) |kv| {
+                    masked.put(kv.key_ptr.*, .{ .string = "****" }) catch return;
+                }
+                const mv: std.json.Value = .{ .object = masked };
+                const s = store.stringifyValue(alloc, mv) catch return;
+                defer alloc.free(s);
+                resp = protocol.encodeOk(alloc, s) catch return;
+            } else {
+                resp = protocol.encodeOk(alloc, "{}") catch return;
+            }
+        } else |_| {
+            resp = protocol.encodeOk(alloc, "{}") catch return;
+        }
     } else if (std.mem.eql(u8, req.method, "ping")) {
         resp = protocol.encodeOk(alloc, "{\"pong\":true,\"version\":\"" ++ protocol.VERSION ++ "\"}") catch return;
     } else if (std.mem.eql(u8, req.method, "version")) {

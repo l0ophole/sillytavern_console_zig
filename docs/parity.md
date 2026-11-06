@@ -11,7 +11,7 @@ Status legend: DONE = implemented in Zig + tested (`zig build test` / `tests/run
 | chats | `chats.list/save/load/delete` | DONE Task 4 |
 | presets (instruct/textgen) | `presets.list/save/load/delete` | DONE Task 5 |
 | worldinfo | `worldinfo.list/save/load/delete` | DONE Task 5 |
-| secrets | `secrets.set/get(list masked)` | TODO Task 6 |
+| secrets | `secrets.set/get(list masked)` | DONE Task 6 |
 | groups | `groups.list/save/delete` | DONE Task 6 |
 | themes / moving-ui / quick-replies | `themes.*` generic | DONE Task 6 (themes) |
 | backgrounds / avatars / sprites / images / thumbnails / files / assets / backups / data-maid | `files.*`, `backups.create/list` (generic binary store) | TODO Task 6/8 |
