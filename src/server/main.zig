@@ -3347,6 +3347,280 @@ fn handleClient(conn: posix.fd_t) void {
         const inner = std.fmt.allocPrint(alloc, "{{\"text\":{s},\"provider\":\"{s}\",\"status\":{d},\"saved\":{s}}}", .{ tq, prov.name, fetched.status, if (saved) "true" else "false" }) catch return;
         defer alloc.free(inner);
         resp = protocol.encodeOk(alloc, inner) catch return;
+    } else if (std.mem.eql(u8, req.method, "chat.turn")) {
+        // Stage 1 end-to-end chat: load card -> build prompt -> stream reply -> save -> reload.
+        const ch_name = getStr(req, "character") orelse getStr(req, "name") orelse {
+            resp = protocol.encodeErr(alloc, "bad_request") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        if (!protocol.isSafeName(ch_name)) {
+            resp = protocol.encodeErr(alloc, "bad_name") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        }
+        const chat_name = getStr(req, "chat") orelse "main";
+        const user_msg_raw = getStr(req, "user_message") orelse getStr(req, "message") orelse getStr(req, "text") orelse {
+            resp = protocol.encodeErr(alloc, "bad_request") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        const pname = getStr(req, "provider") orelse "openrouter";
+        const prov = providers_mod.getProvider(pname) orelse {
+            resp = protocol.encodeErr(alloc, "unknown_provider") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        const model_name = getStr(req, "model") orelse "openai/gpt-4o-mini";
+        var max_tokens: u32 = 256;
+        if (getObjValue(req, "max_tokens")) |mv| {
+            if (mv == .integer) max_tokens = std.math.cast(u32, mv.integer) orelse { resp = protocol.encodeErr(alloc, "bad_request") catch return; defer alloc.free(resp); _ = posix.write(conn, resp) catch {}; return; };
+        }
+        // Load character card
+        const cdir = std.fs.path.join(alloc, &.{ udir, "characters" }) catch return;
+        defer alloc.free(cdir);
+        const cfname = std.fmt.allocPrint(alloc, "{s}.json", .{ch_name}) catch return;
+        defer alloc.free(cfname);
+        const card_content = crud.loadFile(alloc, cdir, cfname) catch {
+            resp = protocol.encodeErr(alloc, "character_not_found") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        defer alloc.free(card_content);
+        const card_parsed = std.json.parseFromSlice(std.json.Value, alloc, card_content, .{}) catch {
+            resp = protocol.encodeErr(alloc, "bad_card") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        const card_obj = if (card_parsed.value == .object) card_parsed.value.object else std.json.ObjectMap.init(alloc);
+        const card_get = struct {
+            fn f(obj: std.json.ObjectMap, key: []const u8) []const u8 {
+                if (obj.get(key)) |v| {
+                    if (v == .string) return v.string;
+                }
+                return "";
+            }
+        }.f;
+        const card_name = card_get(card_obj, "name");
+        const display_name = if (card_name.len > 0) card_name else ch_name;
+        // Build system prompt (upstream order: description, personality, scenario, system_prompt, examples)
+        var sys: std.ArrayListUnmanaged(u8) = .empty;
+        defer sys.deinit(alloc);
+        const sys_parts = [_][]const u8{ card_get(card_obj, "system_prompt"), card_get(card_obj, "description"), card_get(card_obj, "personality"), card_get(card_obj, "scenario") };
+        const sys_labels = [_][]const u8{ "", "Description: ", "Personality: ", "Scenario: " };
+        for (sys_parts, sys_labels) |part, label| {
+            if (part.len == 0) continue;
+            if (sys.items.len > 0) sys.appendSlice(alloc, "\n") catch return;
+            sys.appendSlice(alloc, label) catch return;
+            sys.appendSlice(alloc, part) catch return;
+        }
+        // Macros: {{char}} / {{user}} (full macro engine is Stage 2)
+        const user_msg = std.mem.replaceOwned(u8, alloc, user_msg_raw, "{{user}}", "User") catch return;
+        defer alloc.free(user_msg);
+        const user_msg2 = std.mem.replaceOwned(u8, alloc, user_msg, "{{char}}", display_name) catch return;
+        defer alloc.free(user_msg2);
+        const sys_text = sys.toOwnedSlice(alloc) catch return;
+        defer alloc.free(sys_text);
+        const sys_macro1 = std.mem.replaceOwned(u8, alloc, sys_text, "{{char}}", display_name) catch return;
+        defer alloc.free(sys_macro1);
+        const sys_macro = std.mem.replaceOwned(u8, alloc, sys_macro1, "{{user}}", "User") catch return;
+        defer alloc.free(sys_macro);
+        // History from chat file
+        const chat_dir = std.fs.path.join(alloc, &.{ udir, "chats", ch_name }) catch return;
+        defer alloc.free(chat_dir);
+        std.fs.cwd().makePath(chat_dir) catch {};
+        const chat_fname = std.fmt.allocPrint(alloc, "{s}.jsonl", .{chat_name}) catch return;
+        defer alloc.free(chat_fname);
+        const chat_path = std.fs.path.join(alloc, &.{ chat_dir, chat_fname }) catch return;
+        defer alloc.free(chat_path);
+        var msgs: std.ArrayListUnmanaged(u8) = .empty;
+        defer msgs.deinit(alloc);
+        msgs.append(alloc, '[') catch return;
+        const sys_q = protocol.jsonQuote(alloc, sys_macro) catch return;
+        defer alloc.free(sys_q);
+        const sys_msg = std.fmt.allocPrint(alloc, "{{\"role\":\"system\",\"content\":{s}}}", .{sys_q}) catch return;
+        defer alloc.free(sys_msg);
+        msgs.appendSlice(alloc, sys_msg) catch return;
+        var history_count: usize = 0;
+        if (store.readFileAlloc(alloc, chat_path)) |hist| {
+            defer alloc.free(hist);
+            var it = std.mem.splitScalar(u8, hist, '\n');
+            while (it.next()) |line_raw| {
+                const line = std.mem.trim(u8, line_raw, " \t\r");
+                if (line.len == 0) continue;
+                var arena2 = std.heap.ArenaAllocator.init(alloc);
+                defer arena2.deinit();
+                const v = std.json.parseFromSlice(std.json.Value, arena2.allocator(), line, .{}) catch continue;
+                if (v.value != .object) continue;
+                if (v.value.object.get("chat_metadata") != null) continue;
+                const mes = if (v.value.object.get("mes")) |m| if (m == .string) m.string else "" else continue;
+                if (mes.len == 0) continue;
+                const is_u = if (v.value.object.get("is_user")) |u| u == .bool and u.bool else false;
+                const role: []const u8 = if (is_u) "user" else "assistant";
+                const mq2 = protocol.jsonQuote(alloc, mes) catch return;
+                defer alloc.free(mq2);
+                const one = std.fmt.allocPrint(alloc, ",{{\"role\":\"{s}\",\"content\":{s}}}", .{ role, mq2 }) catch return;
+                defer alloc.free(one);
+                msgs.appendSlice(alloc, one) catch return;
+                history_count += 1;
+            }
+        } else |_| {}
+        const um_q = protocol.jsonQuote(alloc, user_msg2) catch return;
+        defer alloc.free(um_q);
+        const um_msg = std.fmt.allocPrint(alloc, ",{{\"role\":\"user\",\"content\":{s}}}", .{um_q}) catch return;
+        defer alloc.free(um_msg);
+        msgs.appendSlice(alloc, um_msg) catch return;
+        msgs.append(alloc, ']') catch return;
+        const msgs_json = msgs.toOwnedSlice(alloc) catch return;
+        defer alloc.free(msgs_json);
+        // API key: param > secrets.json > env (never logged, never returned)
+        var ak_owned: ?[]u8 = null;
+        defer if (ak_owned) |a| alloc.free(a);
+        var ak: []const u8 = getStr(req, "api_key") orelse "";
+        if (ak.len == 0) {
+            const spath = std.fs.path.join(alloc, &.{ udir, "secrets.json" }) catch return;
+            defer alloc.free(spath);
+            if (store.readFileAlloc(alloc, spath)) |sec| {
+                defer alloc.free(sec);
+                if (std.json.parseFromSlice(std.json.Value, alloc, sec, .{})) |sp| {
+                    if (sp.value == .object) {
+                        for ([_][]const u8{ "api_key", "openrouter_api_key", "openai_api_key" }) |k| {
+                            if (sp.value.object.get(k)) |v| {
+                                if (v == .string and v.string.len > 0) {
+                                    ak = alloc.dupe(u8, v.string) catch return;
+                                    ak_owned = @constCast(ak);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                } else |_| {}
+            } else |_| {}
+        }
+        if (ak.len == 0) {
+            if (std.posix.getenv("OPENROUTER_API_KEY")) |v| ak = v else if (std.posix.getenv("OPENAI_API_KEY")) |v2| ak = v2;
+        }
+        const native_body = providers_mod.buildNativeBody(alloc, pname, model_name, msgs_json, max_tokens) catch {
+            resp = protocol.encodeErr(alloc, "bad_request") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        defer alloc.free(native_body);
+        const with_stream = std.fmt.allocPrint(alloc, "{s},\"stream\":true}}", .{native_body[0 .. native_body.len - 1]}) catch return;
+        defer alloc.free(with_stream);
+        const url = providers_mod.buildUrl(alloc, prov, getStr(req, "base_url"), getStr(req, "path")) catch return;
+        defer alloc.free(url);
+        var headers_buf: [3]std.http.Header = undefined;
+        headers_buf[0] = .{ .name = "Content-Type", .value = "application/json" };
+        var auth_val: ?[]u8 = null;
+        defer if (auth_val) |av| alloc.free(av);
+        var nheaders: usize = 1;
+        if (prov.auth_header.len > 0 and ak.len > 0) {
+            auth_val = std.fmt.allocPrint(alloc, "{s}{s}", .{ prov.auth_prefix, ak }) catch return;
+            headers_buf[1] = .{ .name = prov.auth_header, .value = auth_val.? };
+            nheaders = 2;
+            if (std.mem.eql(u8, pname, "anthropic")) {
+                headers_buf[2] = .{ .name = "anthropic-version", .value = "2023-06-01" };
+                nheaders = 3;
+            }
+        }
+        const fetched = backend.fetchUrlHeaders(alloc, url, "POST", with_stream, headers_buf[0..nheaders]) catch {
+            resp = protocol.encodeErr(alloc, "backend_unreachable") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        defer alloc.free(fetched.body);
+        if (fetched.status < 200 or fetched.status >= 300) {
+            const inner = std.fmt.allocPrint(alloc, "{{\"provider\":\"{s}\",\"status\":{d},\"error\":\"provider_error\"}}", .{ prov.name, fetched.status }) catch return;
+            defer alloc.free(inner);
+            resp = protocol.encodeOk(alloc, inner) catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        }
+        // Parse SSE deltas (OpenAI-compatible)
+        var full: std.ArrayListUnmanaged(u8) = .empty;
+        defer full.deinit(alloc);
+        var pos: usize = 0;
+        while (pos < fetched.body.len) {
+            const data_idx = std.mem.indexOf(u8, fetched.body[pos..], "data:") orelse break;
+            const line_start = pos + data_idx + 5;
+            const line_end = std.mem.indexOfScalar(u8, fetched.body[line_start..], '\n') orelse fetched.body.len;
+            const payload = std.mem.trim(u8, fetched.body[line_start .. line_start + line_end], " \r");
+            pos = line_start + line_end;
+            if (std.mem.eql(u8, payload, "[DONE]")) break;
+            if (payload.len == 0) continue;
+            if (std.json.parseFromSlice(std.json.Value, alloc, payload, .{})) |parsed| {
+                if (parsed.value == .object) {
+                    if (parsed.value.object.get("choices")) |ch| {
+                        if (ch == .array and ch.array.items.len > 0) {
+                            const f = ch.array.items[0];
+                            if (f == .object) {
+                                if (f.object.get("delta")) |d| {
+                                    if (d == .object) {
+                                        if (d.object.get("content")) |c| {
+                                            if (c == .string) full.appendSlice(alloc, c.string) catch return;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } else |_| {}
+        }
+        const text = full.toOwnedSlice(alloc) catch return;
+        defer alloc.free(text);
+        // Save user + assistant turns, then reload
+        const uq = protocol.jsonQuote(alloc, user_msg2) catch return;
+        defer alloc.free(uq);
+        const aq = protocol.jsonQuote(alloc, text) catch return;
+        defer alloc.free(aq);
+        const nq = protocol.jsonQuote(alloc, display_name) catch return;
+        defer alloc.free(nq);
+        var existing: []u8 = alloc.dupe(u8, "") catch return;
+        defer alloc.free(existing);
+        if (store.readFileAlloc(alloc, chat_path)) |ex| {
+            alloc.free(existing);
+            existing = ex;
+        } else |_| {}
+        var to_write: std.ArrayListUnmanaged(u8) = .empty;
+        defer to_write.deinit(alloc);
+        to_write.appendSlice(alloc, existing) catch return;
+        if (existing.len == 0) {
+            const meta = std.fmt.allocPrint(alloc, "{{\"chat_metadata\":{{}},\"user_name\":\"User\",\"character_name\":{s},\"avatar\":\"{s}.png\",\"create_date\":\"\"}}\n", .{ nq, ch_name }) catch return;
+            defer alloc.free(meta);
+            to_write.appendSlice(alloc, meta) catch return;
+        }
+        const uline = std.fmt.allocPrint(alloc, "{{\"name\":\"User\",\"is_user\":true,\"mes\":{s},\"send_date\":\"\"}}\n", .{uq}) catch return;
+        defer alloc.free(uline);
+        to_write.appendSlice(alloc, uline) catch return;
+        const aline = std.fmt.allocPrint(alloc, "{{\"name\":{s},\"is_user\":false,\"mes\":{s},\"send_date\":\"\"}}\n", .{ nq, aq }) catch return;
+        defer alloc.free(aline);
+        to_write.appendSlice(alloc, aline) catch return;
+        store.writeAtomic(chat_path, to_write.items) catch {
+            resp = protocol.encodeErr(alloc, "io_error") catch return;
+            defer alloc.free(resp);
+            _ = posix.write(conn, resp) catch {};
+            return;
+        };
+        const reloaded = store.readFileAlloc(alloc, chat_path) catch return;
+        defer alloc.free(reloaded);
+        const arr = jsonlToArray(alloc, reloaded) catch return;
+        defer alloc.free(arr);
+        const tq = protocol.jsonQuote(alloc, text) catch return;
+        defer alloc.free(tq);
+        const inner = std.fmt.allocPrint(alloc, "{{\"text\":{s},\"provider\":\"{s}\",\"model\":\"{s}\",\"saved\":true,\"history\":{d},\"messages\":{s}}}", .{ tq, prov.name, model_name, history_count, arr }) catch return;
+        defer alloc.free(inner);
+        resp = protocol.encodeOk(alloc, inner) catch return;
     } else if (std.mem.eql(u8, req.method, "backend.stream")) {
         // Streaming SDK flow: SSE deltas accumulated into full text.
         const pname = getStr(req, "provider") orelse "openai";

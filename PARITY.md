@@ -16,7 +16,7 @@ Checklist: not started / implemented / tested. Detail per feature in `docs/parit
 Deliberate differences (Stage 0): token is a local-machine secret, not SillyTavern's multi-user account session (upstream `enable_accounts` is off by default); HTTP body format for errors is `{"error":...}` with 400, matching JS `sendStatus` class.
 
 ## Stage 1 — one complete chat path (console end-to-end)
-- [ ] not started: load character card → build prompt (upstream method) → stream reply from OpenAI-compatible backend → save chat → reload, via `st-client` only.
+- [x] implemented+tested: `chat.turn` — loads character card (`description`/`personality`/`scenario`/`system_prompt`), builds system prompt in upstream order, `{{char}}`/`{{user}}` macros, history from chat JSONL, streams reply (SSE `stream:true`, OpenAI-compatible deltas), saves user+assistant turns, returns reloaded messages. API key: `api_key` param > `secrets.json` > `OPENROUTER_API_KEY`/`OPENAI_API_KEY` env (never logged/returned). Verified vs mock SSE backend and live OpenRouter (`openai/gpt-4o-mini`): turn 1 "Well met, noble friend!…", turn 2 history carried (`history:2`), reload shows 5 messages. `tests/run.sh` covers mock e2e + reload; live key test guarded by `OPENROUTER_API_KEY` env (server must inherit it).
 
 ## Stage 2 — prompt engine parity
 - [ ] not started: `{{char}}`/`{{user}}` macros, context/instruct templates, prompt manager, author's note, World Info scanning during generation, prompt preview.

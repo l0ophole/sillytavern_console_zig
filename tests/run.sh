@@ -344,6 +344,34 @@ python3 $TMP/opencode/mock_openai.py > $TMP/opencode/o.log 2>&1 & echo $! > $TMP
 sleep 1
 ./zig-out/bin/st-client --port $PORT chat.generate_and_save '{"provider":"openai","model":"gpt-4","api_key":"k","base_url":"http://127.0.0.1:18140","path":"/v1/chat/completions","messages":[{"role":"user","content":"hi"}],"character":"Alice","chat":"main"}' | grep -q 'Hi from OpenAI' && echo PASS
 kill $(cat $TMP/opencode/o.pid) 2>/dev/null || true
+echo "== chat.turn end-to-end (card -> prompt -> SSE -> save -> reload) =="
+cat > $TMP/opencode/mock_turn.py <<'PYEOF'
+import json
+from http.server import BaseHTTPRequestHandler, HTTPServer
+class H(BaseHTTPRequestHandler):
+    def do_POST(self):
+        ln=int(self.headers.get('Content-Length',0)); body=self.rfile.read(ln)
+        req=json.loads(body)
+        assert 'brave knight' in req['messages'][0]['content'], req['messages'][0]
+        out=b""
+        for c in ["Hello ","there!"]:
+            out+=b"data: "+json.dumps({"choices":[{"delta":{"content":c}}]}).encode()+b"\n\n"
+        out+=b"data: [DONE]\n\n"
+        self.send_response(200); self.send_header('Content-Type','text/event-stream'); self.send_header('Content-Length',str(len(out))); self.end_headers(); self.wfile.write(out)
+    def log_message(self,*a): pass
+HTTPServer(('127.0.0.1',18141),H).handle_request()
+PYEOF
+python3 $TMP/opencode/mock_turn.py > $TMP/opencode/turn.log 2>&1 & echo $! > $TMP/opencode/turn.pid
+sleep 1
+./zig-out/bin/st-client --port $PORT characters.create '{"name":"Alice","character":{"name":"Alice","description":"A brave knight.","personality":"Cheerful","scenario":"In a tavern"}}' | grep -q '"saved"' && echo PASS
+./zig-out/bin/st-client --port $PORT chat.turn '{"character":"Alice","chat":"turnchat","user_message":"Greetings {{char}}!","provider":"openai","model":"gpt-4","base_url":"http://127.0.0.1:18141","path":"/v1/chat/completions","api_key":"k"}' | grep -q 'Hello there!' && echo PASS_TURN
+./zig-out/bin/st-client --port $PORT chats.load '{"character":"Alice","chat":"turnchat"}' | grep -q 'Greetings Alice!' && echo PASS_TURN_RELOAD
+kill $(cat $TMP/opencode/turn.pid) 2>/dev/null || true
+if [ -n "${OPENROUTER_API_KEY:-}" ]; then
+  ./zig-out/bin/st-client --port $PORT chat.turn '{"character":"Alice","chat":"realchat","user_message":"Reply with one short word.","provider":"openrouter","model":"openai/gpt-4o-mini"}' | grep -q '"saved":true' && echo PASS_TURN_REAL
+else
+  echo SKIP_NO_OPENROUTER_KEY
+fi
 echo "== web UI HTTP =="
 curl -s http://127.0.0.1:$PORT/api/health | grep -q '"pong":true' && echo PASS
 ST_WEB_ROOT=../SillyTavern/public curl -s http://127.0.0.1:$PORT/ > $TMP/opencode/webui.html 2>/dev/null || true
