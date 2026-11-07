@@ -333,37 +333,117 @@ pub fn buildNativeBody(alloc: std.mem.Allocator, provider_name: []const u8, mode
         } else {
             try out.appendSlice(alloc, "{\"contents\":[");
         }
-        var first = true;
+        var conv: std.ArrayListUnmanaged(struct { role: []const u8, parts: std.ArrayListUnmanaged([]u8) }) = .empty;
+        defer {
+            for (conv.items) |*c| {
+                for (c.parts.items) |b| alloc.free(b);
+                c.parts.deinit(alloc);
+            }
+            conv.deinit(alloc);
+        }
         for (msgs[sys_end..]) |m| {
             var role: []const u8 = "user";
-            var content: []const u8 = "";
             var name: []const u8 = "";
+            var content_val: ?std.json.Value = null;
             if (m == .object) {
                 if (m.object.get("role")) |r| {
                     if (r == .string) role = r.string;
                 }
-                if (m.object.get("content")) |c| {
-                    if (c == .string) content = c.string;
-                }
+                if (m.object.get("content")) |c| content_val = c;
                 if (m.object.get("name")) |n| {
                     if (n == .string) name = n.string;
                 }
             }
             const crole: []const u8 = if (std.mem.eql(u8, role, "assistant")) "model" else "user";
-            var text = content;
-            var prefixed: ?[]u8 = null;
-            defer if (prefixed) |p| alloc.free(p);
-            if (name.len > 0 and !std.mem.startsWith(u8, content, name)) {
-                prefixed = try std.fmt.allocPrint(alloc, "{s}: {s}", .{ name, content });
-                text = prefixed.?;
+            var parts: std.ArrayListUnmanaged([]u8) = .empty;
+            if (content_val) |cv| {
+                if (cv == .string) {
+                    var text = cv.string;
+                    var prefixed: ?[]u8 = null;
+                    defer if (prefixed) |p| alloc.free(p);
+                    if (name.len > 0 and !std.mem.startsWith(u8, cv.string, name)) {
+                        prefixed = try std.fmt.allocPrint(alloc, "{s}: {s}", .{ name, cv.string });
+                        text = prefixed.?;
+                    }
+                    const eq = try jsonEscaped(alloc, text);
+                    defer alloc.free(eq);
+                    const one = try std.fmt.allocPrint(alloc, "{{\"text\":\"{s}\"}}", .{eq});
+                    try parts.append(alloc, one);
+                } else if (cv == .array) {
+                    for (cv.array.items) |part| {
+                        if (part != .object) continue;
+                        const ptype = if (part.object.get("type")) |t| if (t == .string) t.string else "" else "";
+                        if (std.mem.eql(u8, ptype, "text")) {
+                            var t: []const u8 = "";
+                            if (part.object.get("text")) |tv| {
+                                if (tv == .string) t = tv.string;
+                            }
+                            var text = t;
+                            var prefixed: ?[]u8 = null;
+                            defer if (prefixed) |p| alloc.free(p);
+                            if (name.len > 0 and t.len > 0 and !std.mem.startsWith(u8, t, name)) {
+                                prefixed = try std.fmt.allocPrint(alloc, "{s}: {s}", .{ name, t });
+                                text = prefixed.?;
+                            }
+                            const eq = try jsonEscaped(alloc, text);
+                            defer alloc.free(eq);
+                            const one = try std.fmt.allocPrint(alloc, "{{\"text\":\"{s}\"}}", .{eq});
+                            try parts.append(alloc, one);
+                        } else if (std.mem.eql(u8, ptype, "image_url")) {
+                            var url: []const u8 = "";
+                            if (part.object.get("image_url")) |iu| {
+                                if (iu == .object) {
+                                    if (iu.object.get("url")) |u| {
+                                        if (u == .string) url = u.string;
+                                    }
+                                }
+                            }
+                            if (std.mem.startsWith(u8, url, "data:")) {
+                                if (std.mem.indexOfScalar(u8, url, ',')) |ci| {
+                                    const header = url[0..ci];
+                                    const data_b64 = url[ci + 1 ..];
+                                    var mimetype: []const u8 = "image/png";
+                                    if (std.mem.indexOfScalar(u8, header, ';')) |si| {
+                                        const mtype = header[5..si];
+                                        if (mtype.len > 0) mimetype = mtype;
+                                    } else if (header.len > 5) {
+                                        mimetype = header[5..];
+                                    }
+                                    const eq_data = try jsonEscaped(alloc, data_b64);
+                                    defer alloc.free(eq_data);
+                                    const eq_mt = try jsonEscaped(alloc, mimetype);
+                                    defer alloc.free(eq_mt);
+                                    const one = try std.fmt.allocPrint(alloc, "{{\"inlineData\":{{\"mimeType\":\"{s}\",\"data\":\"{s}\"}}}}", .{ eq_mt, eq_data });
+                                    try parts.append(alloc, one);
+                                }
+                            }
+                        }
+                    }
+                }
             }
-            const eq = try jsonEscaped(alloc, text);
-            defer alloc.free(eq);
+            // Merge consecutive same-role (upstream loop).
+            if (conv.items.len > 0 and std.mem.eql(u8, conv.items[conv.items.len - 1].role, crole)) {
+                for (parts.items) |b| try conv.items[conv.items.len - 1].parts.append(alloc, b);
+                parts.deinit(alloc);
+            } else {
+                try conv.append(alloc, .{ .role = crole, .parts = parts });
+            }
+        }
+        var first = true;
+        for (conv.items) |c| {
             if (!first) try out.append(alloc, ',');
             first = false;
-            const part = try std.fmt.allocPrint(alloc, "{{\"role\":\"{s}\",\"parts\":[{{\"text\":\"{s}\"}}]}}", .{ crole, eq });
-            defer alloc.free(part);
-            try out.appendSlice(alloc, part);
+            var arr: std.ArrayListUnmanaged(u8) = .empty;
+            defer arr.deinit(alloc);
+            try arr.append(alloc, '[');
+            for (c.parts.items, 0..) |b, idx| {
+                if (idx > 0) try arr.append(alloc, ',');
+                try arr.appendSlice(alloc, b);
+            }
+            try arr.append(alloc, ']');
+            const one = try std.fmt.allocPrint(alloc, "{{\"role\":\"{s}\",\"parts\":{s}}}", .{ c.role, arr.items });
+            defer alloc.free(one);
+            try out.appendSlice(alloc, one);
         }
         try out.appendSlice(alloc, "]}");
         return out.toOwnedSlice(alloc);
@@ -719,6 +799,31 @@ test "anthropic image_url conversion" {
     try std.testing.expectEqualStrings("base64", source.object.get("type").?.string);
     try std.testing.expectEqualStrings("image/png", source.object.get("media_type").?.string);
     try std.testing.expectEqualStrings("iVBORw0=", source.object.get("data").?.string);
+}
+
+test "google image_url conversion" {
+    // RED: upstream convertGooglePrompt addDataUrlPart maps image_url data-URLs
+    // to {inlineData:{mimeType,data}} parts.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const msgs = "[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"what is this\"},{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,iVBORw0=\"}}]}]";
+    const body = try buildNativeBody(alloc, "google", "gemini-pro", msgs, 100);
+    defer alloc.free(body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .object);
+    const contents = parsed.value.object.get("contents").?;
+    try std.testing.expect(contents == .array);
+    try std.testing.expectEqual(@as(usize, 1), contents.array.items.len);
+    const parts = contents.array.items[0].object.get("parts").?;
+    try std.testing.expect(parts == .array);
+    try std.testing.expectEqual(@as(usize, 2), parts.array.items.len);
+    try std.testing.expectEqualStrings("what is this", parts.array.items[0].object.get("text").?.string);
+    const inline_data = parts.array.items[1].object.get("inlineData").?;
+    try std.testing.expect(inline_data == .object);
+    try std.testing.expectEqualStrings("image/png", inline_data.object.get("mimeType").?.string);
+    try std.testing.expectEqualStrings("iVBORw0=", inline_data.object.get("data").?.string);
 }
 
 test "appendSseDeltas extracts incremental deltas" {
