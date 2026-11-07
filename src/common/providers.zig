@@ -85,7 +85,9 @@ pub fn buildNativeBody(alloc: std.mem.Allocator, provider_name: []const u8, mode
         return std.fmt.allocPrint(alloc, "{{\"prompt\":\"{s}\",\"max_length\":{s}}}", .{ eq, mt });
     }
     if (std.mem.eql(u8, provider_name, "anthropic")) {
-        // Anthropic: {model, max_tokens, messages}
+        // Anthropic per upstream convertClaudeMessages (prompt-converters.js):
+        // leading system -> system:[{type:text,text}]; rest system->user;
+        // string content -> [{type:text,text}] with name prefix.
         const mq = try std.json.parseFromSlice(std.json.Value, alloc, messages_json, .{});
         const msgs = if (mq.value == .array) mq.value.array.items else &[_]std.json.Value{};
         var out: std.ArrayListUnmanaged(u8) = .empty;
@@ -98,51 +100,145 @@ pub fn buildNativeBody(alloc: std.mem.Allocator, provider_name: []const u8, mode
         const mt = try std.fmt.allocPrint(alloc, "{d}", .{max_tokens});
         defer alloc.free(mt);
         try out.appendSlice(alloc, mt);
-        try out.appendSlice(alloc, ",\"messages\":[");
-        for (msgs, 0..) |m, idx| {
-            if (idx > 0) try out.append(alloc, ',');
-            // Serialize each message via Stringify
-            var tmp: std.Io.Writer.Allocating = .init(alloc);
-            defer tmp.deinit();
-            var s: std.json.Stringify = .{ .writer = &tmp.writer };
-            try s.write(m);
-            try out.appendSlice(alloc, tmp.written());
-        }
-        try out.appendSlice(alloc, "]}");
-        return out.toOwnedSlice(alloc);
-    } else if (std.mem.eql(u8, provider_name, "google")) {
-        // Google: {contents:[{role, parts:[{text}]}]}
-        const mq = try std.json.parseFromSlice(std.json.Value, alloc, messages_json, .{});
-        const msgs = if (mq.value == .array) mq.value.array.items else &[_]std.json.Value{};
-        var out: std.ArrayListUnmanaged(u8) = .empty;
-        defer out.deinit(alloc);
-        try out.appendSlice(alloc, "{\"contents\":[");
-        for (msgs, 0..) |m, idx| {
-            if (idx > 0) try out.append(alloc, ',');
-            var role: []const u8 = "user";
+        // Collect leading system texts (string content only).
+        var sys_end: usize = 0;
+        while (sys_end < msgs.len) {
+            const m = msgs[sys_end];
+            var is_sys = false;
             var content: []const u8 = "";
             if (m == .object) {
                 if (m.object.get("role")) |r| {
-                    if (r == .string) role = if (std.mem.eql(u8, r.string, "assistant")) "model" else "user";
+                    if (r == .string and std.mem.eql(u8, r.string, "system")) is_sys = true;
                 }
                 if (m.object.get("content")) |c| {
                     if (c == .string) content = c.string;
                 }
             }
-            // escape quotes in content for JSON (simple: replace " with \")
-            var esc: std.ArrayListUnmanaged(u8) = .empty;
-            defer esc.deinit(alloc);
-            for (content) |ch| {
-                if (ch == '"' or ch == '\\') try esc.append(alloc, '\\');
-                if (ch == '\n') {
-                    try esc.appendSlice(alloc, "\\n");
-                } else {
-                    try esc.append(alloc, ch);
+            if (!is_sys) break;
+            sys_end += 1;
+        }
+        if (sys_end > 0) {
+            try out.appendSlice(alloc, ",\"system\":[");
+            for (msgs[0..sys_end], 0..) |m, idx| {
+                if (idx > 0) try out.append(alloc, ',');
+                var content: []const u8 = "";
+                if (m == .object) {
+                    if (m.object.get("content")) |c| {
+                        if (c == .string) content = c.string;
+                    }
+                }
+                const eq = try jsonEscaped(alloc, content);
+                defer alloc.free(eq);
+                const one = try std.fmt.allocPrint(alloc, "{{\"type\":\"text\",\"text\":\"{s}\"}}", .{eq});
+                defer alloc.free(one);
+                try out.appendSlice(alloc, one);
+            }
+            try out.appendSlice(alloc, "]");
+        }
+        try out.appendSlice(alloc, ",\"messages\":[");
+        var first = true;
+        for (msgs[sys_end..]) |m| {
+            var role: []const u8 = "user";
+            var content: []const u8 = "";
+            var name: []const u8 = "";
+            if (m == .object) {
+                if (m.object.get("role")) |r| {
+                    if (r == .string) role = r.string;
+                }
+                if (m.object.get("content")) |c| {
+                    if (c == .string) content = c.string;
+                }
+                if (m.object.get("name")) |n| {
+                    if (n == .string) name = n.string;
                 }
             }
-            const eq = try esc.toOwnedSlice(alloc);
+            const crole = if (std.mem.eql(u8, role, "system")) "user" else role;
+            var text = content;
+            var prefixed: ?[]u8 = null;
+            defer if (prefixed) |p| alloc.free(p);
+            if (name.len > 0 and !std.mem.startsWith(u8, content, name)) {
+                prefixed = try std.fmt.allocPrint(alloc, "{s}: {s}", .{ name, content });
+                text = prefixed.?;
+            }
+            const eq = try jsonEscaped(alloc, text);
             defer alloc.free(eq);
-            const part = try std.fmt.allocPrint(alloc, "{{\"role\":\"{s}\",\"parts\":[{{\"text\":\"{s}\"}}]}}", .{ role, eq });
+            if (!first) try out.append(alloc, ',');
+            first = false;
+            const one = try std.fmt.allocPrint(alloc, "{{\"role\":\"{s}\",\"content\":[{{\"type\":\"text\",\"text\":\"{s}\"}}]}}", .{ crole, eq });
+            defer alloc.free(one);
+            try out.appendSlice(alloc, one);
+        }
+        try out.appendSlice(alloc, "]}");
+        return out.toOwnedSlice(alloc);
+    } else if (std.mem.eql(u8, provider_name, "google")) {
+        // Google per upstream convertGooglePrompt (prompt-converters.js):
+        // leading system (while len>1) -> systemInstruction:{parts:[{text}]};
+        // remaining system/tool->user, assistant->model.
+        const mq = try std.json.parseFromSlice(std.json.Value, alloc, messages_json, .{});
+        const msgs = if (mq.value == .array) mq.value.array.items else &[_]std.json.Value{};
+        var sys_end: usize = 0;
+        while (sys_end + 1 < msgs.len) {
+            const m = msgs[sys_end];
+            var is_sys = false;
+            if (m == .object) {
+                if (m.object.get("role")) |r| {
+                    if (r == .string and std.mem.eql(u8, r.string, "system")) is_sys = true;
+                }
+            }
+            if (!is_sys) break;
+            sys_end += 1;
+        }
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        defer out.deinit(alloc);
+        if (sys_end > 0) {
+            try out.appendSlice(alloc, "{\"systemInstruction\":{\"parts\":[");
+            for (msgs[0..sys_end], 0..) |m, idx| {
+                if (idx > 0) try out.append(alloc, ',');
+                var content: []const u8 = "";
+                if (m == .object) {
+                    if (m.object.get("content")) |c| {
+                        if (c == .string) content = c.string;
+                    }
+                }
+                const eq = try jsonEscaped(alloc, content);
+                defer alloc.free(eq);
+                const one = try std.fmt.allocPrint(alloc, "{{\"text\":\"{s}\"}}", .{eq});
+                defer alloc.free(one);
+                try out.appendSlice(alloc, one);
+            }
+            try out.appendSlice(alloc, "]},\"contents\":[");
+        } else {
+            try out.appendSlice(alloc, "{\"contents\":[");
+        }
+        var first = true;
+        for (msgs[sys_end..]) |m| {
+            var role: []const u8 = "user";
+            var content: []const u8 = "";
+            var name: []const u8 = "";
+            if (m == .object) {
+                if (m.object.get("role")) |r| {
+                    if (r == .string) role = r.string;
+                }
+                if (m.object.get("content")) |c| {
+                    if (c == .string) content = c.string;
+                }
+                if (m.object.get("name")) |n| {
+                    if (n == .string) name = n.string;
+                }
+            }
+            const crole: []const u8 = if (std.mem.eql(u8, role, "assistant")) "model" else "user";
+            var text = content;
+            var prefixed: ?[]u8 = null;
+            defer if (prefixed) |p| alloc.free(p);
+            if (name.len > 0 and !std.mem.startsWith(u8, content, name)) {
+                prefixed = try std.fmt.allocPrint(alloc, "{s}: {s}", .{ name, content });
+                text = prefixed.?;
+            }
+            const eq = try jsonEscaped(alloc, text);
+            defer alloc.free(eq);
+            if (!first) try out.append(alloc, ',');
+            first = false;
+            const part = try std.fmt.allocPrint(alloc, "{{\"role\":\"{s}\",\"parts\":[{{\"text\":\"{s}\"}}]}}", .{ crole, eq });
             defer alloc.free(part);
             try out.appendSlice(alloc, part);
         }
@@ -338,6 +434,62 @@ test "provider table" {
     const k = getProvider("kobold").?;
     try std.testing.expectEqualStrings("", k.auth_header);
     try std.testing.expect(getProvider("nonexistent") == null);
+}
+
+test "anthropic system extraction" {
+    // RED: upstream convertClaudeMessages extracts leading system messages
+    // into system:[{type:text,text}] and normalizes string content to blocks.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const msgs = "[{\"role\":\"system\",\"content\":\"Be kind\"},{\"role\":\"user\",\"content\":\"hi\"},{\"role\":\"system\",\"content\":\"mid note\"},{\"role\":\"assistant\",\"content\":\"hello\"}]";
+    const body = try buildNativeBody(alloc, "anthropic", "claude-3", msgs, 100);
+    defer alloc.free(body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .object);
+    try std.testing.expect(parsed.value.object.get("system") != null);
+    const sys = parsed.value.object.get("system").?;
+    try std.testing.expect(sys == .array);
+    try std.testing.expectEqual(@as(usize, 1), sys.array.items.len);
+    try std.testing.expectEqualStrings("Be kind", sys.array.items[0].object.get("text").?.string);
+    try std.testing.expectEqualStrings("text", sys.array.items[0].object.get("type").?.string);
+    const out_msgs = parsed.value.object.get("messages").?;
+    try std.testing.expect(out_msgs == .array);
+    // leading system removed; mid system converted to user; string content normalized
+    try std.testing.expectEqual(@as(usize, 3), out_msgs.array.items.len);
+    try std.testing.expectEqualStrings("user", out_msgs.array.items[0].object.get("role").?.string);
+    try std.testing.expectEqualStrings("user", out_msgs.array.items[1].object.get("role").?.string);
+    try std.testing.expectEqualStrings("assistant", out_msgs.array.items[2].object.get("role").?.string);
+    const c0 = out_msgs.array.items[0].object.get("content").?;
+    try std.testing.expect(c0 == .array);
+    try std.testing.expectEqualStrings("hi", c0.array.items[0].object.get("text").?.string);
+}
+
+test "google systemInstruction extraction" {
+    // RED: upstream convertGooglePrompt extracts leading system into
+    // systemInstruction:{parts:[{text}]} and maps roles.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const msgs = "[{\"role\":\"system\",\"content\":\"Be kind\"},{\"role\":\"user\",\"content\":\"hi\"},{\"role\":\"assistant\",\"content\":\"hello\"}]";
+    const body = try buildNativeBody(alloc, "google", "gemini-pro", msgs, 100);
+    defer alloc.free(body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .object);
+    try std.testing.expect(parsed.value.object.get("systemInstruction") != null);
+    const si = parsed.value.object.get("systemInstruction").?;
+    try std.testing.expect(si == .object);
+    const parts = si.object.get("parts").?;
+    try std.testing.expect(parts == .array);
+    try std.testing.expectEqual(@as(usize, 1), parts.array.items.len);
+    try std.testing.expectEqualStrings("Be kind", parts.array.items[0].object.get("text").?.string);
+    const contents = parsed.value.object.get("contents").?;
+    try std.testing.expect(contents == .array);
+    try std.testing.expectEqual(@as(usize, 2), contents.array.items.len);
+    try std.testing.expectEqualStrings("user", contents.array.items[0].object.get("role").?.string);
+    try std.testing.expectEqualStrings("model", contents.array.items[1].object.get("role").?.string);
 }
 
 test "buildUrl" {

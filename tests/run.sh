@@ -156,6 +156,36 @@ python3 $TMP/opencode/mock_anthropic2.py > $TMP/opencode/mock2.log 2>&1 & echo $
 sleep 1
 ./zig-out/bin/st-client --port $PORT backend.native '{"provider":"anthropic","model":"claude-3","api_key":"k","base_url":"http://127.0.0.1:18121","path":"/v1/messages","messages":[{"role":"user","content":"hi"}]}' | grep -q 'mocked' && echo PASS || echo FAIL_NATIVE
 kill $(cat $TMP/opencode/mock2.pid) 2>/dev/null || true
+echo "== anthropic/google system parity =="
+cat > $TMP/opencode/mock_syscheck.py <<'PYEOF'
+import json, sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+class H(BaseHTTPRequestHandler):
+    def do_POST(self):
+        ln=int(self.headers.get('Content-Length',0)); body=self.rfile.read(ln)
+        req=json.loads(body)
+        if self.path=='/v1/messages':
+            sysv=req.get('system')
+            assert sysv and sysv[0].get('text')=='sys-text', req
+            assert req['messages'][0]['role']=='user', req
+            assert req['messages'][0]['content'][0].get('text')=='hi', req
+            data=json.dumps({"content":[{"text":"sys-ok"}]}).encode()
+        elif self.path=='/v1beta/models/gemini-pro:generateContent':
+            assert req.get('systemInstruction',{}).get('parts',[{}])[0].get('text')=='sys-text', req
+            assert req['contents'][0]['role']=='user', req
+            data=json.dumps({"candidates":[{"content":{"parts":[{"text":"goog-ok"}]}}]}).encode()
+        else:
+            self.send_response(404); self.end_headers(); return
+        self.send_response(200); self.send_header('Content-Type','application/json'); self.send_header('Content-Length',str(len(data))); self.end_headers(); self.wfile.write(data)
+    def log_message(self,*a): pass
+from http.server import ThreadingHTTPServer
+ThreadingHTTPServer(('127.0.0.1',18146),H).serve_forever()
+PYEOF
+python3 $TMP/opencode/mock_syscheck.py > $TMP/opencode/syscheck.log 2>&1 & echo $! > $TMP/opencode/syscheck.pid
+sleep 1
+./zig-out/bin/st-client --port $PORT backend.native '{"provider":"anthropic","model":"claude-3","api_key":"k","base_url":"http://127.0.0.1:18146","path":"/v1/messages","messages":[{"role":"system","content":"sys-text"},{"role":"user","content":"hi"}]}' | grep -q 'sys-ok' && echo PASS_SYS_ANTHROPIC
+./zig-out/bin/st-client --port $PORT backend.native '{"provider":"google","model":"gemini-pro","api_key":"k","base_url":"http://127.0.0.1:18146","path":"/v1beta/models/gemini-pro:generateContent","messages":[{"role":"system","content":"sys-text"},{"role":"user","content":"hi"}]}' | grep -q 'goog-ok' && echo PASS_SYS_GOOGLE
+kill $(cat $TMP/opencode/syscheck.pid) 2>/dev/null || true
 echo "== multi-model tokenizer =="
 curl -sL -o $TMP/opencode/p50k_base.tiktoken https://openaipublic.blob.core.windows.net/encodings/p50k_base.tiktoken 2>/dev/null || true
 if [ -s $TMP/opencode/p50k_base.tiktoken ]; then
