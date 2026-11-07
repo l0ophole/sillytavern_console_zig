@@ -162,9 +162,74 @@ pub fn buildNativeBody(alloc: std.mem.Allocator, provider_name: []const u8, mode
                     if (n == .string) name = n.string;
                 }
             }
-            const crole = if (std.mem.eql(u8, role, "system")) "user" else role;
+            const crole_raw = role;
+            const crole = if (std.mem.eql(u8, role, "system") or std.mem.eql(u8, role, "tool")) "user" else role;
             var blocks: std.ArrayListUnmanaged([]u8) = .empty;
-            if (content_val) |cv| {
+            // Tool conversions per upstream prompt-converters.js.
+            if (std.mem.eql(u8, crole_raw, "tool")) {
+                var tc_id: []const u8 = "";
+                var t_content: []const u8 = "";
+                if (m == .object) {
+                    if (m.object.get("tool_call_id")) |v| {
+                        if (v == .string) tc_id = v.string;
+                    }
+                    if (m.object.get("content")) |v| {
+                        if (v == .string) t_content = v.string;
+                    }
+                }
+                const eq_id = try jsonEscaped(alloc, tc_id);
+                defer alloc.free(eq_id);
+                const eq_c = try jsonEscaped(alloc, t_content);
+                defer alloc.free(eq_c);
+                const one = try std.fmt.allocPrint(alloc, "{{\"type\":\"tool_result\",\"tool_use_id\":\"{s}\",\"content\":\"{s}\"}}", .{ eq_id, eq_c });
+                try blocks.append(alloc, one);
+            } else if (std.mem.eql(u8, crole_raw, "assistant") and m == .object and m.object.get("tool_calls") != null) {
+                const tcs = m.object.get("tool_calls").?;
+                if (tcs == .array) {
+                    for (tcs.array.items) |tc| {
+                        if (tc != .object) continue;
+                        var tc_id: []const u8 = "";
+                        var fn_name: []const u8 = "";
+                        var fn_args: []const u8 = "{}";
+                        if (tc.object.get("id")) |v| {
+                            if (v == .string) tc_id = v.string;
+                        }
+                        if (tc.object.get("function")) |fnv| {
+                            if (fnv == .object) {
+                                if (fnv.object.get("name")) |v| {
+                                    if (v == .string) fn_name = v.string;
+                                }
+                                if (fnv.object.get("arguments")) |v| {
+                                    if (v == .string) fn_args = v.string;
+                                }
+                            }
+                        }
+                        const eq_id = try jsonEscaped(alloc, tc_id);
+                        defer alloc.free(eq_id);
+                        const eq_name = try jsonEscaped(alloc, fn_name);
+                        defer alloc.free(eq_name);
+                        // Parse arguments JSON (upstream parse); fallback {}.
+                        var input_json: []u8 = undefined;
+                        if (std.json.parseFromSlice(std.json.Value, alloc, fn_args, .{})) |parsed_args| {
+                            var tmp: std.Io.Writer.Allocating = .init(alloc);
+                            defer tmp.deinit();
+                            var s: std.json.Stringify = .{ .writer = &tmp.writer };
+                            try s.write(parsed_args.value);
+                            input_json = try alloc.dupe(u8, tmp.written());
+                            parsed_args.deinit();
+                        } else |_| {
+                            input_json = try alloc.dupe(u8, "{}");
+                        }
+                        defer alloc.free(input_json);
+                        const one = try std.fmt.allocPrint(alloc, "{{\"type\":\"tool_use\",\"id\":\"{s}\",\"name\":\"{s}\",\"input\":{s}}}", .{ eq_id, eq_name, input_json });
+                        try blocks.append(alloc, one);
+                    }
+                }
+                if (blocks.items.len == 0) {
+                    const one = try alloc.dupe(u8, "{\"type\":\"text\",\"text\":\"\"}");
+                    try blocks.append(alloc, one);
+                }
+            } else if (content_val) |cv| {
                 if (cv == .string) {
                     var text = cv.string;
                     var prefixed: ?[]u8 = null;
@@ -824,6 +889,42 @@ test "google image_url conversion" {
     try std.testing.expect(inline_data == .object);
     try std.testing.expectEqualStrings("image/png", inline_data.object.get("mimeType").?.string);
     try std.testing.expectEqualStrings("iVBORw0=", inline_data.object.get("data").?.string);
+}
+
+test "anthropic tool_use/tool_result conversion" {
+    // RED: upstream convertClaudeMessages maps assistant tool_calls ->
+    // {type:tool_use,id,name,input} (args JSON-parsed) and tool role ->
+    // user {type:tool_result,tool_use_id,content}.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const msgs = "[{\"role\":\"user\",\"content\":\"hi\"},{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"id\":\"call_1\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{\\\"city\\\":\\\"Paris\\\"}\"}}]},{\"role\":\"tool\",\"tool_call_id\":\"call_1\",\"content\":\"sunny\"}]";
+    const body = try buildNativeBody(alloc, "anthropic", "claude-3", msgs, 100);
+    defer alloc.free(body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .object);
+    const out_msgs = parsed.value.object.get("messages").?;
+    try std.testing.expect(out_msgs == .array);
+    try std.testing.expectEqual(@as(usize, 3), out_msgs.array.items.len);
+    // assistant tool_use
+    try std.testing.expectEqualStrings("assistant", out_msgs.array.items[1].object.get("role").?.string);
+    const a_content = out_msgs.array.items[1].object.get("content").?;
+    try std.testing.expect(a_content == .array);
+    try std.testing.expectEqual(@as(usize, 1), a_content.array.items.len);
+    try std.testing.expectEqualStrings("tool_use", a_content.array.items[0].object.get("type").?.string);
+    try std.testing.expectEqualStrings("call_1", a_content.array.items[0].object.get("id").?.string);
+    try std.testing.expectEqualStrings("get_weather", a_content.array.items[0].object.get("name").?.string);
+    const tool_input = a_content.array.items[0].object.get("input").?;
+    try std.testing.expect(tool_input == .object);
+    try std.testing.expectEqualStrings("Paris", tool_input.object.get("city").?.string);
+    // tool -> user tool_result
+    try std.testing.expectEqualStrings("user", out_msgs.array.items[2].object.get("role").?.string);
+    const t_content = out_msgs.array.items[2].object.get("content").?;
+    try std.testing.expect(t_content == .array);
+    try std.testing.expectEqualStrings("tool_result", t_content.array.items[0].object.get("type").?.string);
+    try std.testing.expectEqualStrings("call_1", t_content.array.items[0].object.get("tool_use_id").?.string);
+    try std.testing.expectEqualStrings("sunny", t_content.array.items[0].object.get("content").?.string);
 }
 
 test "appendSseDeltas extracts incremental deltas" {

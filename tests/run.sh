@@ -227,6 +227,28 @@ python3 $TMP/opencode/mock_gimgcheck.py > $TMP/opencode/gimgcheck.log 2>&1 & ech
 sleep 1
 ./zig-out/bin/st-client --port $PORT backend.native '{"provider":"google","model":"gemini-pro","api_key":"k","base_url":"http://127.0.0.1:18149","path":"/v1beta/models/gemini-pro:generateContent","messages":[{"role":"user","content":[{"type":"text","text":"what is this"},{"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0="}}]}]}' | grep -q 'gimg-ok' && echo PASS_GOOGLE_IMG
 kill $(cat $TMP/opencode/gimgcheck.pid) 2>/dev/null || true
+echo "== anthropic tools parity =="
+cat > $TMP/opencode/mock_toolcheck.py <<'PYEOF'
+import json
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+class H(BaseHTTPRequestHandler):
+    def do_POST(self):
+        ln=int(self.headers.get('Content-Length',0)); body=self.rfile.read(ln)
+        req=json.loads(body)
+        a=req['messages'][1]['content'][0]
+        assert a.get('type')=='tool_use' and a.get('id')=='call_1' and a.get('name')=='get_weather', req
+        assert a.get('input',{}).get('city')=='Paris', req
+        t=req['messages'][2]
+        assert t['role']=='user' and t['content'][0].get('type')=='tool_result' and t['content'][0].get('tool_use_id')=='call_1', req
+        data=json.dumps({"content":[{"text":"tool-ok"}]}).encode()
+        self.send_response(200); self.send_header('Content-Type','application/json'); self.send_header('Content-Length',str(len(data))); self.end_headers(); self.wfile.write(data)
+    def log_message(self,*a): pass
+ThreadingHTTPServer(('127.0.0.1',18150),H).serve_forever()
+PYEOF
+python3 $TMP/opencode/mock_toolcheck.py > $TMP/opencode/toolcheck.log 2>&1 & echo $! > $TMP/opencode/toolcheck.pid
+sleep 1
+./zig-out/bin/st-client --port $PORT backend.native '{"provider":"anthropic","model":"claude-3","api_key":"k","base_url":"http://127.0.0.1:18150","path":"/v1/messages","messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"","tool_calls":[{"id":"call_1","function":{"name":"get_weather","arguments":"{\"city\":\"Paris\"}"}}]},{"role":"tool","tool_call_id":"call_1","content":"sunny"}]}' | grep -q 'tool-ok' && echo PASS_ANTHROPIC_TOOLS
+kill $(cat $TMP/opencode/toolcheck.pid) 2>/dev/null || true
 echo "== multi-model tokenizer =="
 curl -sL -o $TMP/opencode/p50k_base.tiktoken https://openaipublic.blob.core.windows.net/encodings/p50k_base.tiktoken 2>/dev/null || true
 if [ -s $TMP/opencode/p50k_base.tiktoken ]; then
