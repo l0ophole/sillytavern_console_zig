@@ -508,7 +508,12 @@ pub fn buildNativeBodyWithEffort(alloc: std.mem.Allocator, provider_name: []cons
                         args_json = try std.fmt.allocPrint(alloc, "\"{s}\"", .{eq_args});
                     }
                     defer alloc.free(args_json);
-                    const one = try std.fmt.allocPrint(alloc, "{{\"functionCall\":{{\"name\":\"{s}\",\"args\":{s}}}}}", .{ eq_name, args_json });
+                    // Gemini 3 bypass magic (upstream convertGooglePrompt).
+                    const is_gemini3 = std.mem.indexOf(u8, model, "gemini-3") != null;
+                    const one = if (is_gemini3)
+                        try std.fmt.allocPrint(alloc, "{{\"functionCall\":{{\"name\":\"{s}\",\"args\":{s}}},\"thoughtSignature\":\"skip_thought_signature_validator\"}}", .{ eq_name, args_json })
+                    else
+                        try std.fmt.allocPrint(alloc, "{{\"functionCall\":{{\"name\":\"{s}\",\"args\":{s}}}}}", .{ eq_name, args_json });
                     try parts.append(alloc, one);
                 }
             } else if (has_tool_call_id) {
@@ -607,9 +612,19 @@ pub fn buildNativeBodyWithEffort(alloc: std.mem.Allocator, provider_name: []cons
             var arr: std.ArrayListUnmanaged(u8) = .empty;
             defer arr.deinit(alloc);
             try arr.append(alloc, '[');
+            const is_gemini3 = std.mem.indexOf(u8, model, "gemini-3") != null;
+            const is_image_model = std.mem.indexOf(u8, model, "-image") != null;
             for (c.parts.items, 0..) |b, idx| {
                 if (idx > 0) try arr.append(alloc, ',');
-                try arr.appendSlice(alloc, b);
+                // Gemini 3 -image: model-role text/inlineData parts get bypass magic.
+                if (is_gemini3 and is_image_model and std.mem.eql(u8, c.role, "model") and (std.mem.indexOf(u8, b, "\"text\":") != null or std.mem.indexOf(u8, b, "\"inlineData\":") != null) and std.mem.indexOf(u8, b, "\"thoughtSignature\":") == null) {
+                    const stemmed = b[0 .. b.len - 1]; // strip closing '}'
+                    try arr.appendSlice(alloc, stemmed);
+                    if (std.mem.indexOf(u8, b, "\"inlineData\":") != null) try arr.append(alloc, '}');
+                    try arr.appendSlice(alloc, ",\"thoughtSignature\":\"skip_thought_signature_validator\"}");
+                } else {
+                    try arr.appendSlice(alloc, b);
+                }
             }
             try arr.append(alloc, ']');
             const one = try std.fmt.allocPrint(alloc, "{{\"role\":\"{s}\",\"parts\":{s}}}", .{ c.role, arr.items });
@@ -1102,6 +1117,34 @@ test "anthropic thinking budget" {
     const parsed3 = try std.json.parseFromSlice(std.json.Value, alloc, body3, .{});
     defer parsed3.deinit();
     try std.testing.expect(parsed3.value.object.get("thinking") == null);
+}
+
+test "gemini-3 thoughtSignature bypass" {
+    // RED: upstream convertGooglePrompt adds thoughtSignature bypass magic
+    // to functionCall parts on gemini-3 models.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const msgs = "[{\"role\":\"user\",\"content\":\"hi\"},{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"id\":\"call_1\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{\\\"city\\\":\\\"Paris\\\"}\"}}]}]";
+    const body = try buildNativeBody(alloc, "google", "gemini-3-pro", msgs, 100);
+    defer alloc.free(body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .object);
+    const contents = parsed.value.object.get("contents").?;
+    try std.testing.expectEqual(@as(usize, 2), contents.array.items.len);
+    const parts = contents.array.items[1].object.get("parts").?;
+    const part0 = parts.array.items[0];
+    try std.testing.expectEqualStrings("skip_thought_signature_validator", part0.object.get("thoughtSignature").?.string);
+
+    // non-gemini-3 has no bypass
+    const body2 = try buildNativeBody(alloc, "google", "gemini-pro", msgs, 100);
+    defer alloc.free(body2);
+    const parsed2 = try std.json.parseFromSlice(std.json.Value, alloc, body2, .{});
+    defer parsed2.deinit();
+    const contents2 = parsed2.value.object.get("contents").?;
+    const parts2 = contents2.array.items[1].object.get("parts").?;
+    try std.testing.expect(parts2.array.items[0].object.get("thoughtSignature") == null);
 }
 
 test "appendSseDeltas extracts incremental deltas" {
