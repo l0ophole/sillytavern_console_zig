@@ -762,6 +762,60 @@ fn lowerCaseCopy(alloc: std.mem.Allocator, s: []const u8) ![]u8 {
     return out;
 }
 
+// World Info selective matching (upstream world-info.js world_info_logic:
+// AND_ANY=0, NOT_ALL=1, NOT_ANY=2, AND_ALL=3). Constant entries activate
+// regardless of keys. Otherwise a primary key must match; with no (or
+// empty) keysecondary entries the primary match suffices, else:
+//   AND_ANY  -> any secondary key matches
+//   AND_ALL  -> every secondary key matches
+//   NOT_ANY  -> no secondary key matches
+//   NOT_ALL  -> at least one secondary key does not match
+fn entrySelected(alloc: std.mem.Allocator, scan_lower: []const u8, e: std.json.Value) !bool {
+    if (e != .object) return false;
+    const constant = if (e.object.get("constant")) |v| v == .bool and v.bool else false;
+    if (constant) return true;
+    const prim = if (e.object.get("key")) |k| {
+        if (k == .array) {
+            var hit = false;
+            for (k.array.items) |kv| {
+                if (kv != .string or kv.string.len == 0) continue;
+                const kl = try lowerCaseCopy(alloc, kv.string);
+                defer alloc.free(kl);
+                if (std.mem.indexOf(u8, scan_lower, kl) != null) {
+                    hit = true;
+                    break;
+                }
+            }
+            if (!hit) return false;
+        } else return false;
+    } else return false;
+    _ = prim;
+    const logic: i64 = if (e.object.get("selectiveLogic")) |v| if (v == .integer) v.integer else 0 else 0;
+    var any_sec = false;
+    var all_sec = true;
+    var sec_count: usize = 0;
+    if (e.object.get("keysecondary")) |k| {
+        if (k == .array) {
+            for (k.array.items) |kv| {
+                if (kv != .string or kv.string.len == 0) continue;
+                sec_count += 1;
+                const kl = try lowerCaseCopy(alloc, kv.string);
+                defer alloc.free(kl);
+                const hit = std.mem.indexOf(u8, scan_lower, kl) != null;
+                if (hit) any_sec = true else all_sec = false;
+            }
+        }
+    }
+    if (sec_count == 0) return true;
+    return switch (logic) {
+        0 => any_sec, // AND_ANY
+        1 => !all_sec, // NOT_ALL
+        2 => !any_sec, // NOT_ANY
+        3 => all_sec, // AND_ALL
+        else => any_sec,
+    };
+}
+
 // World Info: select entries whose keys match scan_text (case-insensitive),
 // constant entries always included, disabled excluded. Constant first.
 pub fn worldInfoSelect(alloc: std.mem.Allocator, entries_json: []const u8, scan_text: []const u8) ![]u8 {
@@ -793,22 +847,7 @@ pub fn worldInfoSelect(alloc: std.mem.Allocator, entries_json: []const u8, scan_
             if (cls != pass) continue;
             const content = if (e.object.get("content")) |v| if (v == .string) v.string else "" else "";
             if (content.len == 0) continue;
-            var matched = constant;
-            if (!matched) {
-                if (e.object.get("key")) |k| {
-                    if (k == .array) {
-                        for (k.array.items) |kv| {
-                            if (kv != .string or kv.string.len == 0) continue;
-                            const kl = try lowerCaseCopy(alloc, kv.string);
-                            defer alloc.free(kl);
-                            if (std.mem.indexOf(u8, scan_lower, kl) != null) {
-                                matched = true;
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
+            const matched = try entrySelected(alloc, scan_lower, e);
             if (!matched) continue;
             if (e.object.get("group")) |gv| {
                 if (gv == .string and gv.string.len > 0) {
@@ -1296,6 +1335,47 @@ test "worldinfo constant and key match" {
     const out = try worldInfoSelect(alloc, entries, "We enter the TAVERN");
     defer alloc.free(out);
     try std.testing.expectEqualStrings("Always here.\nA cozy tavern.", out);
+}
+
+test "worldinfo selectiveLogic secondary keys" {
+    // Upstream world-info.js: selectiveLogic AND_ANY=0, NOT_ALL=1,
+    // NOT_ANY=2, AND_ALL=3. Primary key must match first; secondary
+    // logic gates activation (no secondary keys -> primary suffices).
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    // AND_ANY: primary + one secondary present -> active; primary only -> inactive
+    var out = try worldInfoSelect(alloc, "[{\"key\":[\"dragon\"],\"keysecondary\":[\"fire\",\"wings\"],\"selectiveLogic\":0,\"content\":\"ANY\",\"disable\":false,\"constant\":false}]", "a dragon with wings");
+    try std.testing.expectEqualStrings("ANY", out);
+    alloc.free(out);
+    out = try worldInfoSelect(alloc, "[{\"key\":[\"dragon\"],\"keysecondary\":[\"fire\",\"wings\"],\"selectiveLogic\":0,\"content\":\"ANY\",\"disable\":false,\"constant\":false}]", "a dragon");
+    try std.testing.expectEqualStrings("", out);
+    alloc.free(out);
+    // AND_ALL: needs every secondary key
+    out = try worldInfoSelect(alloc, "[{\"key\":[\"dragon\"],\"keysecondary\":[\"fire\",\"wings\"],\"selectiveLogic\":3,\"content\":\"ALL\",\"disable\":false,\"constant\":false}]", "dragon fire wings");
+    try std.testing.expectEqualStrings("ALL", out);
+    alloc.free(out);
+    out = try worldInfoSelect(alloc, "[{\"key\":[\"dragon\"],\"keysecondary\":[\"fire\",\"wings\"],\"selectiveLogic\":3,\"content\":\"ALL\",\"disable\":false,\"constant\":false}]", "dragon fire");
+    try std.testing.expectEqualStrings("", out);
+    alloc.free(out);
+    // NOT_ANY: active only when no secondary key matches
+    out = try worldInfoSelect(alloc, "[{\"key\":[\"dragon\"],\"keysecondary\":[\"fire\"],\"selectiveLogic\":2,\"content\":\"NANY\",\"disable\":false,\"constant\":false}]", "a dragon");
+    try std.testing.expectEqualStrings("NANY", out);
+    alloc.free(out);
+    out = try worldInfoSelect(alloc, "[{\"key\":[\"dragon\"],\"keysecondary\":[\"fire\"],\"selectiveLogic\":2,\"content\":\"NANY\",\"disable\":false,\"constant\":false}]", "dragon fire");
+    try std.testing.expectEqualStrings("", out);
+    alloc.free(out);
+    // NOT_ALL: active when at least one secondary is missing
+    out = try worldInfoSelect(alloc, "[{\"key\":[\"dragon\"],\"keysecondary\":[\"fire\",\"wings\"],\"selectiveLogic\":1,\"content\":\"NALL\",\"disable\":false,\"constant\":false}]", "dragon fire");
+    try std.testing.expectEqualStrings("NALL", out);
+    alloc.free(out);
+    out = try worldInfoSelect(alloc, "[{\"key\":[\"dragon\"],\"keysecondary\":[\"fire\",\"wings\"],\"selectiveLogic\":1,\"content\":\"NALL\",\"disable\":false,\"constant\":false}]", "dragon fire wings");
+    try std.testing.expectEqualStrings("", out);
+    alloc.free(out);
+    // Empty secondary list -> primary alone suffices regardless of logic value.
+    out = try worldInfoSelect(alloc, "[{\"key\":[\"dragon\"],\"keysecondary\":[],\"selectiveLogic\":3,\"content\":\"PLAIN\",\"disable\":false,\"constant\":false}]", "a dragon");
+    try std.testing.expectEqualStrings("PLAIN", out);
+    alloc.free(out);
 }
 
 test "author note depth insertion" {
