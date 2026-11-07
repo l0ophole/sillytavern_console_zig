@@ -70,6 +70,10 @@ fn jsonEscaped(alloc: std.mem.Allocator, s: []const u8) ![]u8 {
 
 /// Normalize provider-specific chat request body.
 pub fn buildNativeBody(alloc: std.mem.Allocator, provider_name: []const u8, model: []const u8, messages_json: []const u8, max_tokens: u32) ![]u8 {
+    return buildNativeBodyWithEffort(alloc, provider_name, model, messages_json, max_tokens, "");
+}
+
+pub fn buildNativeBodyWithEffort(alloc: std.mem.Allocator, provider_name: []const u8, model: []const u8, messages_json: []const u8, max_tokens: u32, reasoning_effort: []const u8) ![]u8 {
     if (std.mem.eql(u8, provider_name, "novelai") or std.mem.eql(u8, provider_name, "horde") or std.mem.eql(u8, provider_name, "kobold")) {
         const prompt = try concatPrompt(alloc, messages_json);
         defer alloc.free(prompt);
@@ -90,18 +94,51 @@ pub fn buildNativeBody(alloc: std.mem.Allocator, provider_name: []const u8, mode
         // string content -> [{type:text,text}] with name prefix; array
         // content: text parts (name prefix, empty -> zero-width space) +
         // image_url data-URLs -> {type:image,source:{type:base64,...}}.
+        // Thinking per upstream sendClaudeRequest + calculateClaudeBudgetTokens
+        // (prompt-converters.js): thinking-capable models only; budget =
+        // min 1024, low 10%, medium 25%, high 50%, max 95%, floor 1024,
+        // cap 21333; auto/unknown -> no block; max_tokens bumped +1024 when
+        // <=1024 (mutates max_tokens output like upstream).
         const mq = try std.json.parseFromSlice(std.json.Value, alloc, messages_json, .{});
         const msgs = if (mq.value == .array) mq.value.array.items else &[_]std.json.Value{};
         var out: std.ArrayListUnmanaged(u8) = .empty;
         defer out.deinit(alloc);
+        var eff_max_tokens = max_tokens;
+        var budget: ?u32 = null;
+        const use_thinking = std.mem.startsWith(u8, model, "claude-3-7") or std.mem.indexOf(u8, model, "opus-4") != null or std.mem.indexOf(u8, model, "sonnet-4") != null or std.mem.indexOf(u8, model, "haiku-4-5") != null;
+        if (use_thinking and reasoning_effort.len > 0 and !std.mem.eql(u8, reasoning_effort, "auto")) {
+            var b: u32 = 0;
+            if (std.mem.eql(u8, reasoning_effort, "min")) {
+                b = 1024;
+            } else if (std.mem.eql(u8, reasoning_effort, "low")) {
+                b = @intCast((@as(u64, max_tokens) * 10) / 100);
+            } else if (std.mem.eql(u8, reasoning_effort, "medium")) {
+                b = @intCast((@as(u64, max_tokens) * 25) / 100);
+            } else if (std.mem.eql(u8, reasoning_effort, "high")) {
+                b = @intCast((@as(u64, max_tokens) * 50) / 100);
+            } else if (std.mem.eql(u8, reasoning_effort, "max")) {
+                b = @intCast((@as(u64, max_tokens) * 95) / 100);
+            }
+            if (b > 0) {
+                if (b < 1024) b = 1024;
+                if (b > 21333) b = 21333;
+                if (eff_max_tokens <= 1024) eff_max_tokens += 1024;
+                budget = b;
+            }
+        }
         try out.appendSlice(alloc, "{\"model\":");
         const model_q = try std.fmt.allocPrint(alloc, "\"{s}\"", .{model});
         defer alloc.free(model_q);
         try out.appendSlice(alloc, model_q);
         try out.appendSlice(alloc, ",\"max_tokens\":");
-        const mt = try std.fmt.allocPrint(alloc, "{d}", .{max_tokens});
+        const mt = try std.fmt.allocPrint(alloc, "{d}", .{eff_max_tokens});
         defer alloc.free(mt);
         try out.appendSlice(alloc, mt);
+        if (budget) |b| {
+            const tb = try std.fmt.allocPrint(alloc, ",\"thinking\":{{\"type\":\"enabled\",\"budget_tokens\":{d}}}", .{b});
+            defer alloc.free(tb);
+            try out.appendSlice(alloc, tb);
+        }
         // Collect leading system texts (string content only).
         var sys_end: usize = 0;
         while (sys_end < msgs.len) {
@@ -1027,6 +1064,44 @@ test "google tool functionCall/functionResponse conversion" {
     try std.testing.expectEqualStrings("get_weather", fr.object.get("name").?.string);
     const fr_resp = fr.object.get("response").?;
     try std.testing.expectEqualStrings("sunny", fr_resp.object.get("content").?.string);
+}
+
+test "anthropic thinking budget" {
+    // RED: upstream sendClaudeRequest adds thinking:{type:enabled,
+    // budget_tokens} for thinking-capable models when reasoning_effort set,
+    // with max_tokens bump when <=1024.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const msgs = "[{\"role\":\"user\",\"content\":\"hi\"}]";
+    const body = try buildNativeBodyWithEffort(alloc, "anthropic", "claude-3-7-sonnet", msgs, 4096, "medium");
+    defer alloc.free(body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .object);
+    try std.testing.expect(parsed.value.object.get("thinking") != null);
+    const thinking = parsed.value.object.get("thinking").?;
+    try std.testing.expect(thinking == .object);
+    try std.testing.expectEqualStrings("enabled", thinking.object.get("type").?.string);
+    // medium = 25% of 4096 = 1024
+    try std.testing.expectEqual(@as(i64, 1024), thinking.object.get("budget_tokens").?.integer);
+    try std.testing.expectEqual(@as(i64, 4096), parsed.value.object.get("max_tokens").?.integer);
+
+    // small max_tokens bumps to max_tokens+1024 like upstream
+    const body2 = try buildNativeBodyWithEffort(alloc, "anthropic", "claude-3-7-sonnet", msgs, 500, "low");
+    defer alloc.free(body2);
+    const parsed2 = try std.json.parseFromSlice(std.json.Value, alloc, body2, .{});
+    defer parsed2.deinit();
+    const thinking2 = parsed2.value.object.get("thinking").?;
+    try std.testing.expectEqualStrings("enabled", thinking2.object.get("type").?.string);
+    try std.testing.expectEqual(@as(i64, 1524), parsed2.value.object.get("max_tokens").?.integer);
+
+    // auto effort -> no thinking block
+    const body3 = try buildNativeBodyWithEffort(alloc, "anthropic", "claude-3-7-sonnet", msgs, 4096, "auto");
+    defer alloc.free(body3);
+    const parsed3 = try std.json.parseFromSlice(std.json.Value, alloc, body3, .{});
+    defer parsed3.deinit();
+    try std.testing.expect(parsed3.value.object.get("thinking") == null);
 }
 
 test "appendSseDeltas extracts incremental deltas" {

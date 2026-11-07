@@ -270,6 +270,26 @@ python3 $TMP/opencode/mock_gtoolcheck.py > $TMP/opencode/gtoolcheck.log 2>&1 & e
 sleep 1
 ./zig-out/bin/st-client --port $PORT backend.native '{"provider":"google","model":"gemini-pro","api_key":"k","base_url":"http://127.0.0.1:18151","path":"/v1beta/models/gemini-pro:generateContent","messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"","tool_calls":[{"id":"call_1","function":{"name":"get_weather","arguments":"{\"city\":\"Paris\"}"}}]},{"role":"user","tool_call_id":"call_1","content":"sunny"}]}' | grep -q 'gtool-ok' && echo PASS_GOOGLE_TOOLS
 kill $(cat $TMP/opencode/gtoolcheck.pid) 2>/dev/null || true
+echo "== anthropic thinking parity =="
+cat > $TMP/opencode/mock_thinkcheck.py <<'PYEOF'
+import json
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+class H(BaseHTTPRequestHandler):
+    def do_POST(self):
+        ln=int(self.headers.get('Content-Length',0)); body=self.rfile.read(ln)
+        req=json.loads(body)
+        th=req.get('thinking',{})
+        assert th.get('type')=='enabled' and th.get('budget_tokens')==1024, req
+        assert req.get('max_tokens')==4096, req
+        data=json.dumps({"content":[{"text":"think-ok"}]}).encode()
+        self.send_response(200); self.send_header('Content-Type','application/json'); self.send_header('Content-Length',str(len(data))); self.end_headers(); self.wfile.write(data)
+    def log_message(self,*a): pass
+ThreadingHTTPServer(('127.0.0.1',18152),H).serve_forever()
+PYEOF
+python3 $TMP/opencode/mock_thinkcheck.py > $TMP/opencode/thinkcheck.log 2>&1 & echo $! > $TMP/opencode/thinkcheck.pid
+sleep 1
+./zig-out/bin/st-client --port $PORT backend.native '{"provider":"anthropic","model":"claude-3-7-sonnet","api_key":"k","base_url":"http://127.0.0.1:18152","path":"/v1/messages","max_tokens":4096,"reasoning_effort":"medium","messages":[{"role":"user","content":"hi"}]}' | grep -q 'think-ok' && echo PASS_ANTHROPIC_THINKING
+kill $(cat $TMP/opencode/thinkcheck.pid) 2>/dev/null || true
 echo "== multi-model tokenizer =="
 curl -sL -o $TMP/opencode/p50k_base.tiktoken https://openaipublic.blob.core.windows.net/encodings/p50k_base.tiktoken 2>/dev/null || true
 if [ -s $TMP/opencode/p50k_base.tiktoken ]; then

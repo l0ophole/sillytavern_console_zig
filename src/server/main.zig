@@ -3286,7 +3286,7 @@ fn handleClient(conn: posix.fd_t) void {
             msgs_json = alloc.dupe(u8, "[]") catch return;
         }
         defer alloc.free(msgs_json);
-        const native_body = providers_mod.buildNativeBody(alloc, pname, model_name, msgs_json, max_tokens) catch {
+        const native_body = providers_mod.buildNativeBodyWithEffort(alloc, pname, model_name, msgs_json, max_tokens, getStr(req, "reasoning_effort") orelse "") catch {
             resp = protocol.encodeErr(alloc, "bad_request") catch return;
             defer alloc.free(resp);
             _ = posix.write(conn, resp) catch {};
@@ -3437,7 +3437,7 @@ fn handleClient(conn: posix.fd_t) void {
             msgs_json = alloc.dupe(u8, "[]") catch return;
         }
         defer alloc.free(msgs_json);
-        const native_body = providers_mod.buildNativeBody(alloc, pname, model_name, msgs_json, max_tokens) catch {
+        const native_body = providers_mod.buildNativeBodyWithEffort(alloc, pname, model_name, msgs_json, max_tokens, getStr(req, "reasoning_effort") orelse "") catch {
             resp = protocol.encodeErr(alloc, "bad_request") catch return;
             defer alloc.free(resp);
             _ = posix.write(conn, resp) catch {};
@@ -3854,7 +3854,7 @@ fn handleClient(conn: posix.fd_t) void {
         if (ak.len == 0) {
             if (std.posix.getenv("OPENROUTER_API_KEY")) |v| ak = v else if (std.posix.getenv("OPENAI_API_KEY")) |v2| ak = v2;
         }
-        const native_body = providers_mod.buildNativeBody(alloc, pname, model_name, msgs_json, max_tokens) catch {
+        const native_body = providers_mod.buildNativeBodyWithEffort(alloc, pname, model_name, msgs_json, max_tokens, getStr(req, "reasoning_effort") orelse "") catch {
             resp = protocol.encodeErr(alloc, "bad_request") catch return;
             defer alloc.free(resp);
             _ = posix.write(conn, resp) catch {};
@@ -4280,7 +4280,7 @@ fn handleClient(conn: posix.fd_t) void {
             msgs_json = alloc.dupe(u8, "[]") catch return;
         }
         defer alloc.free(msgs_json);
-        var native_body = providers_mod.buildNativeBody(alloc, pname, model_name, msgs_json, 1024) catch return;
+        var native_body = providers_mod.buildNativeBodyWithEffort(alloc, pname, model_name, msgs_json, 1024, getStr(req, "reasoning_effort") orelse "") catch return;
         defer alloc.free(native_body);
         // Inject stream:true before final }
         const with_stream = std.fmt.allocPrint(alloc, "{s},\"stream\":true}}", .{native_body[0 .. native_body.len - 1]}) catch return;
