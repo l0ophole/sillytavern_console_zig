@@ -87,7 +87,9 @@ pub fn buildNativeBody(alloc: std.mem.Allocator, provider_name: []const u8, mode
     if (std.mem.eql(u8, provider_name, "anthropic")) {
         // Anthropic per upstream convertClaudeMessages (prompt-converters.js):
         // leading system -> system:[{type:text,text}]; rest system->user;
-        // string content -> [{type:text,text}] with name prefix.
+        // string content -> [{type:text,text}] with name prefix; array
+        // content: text parts (name prefix, empty -> zero-width space) +
+        // image_url data-URLs -> {type:image,source:{type:base64,...}}.
         const mq = try std.json.parseFromSlice(std.json.Value, alloc, messages_json, .{});
         const msgs = if (mq.value == .array) mq.value.array.items else &[_]std.json.Value{};
         var out: std.ArrayListUnmanaged(u8) = .empty;
@@ -137,34 +139,155 @@ pub fn buildNativeBody(alloc: std.mem.Allocator, provider_name: []const u8, mode
         }
         try out.appendSlice(alloc, ",\"messages\":[");
         var first = true;
+        // Build converted messages first (with array-content + assistant-image move).
+        // For each message, produce content blocks as JSON strings.
+        var conv: std.ArrayListUnmanaged(struct { role: []const u8, blocks: std.ArrayListUnmanaged([]u8) }) = .empty;
+        defer {
+            for (conv.items) |*c| {
+                for (c.blocks.items) |b| alloc.free(b);
+                c.blocks.deinit(alloc);
+            }
+            conv.deinit(alloc);
+        }
         for (msgs[sys_end..]) |m| {
             var role: []const u8 = "user";
-            var content: []const u8 = "";
             var name: []const u8 = "";
+            var content_val: ?std.json.Value = null;
             if (m == .object) {
                 if (m.object.get("role")) |r| {
                     if (r == .string) role = r.string;
                 }
-                if (m.object.get("content")) |c| {
-                    if (c == .string) content = c.string;
-                }
+                if (m.object.get("content")) |c| content_val = c;
                 if (m.object.get("name")) |n| {
                     if (n == .string) name = n.string;
                 }
             }
             const crole = if (std.mem.eql(u8, role, "system")) "user" else role;
-            var text = content;
-            var prefixed: ?[]u8 = null;
-            defer if (prefixed) |p| alloc.free(p);
-            if (name.len > 0 and !std.mem.startsWith(u8, content, name)) {
-                prefixed = try std.fmt.allocPrint(alloc, "{s}: {s}", .{ name, content });
-                text = prefixed.?;
+            var blocks: std.ArrayListUnmanaged([]u8) = .empty;
+            if (content_val) |cv| {
+                if (cv == .string) {
+                    var text = cv.string;
+                    var prefixed: ?[]u8 = null;
+                    defer if (prefixed) |p| alloc.free(p);
+                    if (name.len > 0 and !std.mem.startsWith(u8, cv.string, name)) {
+                        prefixed = try std.fmt.allocPrint(alloc, "{s}: {s}", .{ name, cv.string });
+                        text = prefixed.?;
+                    }
+                    const eq = try jsonEscaped(alloc, text);
+                    defer alloc.free(eq);
+                    const one = try std.fmt.allocPrint(alloc, "{{\"type\":\"text\",\"text\":\"{s}\"}}", .{eq});
+                    try blocks.append(alloc, one);
+                } else if (cv == .array) {
+                    for (cv.array.items) |part| {
+                        if (part != .object) continue;
+                        const ptype = if (part.object.get("type")) |t| if (t == .string) t.string else "" else "";
+                        if (std.mem.eql(u8, ptype, "image_url")) {
+                            var url: []const u8 = "";
+                            if (part.object.get("image_url")) |iu| {
+                                if (iu == .object) {
+                                    if (iu.object.get("url")) |u| {
+                                        if (u == .string) url = u.string;
+                                    }
+                                }
+                            }
+                            // Only data-URLs can be inlined (no base64 fetch).
+                            if (std.mem.startsWith(u8, url, "data:")) {
+                                if (std.mem.indexOfScalar(u8, url, ',')) |ci| {
+                                    const header = url[0..ci];
+                                    const data_b64 = url[ci + 1 ..];
+                                    var media_type: []const u8 = "application/octet-stream";
+                                    if (std.mem.indexOfScalar(u8, header, ';')) |si| {
+                                        const mtype = header[5..si];
+                                        if (mtype.len > 0) media_type = mtype;
+                                    } else if (header.len > 5) {
+                                        media_type = header[5..];
+                                    }
+                                    const eq_data = try jsonEscaped(alloc, data_b64);
+                                    defer alloc.free(eq_data);
+                                    const eq_mt = try jsonEscaped(alloc, media_type);
+                                    defer alloc.free(eq_mt);
+                                    const one = try std.fmt.allocPrint(alloc, "{{\"type\":\"image\",\"source\":{{\"type\":\"base64\",\"media_type\":\"{s}\",\"data\":\"{s}\"}}}}", .{ eq_mt, eq_data });
+                                    try blocks.append(alloc, one);
+                                }
+                            }
+                        } else if (std.mem.eql(u8, ptype, "text")) {
+                            var t: []const u8 = "";
+                            if (part.object.get("text")) |tv| {
+                                if (tv == .string) t = tv.string;
+                            }
+                            var text = t;
+                            var prefixed: ?[]u8 = null;
+                            defer if (prefixed) |p| alloc.free(p);
+                            if (name.len > 0 and t.len > 0 and !std.mem.startsWith(u8, t, name)) {
+                                prefixed = try std.fmt.allocPrint(alloc, "{s}: {s}", .{ name, t });
+                                text = prefixed.?;
+                            }
+                            if (text.len == 0) text = "\u{200b}";
+                            const eq = try jsonEscaped(alloc, text);
+                            defer alloc.free(eq);
+                            const one = try std.fmt.allocPrint(alloc, "{{\"type\":\"text\",\"text\":\"{s}\"}}", .{eq});
+                            try blocks.append(alloc, one);
+                        } else {
+                            // Preserve other part types verbatim.
+                            var tmp: std.Io.Writer.Allocating = .init(alloc);
+                            defer tmp.deinit();
+                            var s: std.json.Stringify = .{ .writer = &tmp.writer };
+                            try s.write(part);
+                            const one = try alloc.dupe(u8, tmp.written());
+                            try blocks.append(alloc, one);
+                        }
+                    }
+                }
             }
-            const eq = try jsonEscaped(alloc, text);
-            defer alloc.free(eq);
+            try conv.append(alloc, .{ .role = crole, .blocks = blocks });
+        }
+        // Move assistant images to next user message (upstream loop).
+        var i: usize = 0;
+        while (i < conv.items.len) {
+            if (std.mem.eql(u8, conv.items[i].role, "assistant")) {
+                var has_image = false;
+                for (conv.items[i].blocks.items) |b| {
+                    if (std.mem.indexOf(u8, b, "\"type\":\"image\"") != null) has_image = true;
+                }
+                if (!has_image) {
+                    i += 1;
+                    continue;
+                }
+                var j = i + 1;
+                while (j < conv.items.len and !std.mem.eql(u8, conv.items[j].role, "user")) j += 1;
+                if (j >= conv.items.len) {
+                    try conv.append(alloc, .{ .role = "user", .blocks = .empty });
+                    j = conv.items.len - 1;
+                }
+                var w: usize = 0;
+                while (w < conv.items[i].blocks.items.len) {
+                    const blk = conv.items[i].blocks.items[w];
+                    if (std.mem.indexOf(u8, blk, "\"type\":\"image\"") != null) {
+                        try conv.items[j].blocks.append(alloc, blk);
+                        // Remove from assistant (swap-with-last).
+                        const last = conv.items[i].blocks.items.len - 1;
+                        conv.items[i].blocks.items[w] = conv.items[i].blocks.items[last];
+                        conv.items[i].blocks.items[last] = blk;
+                        _ = conv.items[i].blocks.pop();
+                    } else {
+                        w += 1;
+                    }
+                }
+            }
+            i += 1;
+        }
+        for (conv.items) |c| {
             if (!first) try out.append(alloc, ',');
             first = false;
-            const one = try std.fmt.allocPrint(alloc, "{{\"role\":\"{s}\",\"content\":[{{\"type\":\"text\",\"text\":\"{s}\"}}]}}", .{ crole, eq });
+            var arr: std.ArrayListUnmanaged(u8) = .empty;
+            defer arr.deinit(alloc);
+            try arr.append(alloc, '[');
+            for (c.blocks.items, 0..) |b, idx| {
+                if (idx > 0) try arr.append(alloc, ',');
+                try arr.appendSlice(alloc, b);
+            }
+            try arr.append(alloc, ']');
+            const one = try std.fmt.allocPrint(alloc, "{{\"role\":\"{s}\",\"content\":{s}}}", .{ c.role, arr.items });
             defer alloc.free(one);
             try out.appendSlice(alloc, one);
         }
@@ -568,6 +691,34 @@ test "novelai/horde/kobold exact body shapes" {
     defer kp.deinit();
     try std.testing.expectEqualStrings("hi", kp.value.object.get("prompt").?.string);
     try std.testing.expectEqual(@as(i64, 42), kp.value.object.get("max_length").?.integer);
+}
+
+test "anthropic image_url conversion" {
+    // RED: upstream prompt-converters.js converts image_url data-URLs to
+    // {type:image,source:{type:base64,media_type,data}} blocks.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const msgs = "[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"what is this\"},{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,iVBORw0=\"}}]}]";
+    const body = try buildNativeBody(alloc, "anthropic", "claude-3", msgs, 100);
+    defer alloc.free(body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .object);
+    const out_msgs = parsed.value.object.get("messages").?;
+    try std.testing.expect(out_msgs == .array);
+    try std.testing.expectEqual(@as(usize, 1), out_msgs.array.items.len);
+    const content = out_msgs.array.items[0].object.get("content").?;
+    try std.testing.expect(content == .array);
+    try std.testing.expectEqual(@as(usize, 2), content.array.items.len);
+    try std.testing.expectEqualStrings("text", content.array.items[0].object.get("type").?.string);
+    try std.testing.expectEqualStrings("what is this", content.array.items[0].object.get("text").?.string);
+    try std.testing.expectEqualStrings("image", content.array.items[1].object.get("type").?.string);
+    const source = content.array.items[1].object.get("source").?;
+    try std.testing.expect(source == .object);
+    try std.testing.expectEqualStrings("base64", source.object.get("type").?.string);
+    try std.testing.expectEqualStrings("image/png", source.object.get("media_type").?.string);
+    try std.testing.expectEqualStrings("iVBORw0=", source.object.get("data").?.string);
 }
 
 test "appendSseDeltas extracts incremental deltas" {

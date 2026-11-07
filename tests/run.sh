@@ -186,6 +186,27 @@ sleep 1
 ./zig-out/bin/st-client --port $PORT backend.native '{"provider":"anthropic","model":"claude-3","api_key":"k","base_url":"http://127.0.0.1:18146","path":"/v1/messages","messages":[{"role":"system","content":"sys-text"},{"role":"user","content":"hi"}]}' | grep -q 'sys-ok' && echo PASS_SYS_ANTHROPIC
 ./zig-out/bin/st-client --port $PORT backend.native '{"provider":"google","model":"gemini-pro","api_key":"k","base_url":"http://127.0.0.1:18146","path":"/v1beta/models/gemini-pro:generateContent","messages":[{"role":"system","content":"sys-text"},{"role":"user","content":"hi"}]}' | grep -q 'goog-ok' && echo PASS_SYS_GOOGLE
 kill $(cat $TMP/opencode/syscheck.pid) 2>/dev/null || true
+echo "== anthropic image parity =="
+cat > $TMP/opencode/mock_imgcheck.py <<'PYEOF'
+import json
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+class H(BaseHTTPRequestHandler):
+    def do_POST(self):
+        ln=int(self.headers.get('Content-Length',0)); body=self.rfile.read(ln)
+        req=json.loads(body)
+        content=req['messages'][0]['content']
+        assert content[1].get('type')=='image', req
+        src=content[1].get('source',{})
+        assert src.get('type')=='base64' and src.get('media_type')=='image/png' and src.get('data')=='iVBORw0=', req
+        data=json.dumps({"content":[{"text":"img-ok"}]}).encode()
+        self.send_response(200); self.send_header('Content-Type','application/json'); self.send_header('Content-Length',str(len(data))); self.end_headers(); self.wfile.write(data)
+    def log_message(self,*a): pass
+ThreadingHTTPServer(('127.0.0.1',18148),H).serve_forever()
+PYEOF
+python3 $TMP/opencode/mock_imgcheck.py > $TMP/opencode/imgcheck.log 2>&1 & echo $! > $TMP/opencode/imgcheck.pid
+sleep 1
+./zig-out/bin/st-client --port $PORT backend.native '{"provider":"anthropic","model":"claude-3","api_key":"k","base_url":"http://127.0.0.1:18148","path":"/v1/messages","messages":[{"role":"user","content":[{"type":"text","text":"what is this"},{"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0="}}]}]}' | grep -q 'img-ok' && echo PASS_ANTHROPIC_IMG
+kill $(cat $TMP/opencode/imgcheck.pid) 2>/dev/null || true
 echo "== multi-model tokenizer =="
 curl -sL -o $TMP/opencode/p50k_base.tiktoken https://openaipublic.blob.core.windows.net/encodings/p50k_base.tiktoken 2>/dev/null || true
 if [ -s $TMP/opencode/p50k_base.tiktoken ]; then

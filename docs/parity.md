@@ -46,3 +46,5 @@ Streaming pickup: `chat.turn` accepts internal `job_id` (safe + `job-` prefixed)
 Anthropic/Google system parity: `buildNativeBody` extracts leading system messages per upstream `convertClaudeMessages` → `system:[{type:text,text}]` and `convertGooglePrompt` → `systemInstruction:{parts:[{text}]}`; remaining system→user, string content normalized. Verified by exact-shape unit tests + `PASS_SYS_ANTHROPIC`/`PASS_SYS_GOOGLE` wire mocks. Deliberate gaps: tool/image/thinking handling not ported.
 
 NovelAI/Horde/Kobold byte-shape parity: NovelAI `prompt`→`input` per upstream `src/endpoints/novelai.js:212`; Horde/Kobold exact shapes locked (`prompt/params`, `prompt/max_length`). Verified by `novelai/horde/kobold exact body shapes` unit test + `PASS_NOVELAI_INPUT` wire mock. Deliberate gap: Horde async polling not ported (sync shape only).
+
+Anthropic image conversion: array `image_url` data-URLs → `{type:image,source:{type:base64,media_type,data}}` + assistant-image move per upstream `prompt-converters.js` (unit + `PASS_ANTHROPIC_IMG` e2e). Deliberate gaps: tools/thinking not ported; Google image conversion not ported.
