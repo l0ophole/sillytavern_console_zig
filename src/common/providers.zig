@@ -585,11 +585,26 @@ pub fn buildNativeBodyWithEffort(alloc: std.mem.Allocator, provider_name: []cons
                                     } else if (header.len > 5) {
                                         mimetype = header[5..];
                                     }
+                                    var detail: []const u8 = "";
+                                    if (part.object.get("image_url")) |iu| {
+                                        if (iu == .object) {
+                                            if (iu.object.get("detail")) |d| {
+                                                if (d == .string) detail = d.string;
+                                            }
+                                        }
+                                    }
                                     const eq_data = try jsonEscaped(alloc, data_b64);
                                     defer alloc.free(eq_data);
                                     const eq_mt = try jsonEscaped(alloc, mimetype);
                                     defer alloc.free(eq_mt);
-                                    const one = try std.fmt.allocPrint(alloc, "{{\"inlineData\":{{\"mimeType\":\"{s}\",\"data\":\"{s}\"}}}}", .{ eq_mt, eq_data });
+                                    const is_gemini3 = std.mem.indexOf(u8, model, "gemini-3") != null;
+                                    var level: ?[]const u8 = null;
+                                    if (is_gemini3 and std.mem.eql(u8, detail, "low")) level = "media_resolution_low";
+                                    if (is_gemini3 and std.mem.eql(u8, detail, "high")) level = "media_resolution_high";
+                                    const one = if (level) |lv|
+                                        try std.fmt.allocPrint(alloc, "{{\"inlineData\":{{\"mimeType\":\"{s}\",\"data\":\"{s}\"}},\"mediaResolution\":{{\"level\":\"{s}\"}}}}", .{ eq_mt, eq_data, lv })
+                                    else
+                                        try std.fmt.allocPrint(alloc, "{{\"inlineData\":{{\"mimeType\":\"{s}\",\"data\":\"{s}\"}}}}", .{ eq_mt, eq_data });
                                     try parts.append(alloc, one);
                                 }
                             }
@@ -1145,6 +1160,33 @@ test "gemini-3 thoughtSignature bypass" {
     const contents2 = parsed2.value.object.get("contents").?;
     const parts2 = contents2.array.items[1].object.get("parts").?;
     try std.testing.expect(parts2.array.items[0].object.get("thoughtSignature") == null);
+}
+
+test "gemini-3 mediaResolution detail" {
+    // RED: upstream addDataUrlPart maps image_url detail low/high ->
+    // mediaResolution:{level} on gemini-3 models.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const msgs = "[{\"role\":\"user\",\"content\":[{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,iVBORw0=\",\"detail\":\"low\"}}]}]";
+    const body = try buildNativeBody(alloc, "google", "gemini-3-pro", msgs, 100);
+    defer alloc.free(body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    const contents = parsed.value.object.get("contents").?;
+    const part = contents.array.items[0].object.get("parts").?.array.items[0];
+    const mr = part.object.get("mediaResolution").?;
+    try std.testing.expect(mr == .object);
+    try std.testing.expectEqualStrings("media_resolution_low", mr.object.get("level").?.string);
+
+    // non-gemini-3 has no mediaResolution even with detail
+    const body2 = try buildNativeBody(alloc, "google", "gemini-pro", msgs, 100);
+    defer alloc.free(body2);
+    const parsed2 = try std.json.parseFromSlice(std.json.Value, alloc, body2, .{});
+    defer parsed2.deinit();
+    const contents2 = parsed2.value.object.get("contents").?;
+    const part2 = contents2.array.items[0].object.get("parts").?.array.items[0];
+    try std.testing.expect(part2.object.get("mediaResolution") == null);
 }
 
 test "appendSseDeltas extracts incremental deltas" {
