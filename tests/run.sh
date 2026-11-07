@@ -228,6 +228,27 @@ python3 $TMP/opencode/mock_kobold.py > $TMP/opencode/k.log 2>&1 & echo $! > $TMP
 sleep 1
 ./zig-out/bin/st-client --port $PORT backend.native '{"provider":"kobold","model":"m","base_url":"http://127.0.0.1:18124","path":"/api/v1/generate","messages":[{"role":"user","content":"hi"}]}' | grep -q 'kobold mock out' && echo PASS
 kill $(cat $TMP/opencode/k.pid) 2>/dev/null || true
+echo "== novelai input parity =="
+cat > $TMP/opencode/mock_novel.py <<'PYEOF'
+import json
+from http.server import BaseHTTPRequestHandler, HTTPServer
+class H(BaseHTTPRequestHandler):
+    def do_POST(self):
+        ln=int(self.headers.get('Content-Length',0)); body=self.rfile.read(ln)
+        req=json.loads(body)
+        assert req.get('input')=='hi', req
+        assert 'prompt' not in req, req
+        assert req.get('model')=='nai', req
+        assert req.get('parameters',{}).get('max_length')==42, req
+        data=json.dumps({"output":"novel out"}).encode()
+        self.send_response(200); self.send_header('Content-Type','application/json'); self.send_header('Content-Length',str(len(data))); self.end_headers(); self.wfile.write(data)
+    def log_message(self,*a): pass
+HTTPServer(('127.0.0.1',18147),H).handle_request()
+PYEOF
+python3 $TMP/opencode/mock_novel.py > $TMP/opencode/novel.log 2>&1 & echo $! > $TMP/opencode/novel.pid
+sleep 1
+./zig-out/bin/st-client --port $PORT backend.native '{"provider":"novelai","model":"nai","api_key":"k","base_url":"http://127.0.0.1:18147","path":"/ai/generate","max_tokens":42,"messages":[{"role":"user","content":"hi"}]}' | grep -q 'novel out' && echo PASS_NOVELAI_INPUT
+kill $(cat $TMP/opencode/novel.pid) 2>/dev/null || true
 echo "== llama tokenizer =="
 if [ -f ../SillyTavern/src/tokenizers/llama3.json ]; then
   ./zig-out/bin/st-client --port $PORT tokenizer.encode '{"text":"hello world","vocab":"../SillyTavern/src/tokenizers/llama3.json"}' | grep -q '15339,1917' && echo PASS_LLAMA || echo FAIL_LLAMA

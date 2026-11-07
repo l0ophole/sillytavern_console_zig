@@ -78,7 +78,7 @@ pub fn buildNativeBody(alloc: std.mem.Allocator, provider_name: []const u8, mode
         const mt = try std.fmt.allocPrint(alloc, "{d}", .{max_tokens});
         defer alloc.free(mt);
         if (std.mem.eql(u8, provider_name, "novelai")) {
-            return std.fmt.allocPrint(alloc, "{{\"prompt\":\"{s}\",\"model\":\"{s}\",\"parameters\":{{\"max_length\":{s}}}}}", .{ eq, model, mt });
+            return std.fmt.allocPrint(alloc, "{{\"input\":\"{s}\",\"model\":\"{s}\",\"parameters\":{{\"max_length\":{s}}}}}", .{ eq, model, mt });
         } else if (std.mem.eql(u8, provider_name, "horde")) {
             return std.fmt.allocPrint(alloc, "{{\"prompt\":\"{s}\",\"params\":{{\"model\":\"{s}\",\"max_length\":{s}}}}}", .{ eq, model, mt });
         }
@@ -405,7 +405,7 @@ test "native build/parse" {
     }
     const nb = try buildNativeBody(alloc, "novelai", "nai", msgs, 42);
     defer alloc.free(nb);
-    try std.testing.expect(std.mem.indexOf(u8, nb, "\"prompt\":\"hi\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, nb, "\"input\":\"hi\"") != null);
     const hb = try buildNativeBody(alloc, "horde", "hm", msgs, 42);
     defer alloc.free(hb);
     const kb = try buildNativeBody(alloc, "kobold", "km", msgs, 42);
@@ -519,7 +519,7 @@ test "per-provider byte shape comparison" {
         .{ .name = "nanogpt", .keys = &.{ "model", "messages", "max_tokens" } },
         .{ .name = "anthropic", .keys = &.{ "model", "max_tokens", "messages" } },
         .{ .name = "google", .keys = &.{ "contents" } },
-        .{ .name = "novelai", .keys = &.{ "prompt", "model", "parameters" } },
+        .{ .name = "novelai", .keys = &.{ "input", "model", "parameters" } },
         .{ .name = "horde", .keys = &.{ "prompt", "params" } },
         .{ .name = "kobold", .keys = &.{ "prompt", "max_length" } },
     };
@@ -532,6 +532,42 @@ test "per-provider byte shape comparison" {
             try std.testing.expect(parsed.value.object.get(k) != null);
         }
     }
+}
+
+test "novelai/horde/kobold exact body shapes" {
+    // Upstream byte-shape check (src/endpoints/novelai.js:212 data={input,model,
+    // parameters:{max_length}}). NovelAI must use "input", not "prompt".
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const msgs = "[{\"role\":\"user\",\"content\":\"hi\"}]";
+    const nb = try buildNativeBody(alloc, "novelai", "nai", msgs, 42);
+    defer alloc.free(nb);
+    const np = try std.json.parseFromSlice(std.json.Value, alloc, nb, .{});
+    defer np.deinit();
+    try std.testing.expect(np.value.object.get("input") != null);
+    try std.testing.expectEqualStrings("hi", np.value.object.get("input").?.string);
+    try std.testing.expectEqualStrings("nai", np.value.object.get("model").?.string);
+    const nparams = np.value.object.get("parameters").?;
+    try std.testing.expect(nparams == .object);
+    try std.testing.expectEqual(@as(i64, 42), nparams.object.get("max_length").?.integer);
+
+    const hb = try buildNativeBody(alloc, "horde", "hm", msgs, 42);
+    defer alloc.free(hb);
+    const hp = try std.json.parseFromSlice(std.json.Value, alloc, hb, .{});
+    defer hp.deinit();
+    try std.testing.expectEqualStrings("hi", hp.value.object.get("prompt").?.string);
+    const hparams = hp.value.object.get("params").?;
+    try std.testing.expect(hparams == .object);
+    try std.testing.expectEqualStrings("hm", hparams.object.get("model").?.string);
+    try std.testing.expectEqual(@as(i64, 42), hparams.object.get("max_length").?.integer);
+
+    const kb = try buildNativeBody(alloc, "kobold", "km", msgs, 42);
+    defer alloc.free(kb);
+    const kp = try std.json.parseFromSlice(std.json.Value, alloc, kb, .{});
+    defer kp.deinit();
+    try std.testing.expectEqualStrings("hi", kp.value.object.get("prompt").?.string);
+    try std.testing.expectEqual(@as(i64, 42), kp.value.object.get("max_length").?.integer);
 }
 
 test "appendSseDeltas extracts incremental deltas" {
