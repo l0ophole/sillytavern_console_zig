@@ -406,6 +406,8 @@ pub fn buildNativeBody(alloc: std.mem.Allocator, provider_name: []const u8, mode
             }
             conv.deinit(alloc);
         }
+        var tool_name_map: std.StringHashMapUnmanaged([]const u8) = .empty;
+        defer tool_name_map.deinit(alloc);
         for (msgs[sys_end..]) |m| {
             var role: []const u8 = "user";
             var name: []const u8 = "";
@@ -421,7 +423,74 @@ pub fn buildNativeBody(alloc: std.mem.Allocator, provider_name: []const u8, mode
             }
             const crole: []const u8 = if (std.mem.eql(u8, role, "assistant")) "model" else "user";
             var parts: std.ArrayListUnmanaged([]u8) = .empty;
-            if (content_val) |cv| {
+            // Tools per upstream convertGooglePrompt (string-content tools only).
+            var has_tool_calls = false;
+            var has_tool_call_id = false;
+            if (m == .object) {
+                if (m.object.get("tool_calls")) |tc| {
+                    if (tc == .array and tc.array.items.len > 0) has_tool_calls = true;
+                }
+                if (m.object.get("tool_call_id")) |v| {
+                    if (v == .string and v.string.len > 0) has_tool_call_id = true;
+                }
+            }
+            if (has_tool_calls) {
+                const tcs = m.object.get("tool_calls").?;
+                for (tcs.array.items) |tc| {
+                    if (tc != .object) continue;
+                    var tc_id: []const u8 = "";
+                    var fn_name: []const u8 = "";
+                    var fn_args: []const u8 = "{}";
+                    if (tc.object.get("id")) |v| {
+                        if (v == .string) tc_id = v.string;
+                    }
+                    if (tc.object.get("function")) |fnv| {
+                        if (fnv == .object) {
+                            if (fnv.object.get("name")) |v| {
+                                if (v == .string) fn_name = v.string;
+                            }
+                            if (fnv.object.get("arguments")) |v| {
+                                if (v == .string) fn_args = v.string;
+                            }
+                        }
+                    }
+                    if (tc_id.len > 0) try tool_name_map.put(alloc, tc_id, fn_name);
+                    const eq_name = try jsonEscaped(alloc, fn_name);
+                    defer alloc.free(eq_name);
+                    var args_json: []u8 = undefined;
+                    if (std.json.parseFromSlice(std.json.Value, alloc, fn_args, .{})) |pa| {
+                        var tmp: std.Io.Writer.Allocating = .init(alloc);
+                        defer tmp.deinit();
+                        var s: std.json.Stringify = .{ .writer = &tmp.writer };
+                        try s.write(pa.value);
+                        args_json = try alloc.dupe(u8, tmp.written());
+                        pa.deinit();
+                    } else |_| {
+                        const eq_args = try jsonEscaped(alloc, fn_args);
+                        defer alloc.free(eq_args);
+                        args_json = try std.fmt.allocPrint(alloc, "\"{s}\"", .{eq_args});
+                    }
+                    defer alloc.free(args_json);
+                    const one = try std.fmt.allocPrint(alloc, "{{\"functionCall\":{{\"name\":\"{s}\",\"args\":{s}}}}}", .{ eq_name, args_json });
+                    try parts.append(alloc, one);
+                }
+            } else if (has_tool_call_id) {
+                var tc_id: []const u8 = "";
+                var t_content: []const u8 = "";
+                if (m.object.get("tool_call_id")) |v| {
+                    if (v == .string) tc_id = v.string;
+                }
+                if (content_val) |cv| {
+                    if (cv == .string) t_content = cv.string;
+                }
+                const fn_name = tool_name_map.get(tc_id) orelse "unknown";
+                const eq_name = try jsonEscaped(alloc, fn_name);
+                defer alloc.free(eq_name);
+                const eq_c = try jsonEscaped(alloc, t_content);
+                defer alloc.free(eq_c);
+                const one = try std.fmt.allocPrint(alloc, "{{\"functionResponse\":{{\"name\":\"{s}\",\"response\":{{\"name\":\"{s}\",\"content\":\"{s}\"}}}}}}", .{ eq_name, eq_name, eq_c });
+                try parts.append(alloc, one);
+            } else if (content_val) |cv| {
                 if (cv == .string) {
                     var text = cv.string;
                     var prefixed: ?[]u8 = null;
@@ -925,6 +994,39 @@ test "anthropic tool_use/tool_result conversion" {
     try std.testing.expectEqualStrings("tool_result", t_content.array.items[0].object.get("type").?.string);
     try std.testing.expectEqualStrings("call_1", t_content.array.items[0].object.get("tool_use_id").?.string);
     try std.testing.expectEqualStrings("sunny", t_content.array.items[0].object.get("content").?.string);
+}
+
+test "google tool functionCall/functionResponse conversion" {
+    // RED: upstream convertGooglePrompt maps string tool_calls ->
+    // {functionCall:{name,args}} and tool_call_id ->
+    // {functionResponse:{name,response:{name,content}}} with toolNameMap.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const msgs = "[{\"role\":\"user\",\"content\":\"hi\"},{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"id\":\"call_1\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{\\\"city\\\":\\\"Paris\\\"}\"}}]},{\"role\":\"user\",\"tool_call_id\":\"call_1\",\"content\":\"sunny\"}]";
+    const body = try buildNativeBody(alloc, "google", "gemini-pro", msgs, 100);
+    defer alloc.free(body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .object);
+    const contents = parsed.value.object.get("contents").?;
+    try std.testing.expect(contents == .array);
+    try std.testing.expectEqual(@as(usize, 3), contents.array.items.len);
+    // assistant functionCall
+    try std.testing.expectEqualStrings("model", contents.array.items[1].object.get("role").?.string);
+    const a_parts = contents.array.items[1].object.get("parts").?;
+    try std.testing.expectEqual(@as(usize, 1), a_parts.array.items.len);
+    const fc = a_parts.array.items[0].object.get("functionCall").?;
+    try std.testing.expectEqualStrings("get_weather", fc.object.get("name").?.string);
+    const fc_args = fc.object.get("args").?;
+    try std.testing.expect(fc_args == .object);
+    try std.testing.expectEqualStrings("Paris", fc_args.object.get("city").?.string);
+    // functionResponse
+    const t_parts = contents.array.items[2].object.get("parts").?;
+    const fr = t_parts.array.items[0].object.get("functionResponse").?;
+    try std.testing.expectEqualStrings("get_weather", fr.object.get("name").?.string);
+    const fr_resp = fr.object.get("response").?;
+    try std.testing.expectEqualStrings("sunny", fr_resp.object.get("content").?.string);
 }
 
 test "appendSseDeltas extracts incremental deltas" {
