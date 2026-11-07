@@ -18,7 +18,8 @@ const posix = std.posix;
 var data_root: []const u8 = "data";
 var port: u16 = 8000;
 var host: []const u8 = "127.0.0.1";
-var allow_execute: bool = false; // extensions.execute is remote code execution: opt-in only (ST_ALLOW_EXECUTE=1)
+var server_unix_path: ?[]const u8 = null; // set in main when listening on a Unix socket
+// extensions.execute* never runs caller code: unconditionally disabled.
 var auth_token: ?[]const u8 = null; // if ST_TOKEN is set, HTTP requests must present X-ST-Token
 
 fn printUsage() void {
@@ -373,9 +374,11 @@ fn handleHttp(conn: posix.fd_t, cbuf: *ConnBuf, first_line: []const u8) void {
         }
     }
     if (auth_token) |tok| {
+        // Health/ping are exempt (same as TCP ping/version/health).
+        const is_health = std.mem.indexOf(u8, first_line, " /api/health") != null or std.mem.indexOf(u8, first_line, " /api/ping") != null;
         const presented = getHeader(headers_slice_all, "x-st-token") orelse getHeader(headers_slice_all, "authorization") orelse "";
         const presented_tok = if (std.mem.startsWith(u8, presented, "Bearer ")) presented[7..] else presented;
-        if (!std.mem.eql(u8, presented_tok, tok)) {
+        if (!is_health and !std.mem.eql(u8, presented_tok, tok)) {
             _ = posix.write(conn, "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n") catch {};
             return;
         }
@@ -694,6 +697,7 @@ const JobCtx = struct {
     job_id: []u8,
     params_json: []u8, // chat.turn params (without token; added by thread)
     port: u16,
+    unix_path: ?[]const u8 = null, // loop back over the Unix socket in default mode
     token: []u8,
     data_root: []u8,
 };
@@ -775,21 +779,48 @@ fn jobThread(ctx: *JobCtx) void {
     defer alloc.free(params);
     const line = std.fmt.allocPrint(alloc, "{{\"method\":\"chat.turn\",\"version\":1,\"params\":{s}}}\n", .{params}) catch return;
     defer alloc.free(line);
-    const addr_str = std.fmt.allocPrint(alloc, "127.0.0.1:{d}", .{ctx.port}) catch return;
-    defer alloc.free(addr_str);
-    const addr = std.net.Address.parseIpAndPort(addr_str) catch {
-        writeJobFile(alloc, ctx, "{\"status\":\"error\",\"error\":\"connect\"}");
-        return;
-    };
-    const sock = posix.socket(addr.any.family, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP) catch {
-        writeJobFile(alloc, ctx, "{\"status\":\"error\",\"error\":\"connect\"}");
-        return;
+    // Loop back over the Unix socket when the server listens there
+    // (default mode); otherwise over TCP localhost.
+    const sock: posix.fd_t = blk: {
+        if (ctx.unix_path) |up| {
+            const s = posix.socket(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0) catch {
+                writeJobFile(alloc, ctx, "{\"status\":\"error\",\"error\":\"connect\"}");
+                return;
+            };
+            var sa: posix.sockaddr.un = undefined;
+            sa.family = posix.AF.UNIX;
+            @memset(&sa.path, 0);
+            if (up.len >= sa.path.len) {
+                posix.close(s);
+                writeJobFile(alloc, ctx, "{\"status\":\"error\",\"error\":\"connect\"}");
+                return;
+            }
+            @memcpy(sa.path[0..up.len], up);
+            posix.connect(s, @as(*posix.sockaddr, @ptrCast(&sa)), @sizeOf(posix.sockaddr.un)) catch {
+                posix.close(s);
+                writeJobFile(alloc, ctx, "{\"status\":\"error\",\"error\":\"connect\"}");
+                return;
+            };
+            break :blk s;
+        }
+        const addr_str = std.fmt.allocPrint(alloc, "127.0.0.1:{d}", .{ctx.port}) catch return;
+        defer alloc.free(addr_str);
+        const addr = std.net.Address.parseIpAndPort(addr_str) catch {
+            writeJobFile(alloc, ctx, "{\"status\":\"error\",\"error\":\"connect\"}");
+            return;
+        };
+        const s = posix.socket(addr.any.family, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP) catch {
+            writeJobFile(alloc, ctx, "{\"status\":\"error\",\"error\":\"connect\"}");
+            return;
+        };
+        posix.connect(s, &addr.any, addr.getOsSockLen()) catch {
+            posix.close(s);
+            writeJobFile(alloc, ctx, "{\"status\":\"error\",\"error\":\"connect\"}");
+            return;
+        };
+        break :blk s;
     };
     defer posix.close(sock);
-    posix.connect(sock, &addr.any, addr.getOsSockLen()) catch {
-        writeJobFile(alloc, ctx, "{\"status\":\"error\",\"error\":\"connect\"}");
-        return;
-    };
     writeAll(sock, line);
     // Collect the single loopback response. Progress (partial_text/chunks)
     // is written directly by chat.turn via sseChunk; do not clobber it here
@@ -852,7 +883,10 @@ fn handleClient(conn: posix.fd_t) void {
         return;
     };
     // Token required on every endpoint that reads/changes user data.
-    const token_exempt = std.mem.eql(u8, req.method, "ping") or std.mem.eql(u8, req.method, "version") or std.mem.eql(u8, req.method, "health");
+    // users.validate/logout carry their own session token in params.token
+    // and authenticate it themselves, so they are exempt from the server
+    // token check (same rationale as ping/version/health).
+    const token_exempt = std.mem.eql(u8, req.method, "ping") or std.mem.eql(u8, req.method, "version") or std.mem.eql(u8, req.method, "health") or std.mem.eql(u8, req.method, "users.validate") or std.mem.eql(u8, req.method, "users.logout");
     if (auth_token) |tok| {
         if (!token_exempt) {
             const presented = getStr(req, "token") orelse "";
@@ -3994,6 +4028,7 @@ fn handleClient(conn: posix.fd_t) void {
             .job_id = page_alloc.dupe(u8, job_id) catch return,
             .params_json = page_alloc.dupe(u8, params_json) catch return,
             .port = port,
+            .unix_path = server_unix_path,
             .token = page_alloc.dupe(u8, auth_token orelse "") catch return,
             .data_root = page_alloc.dupe(u8, data_root) catch return,
         };
@@ -4454,8 +4489,10 @@ fn handleClient(conn: posix.fd_t) void {
         defer out.deinit(alloc);
         out.append(alloc, '{') catch return;
         for (steps, 0..) |st, idx| {
-            // Build HTTP request
-            const req_str = std.fmt.allocPrint(alloc, "POST {s} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ st.path, st.body.len, st.body }) catch return;
+            // Build HTTP request (with server token: bridge enforces auth)
+            const tok_hdr = if (auth_token) |t| std.fmt.allocPrint(alloc, "X-ST-Token: {s}\r\n", .{t}) catch "" else alloc.dupe(u8, "") catch "";
+            defer alloc.free(tok_hdr);
+            const req_str = std.fmt.allocPrint(alloc, "POST {s} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n{s}Content-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ st.path, tok_hdr, st.body.len, st.body }) catch return;
             defer alloc.free(req_str);
             const addr_str = std.fmt.allocPrint(alloc, "127.0.0.1:{d}", .{port}) catch return;
             defer alloc.free(addr_str);
@@ -4488,7 +4525,7 @@ fn handleClient(conn: posix.fd_t) void {
                 rn += part;
             }
             posix.close(sock);
-            const ok = rn > 0 and std.mem.indexOf(u8, rbuf[0..rn], "\"ok\":true") != null;
+            const ok = rn > 0 and std.mem.indexOf(u8, rbuf[0..rn], " 200 ") != null;
             if (ok) ok_count += 1;
             if (idx > 0) out.append(alloc, ',') catch return;
             const pq = protocol.jsonQuote(alloc, st.path) catch return;
@@ -4765,7 +4802,10 @@ pub fn main() !void {
             printUsage();
             return;
         } else if (std.mem.eql(u8, args[i], "--port") and i + 1 < args.len) {
-            port = try std.fmt.parseInt(u16, args[i + 1], 10);
+            port = std.fmt.parseInt(u16, args[i + 1], 10) catch {
+                std.fs.File.stderr().writeAll("error: invalid port (must be 0-65535)\n") catch {};
+                std.process.exit(1);
+            };
             port_explicit = true;
             i += 1;
         } else if (std.mem.eql(u8, args[i], "--host") and i + 1 < args.len) {
@@ -4779,9 +4819,7 @@ pub fn main() !void {
             i += 1;
         }
     }
-    if (std.posix.getenv("ST_ALLOW_EXECUTE")) |v| {
-        if (std.mem.eql(u8, v, "1") or std.ascii.eqlIgnoreCase(v, "true")) allow_execute = true;
-    }
+    // No ST_ALLOW_EXECUTE: caller code is never executed.
     try std.fs.cwd().makePath(data_root);
     // Auth token: ST_TOKEN env, else load/generate <data_root>/token (mode 0600).
     // Required on every data endpoint (TCP params.token and HTTP X-ST-Token).
@@ -4814,6 +4852,7 @@ pub fn main() !void {
         unix_owned = std.fs.path.join(alloc, &.{ data_root, "st.sock" }) catch unreachable;
         unix_path = unix_owned.?;
     }
+    server_unix_path = unix_path;
     const sock: posix.fd_t = blk: {
         if (unix_path) |up| {
             std.posix.unlink(up) catch {};

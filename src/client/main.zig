@@ -94,11 +94,24 @@ fn repl(alloc: std.mem.Allocator, host: []const u8, port: u16) !void {
     var read_chunk: [4096]u8 = undefined;
     var pending: std.ArrayListUnmanaged(u8) = .empty;
     defer pending.deinit(alloc);
+    // Consumed-prefix offset: pending.items stays the allocation base so
+    // appendSlice/resize remain valid; compact periodically instead of
+    // reslicing items (reslicing corrupts capacity accounting and caused a
+    // heap double-free after ~1,500 REPL lines).
+    var consumed: usize = 0;
     var eof = false;
     while (true) {
         out.writeAll("> ") catch {};
+        // Compact consumed prefix so appends never run off the allocation.
+        if (consumed > 0 and (consumed == pending.items.len or consumed >= 65536)) {
+            if (consumed < pending.items.len) {
+                std.mem.copyForwards(u8, pending.items[0..], pending.items[consumed..]);
+            }
+            pending.items = pending.items[0 .. pending.items.len - consumed];
+            consumed = 0;
+        }
         // Fill until newline or EOF
-        while (std.mem.indexOfScalar(u8, pending.items, '\n') == null and !eof) {
+        while (std.mem.indexOfScalar(u8, pending.items[consumed..], '\n') == null and !eof) {
             const nread = posix.read(posix.STDIN_FILENO, &read_chunk) catch 0;
             if (nread == 0) {
                 eof = true;
@@ -106,9 +119,9 @@ fn repl(alloc: std.mem.Allocator, host: []const u8, port: u16) !void {
             }
             pending.appendSlice(alloc, read_chunk[0..nread]) catch break;
         }
-        const nl = std.mem.indexOfScalar(u8, pending.items, '\n') orelse break;
-        const line = pending.items[0..nl];
-        pending.items = pending.items[nl + 1 ..];
+        const nl = std.mem.indexOfScalar(u8, pending.items[consumed..], '\n') orelse break;
+        const line = pending.items[consumed .. consumed + nl];
+        consumed += nl + 1;
         const trimmed = std.mem.trim(u8, line, " \t\r");
         if (trimmed.len == 0) continue;
         if (std.mem.eql(u8, trimmed, "/exit") or std.mem.eql(u8, trimmed, "exit") or std.mem.eql(u8, trimmed, "/quit")) break;
@@ -142,11 +155,14 @@ fn repl(alloc: std.mem.Allocator, host: []const u8, port: u16) !void {
         if (std.mem.eql(u8, method, "users")) method = "users.list";
         const resp = sendRequest(alloc, host, port, method, params) catch |e| {
             const m = std.fmt.allocPrint(alloc, "error: {}\n", .{e}) catch "";
+            defer alloc.free(m);
             err_out.writeAll(m) catch {};
             continue;
         };
-        defer alloc.free(resp);
+        // Free immediately: defer inside the loop accumulates until REPL
+        // exit and grows memory with every line.
         out.writeAll(resp) catch {};
+        alloc.free(resp);
     }
 }
 
@@ -173,7 +189,10 @@ pub fn main() !void {
             host = args[i + 1];
             i += 1;
         } else if (std.mem.eql(u8, args[i], "--port") and i + 1 < args.len) {
-            port = try std.fmt.parseInt(u16, args[i + 1], 10);
+            port = std.fmt.parseInt(u16, args[i + 1], 10) catch {
+                std.fs.File.stderr().writeAll("st-client: error: invalid port (must be 0-65535)\n") catch {};
+                std.process.exit(1);
+            };
             i += 1;
         } else if (method == null) {
             method = args[i];

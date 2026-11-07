@@ -23,7 +23,7 @@ Status legend: DONE = implemented in Zig + tested (`zig build test` / `tests/run
 | vectors | `vectors.save/list/query/delete/generate/embed/model/onnx/neural_real/pure_minilm` (hash + MLP + ONNX ORT-verified + MiniLM semantic ranking 1.0>0.09 + pure-Zig MiniLM safetensors cosine 0.999999 vs ONNX) | DONE |
 | search | `search.query` (local) + `search.web` (DuckDuckGo/custom URL, HTTP+HTTPS) | DONE |
 | speech/caption/classify/translate/stable-diffusion/openai/anthropic/google/azure/openrouter/novelai/horde/minimax/volcengine/nanogpt/backends | `*.proxy` + `caption.image` + `speech.tts` + `classify.classify` + `translate.translate` + `stable-diffusion.generate_and_save` | PROXY — handler exists, requires upstream key/server (85 routes `backend_unreachable`); not byte-identical |
-| extensions | `extensions.save/list/get/delete/execute/execute_browser` (node + DOM/SillyTavern shim) | DONE (local install/update via generic files; remote git ops require network) |
+| extensions | `extensions.save/list/get/delete/execute/execute_browser` | DONE-local (file storage only; `execute*` returns `execute_disabled` — caller code is never executed, no Node/JS runtime; Zig-native surface is `slash.*` + files; remote git ops require network) |
 | content-manager | `content-manager.import/list/import_url` (HTTP+HTTPS fetch) | DONE |
 | byaf/charx | `byaf.import`/`charx.import`/`characters.import_zip` (ZIP card.json, stored+deflate) | DONE |
 

@@ -62,10 +62,13 @@ See [docs/parity.md](docs/parity.md) — honest per-endpoint status vs `../Silly
 
 ```sh
 zig build test
-tests/run.sh   # unit + integration (server/client ping, settings, characters, chats)
+tests/run.sh   # strict smoke/e2e: every failure exits nonzero; ALL SMOKE TESTS PASSED only with zero failures; skips listed separately (ST_FORCE_FAIL=1 proves nonzero exit)
+tests/run-musl.sh   # musl + gnu baseline builds, AVX-family disassembly check incl. XMM VEX forms (NO_AVX_OK)
+tests/run-alpine.sh  # musl binary + Zig 0.15 build inside Alpine 3.20 (ALPINE VERIFIED)
 ```
 
-Each feature is implemented, tested, committed, and pushed separately (see `git log`).
+Each feature is implemented, tested (unit + actual client/server end-to-end), then committed and pushed separately (see `git log`). Failing code and secrets are never committed; failures/skips are reported honestly.
+
 
 ## License
 
