@@ -250,6 +250,34 @@ pub fn parseNativeResponse(alloc: std.mem.Allocator, provider_name: []const u8, 
     return alloc.dupe(u8, "");
 }
 
+/// Extract OpenAI-compatible SSE deltas from a complete-lines buffer and
+/// append the delta content to `out`. Non-JSON lines, empty lines and
+/// `[DONE]` are skipped. Callers buffer incomplete trailing lines.
+pub fn appendSseDeltas(alloc: std.mem.Allocator, sse: []const u8, out: *std.ArrayListUnmanaged(u8)) !void {
+    var pos: usize = 0;
+    while (pos < sse.len) {
+        const data_idx = std.mem.indexOf(u8, sse[pos..], "data:") orelse break;
+        const line_start = pos + data_idx + 5;
+        const line_end = std.mem.indexOfScalar(u8, sse[line_start..], '\n') orelse sse.len;
+        const payload = std.mem.trim(u8, sse[line_start .. line_start + line_end], " \r");
+        pos = line_start + line_end;
+        if (payload.len == 0) continue;
+        if (std.mem.eql(u8, payload, "[DONE]")) break;
+        const parsed = std.json.parseFromSlice(std.json.Value, alloc, payload, .{}) catch continue;
+        defer parsed.deinit();
+        if (parsed.value != .object) continue;
+        const ch = parsed.value.object.get("choices") orelse continue;
+        if (ch != .array or ch.array.items.len == 0) continue;
+        const f = ch.array.items[0];
+        if (f != .object) continue;
+        const d = f.object.get("delta") orelse continue;
+        if (d != .object) continue;
+        const c = d.object.get("content") orelse continue;
+        if (c != .string) continue;
+        try out.appendSlice(alloc, c.string);
+    }
+}
+
 test "native build/parse" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -352,4 +380,20 @@ test "per-provider byte shape comparison" {
             try std.testing.expect(parsed.value.object.get(k) != null);
         }
     }
+}
+
+test "appendSseDeltas extracts incremental deltas" {
+    // RED: streaming pickup — parser must extract OpenAI-compatible SSE
+    // deltas from a complete-lines buffer into the accumulator.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var full: std.ArrayListUnmanaged(u8) = .empty;
+    defer full.deinit(alloc);
+    const sse =
+        "data: {\"choices\":[{\"delta\":{\"content\":\"Hello \"}}]}\n\n" ++
+        "data: {\"choices\":[{\"delta\":{\"content\":\"there!\"}}]}\n\n" ++
+        "data: [DONE]\n\n";
+    try appendSseDeltas(alloc, sse, &full);
+    try std.testing.expectEqualStrings("Hello there!", full.items);
 }

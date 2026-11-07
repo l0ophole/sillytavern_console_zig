@@ -469,6 +469,34 @@ JOBID=$(./zig-out/bin/st-client --port $PORT chat.job_start '{"params":{"charact
 sleep 2
 ./zig-out/bin/st-client --port $PORT chat.job_result "{\"job_id\":\"$JOBID\"}" | grep -q 'job-reply' && echo PASS_JOB
 kill $(cat $TMP/opencode/job.pid) 2>/dev/null || true
+echo "== streaming job pickup (slow-drip) =="
+cat > $TMP/opencode/mock_slow.py <<'PYEOF'
+import json, time
+from http.server import BaseHTTPRequestHandler, HTTPServer
+class H(BaseHTTPRequestHandler):
+    def do_POST(self):
+        ln=int(self.headers.get('Content-Length',0)); self.rfile.read(ln)
+        part1=b"data: "+json.dumps({"choices":[{"delta":{"content":"Hello "}}]}).encode()+b"\n\n"
+        part2=b"data: "+json.dumps({"choices":[{"delta":{"content":"world!"}}]}).encode()+b"\n\ndata: [DONE]\n\n"
+        total=part1+part2
+        self.send_response(200); self.send_header('Content-Type','text/event-stream'); self.send_header('Content-Length',str(len(total))); self.end_headers(); self.wfile.write(part1); self.wfile.flush(); time.sleep(1.5); self.wfile.write(part2); self.wfile.flush()
+    def log_message(self,*a): pass
+HTTPServer(('127.0.0.1',18145),H).handle_request()
+PYEOF
+python3 $TMP/opencode/mock_slow.py > $TMP/opencode/slow.log 2>&1 & echo $! > $TMP/opencode/slow.pid
+sleep 1
+SLOWID=$(./zig-out/bin/st-client --port $PORT chat.job_start '{"params":{"character":"Alice","chat":"slowchat","user_message":"hi","provider":"openai","model":"gpt-4","base_url":"http://127.0.0.1:18145","path":"/v1/chat/completions","api_key":"k"}}' | python3 -c "import json,sys; print(json.load(sys.stdin)['result']['job_id'])")
+FOUND_STREAMING=0
+i=0
+while [ "$i" -lt 20 ]; do
+  OUT_STREAM=$(./zig-out/bin/st-client --port $PORT chat.job_status "{\"job_id\":\"$SLOWID\"}")
+  if echo "$OUT_STREAM" | grep -q 'partial_text' && echo "$OUT_STREAM" | grep -q 'Hello ' && echo "$OUT_STREAM" | grep -q '"status":"running"'; then FOUND_STREAMING=1; break; fi
+  i=$((i+1)); sleep 0.2
+done
+[ "$FOUND_STREAMING" = "1" ] && echo PASS_STREAM_PICKUP
+sleep 2
+./zig-out/bin/st-client --port $PORT chat.job_result "{\"job_id\":\"$SLOWID\"}" | grep -q 'Hello world!' && echo PASS_STREAM_DONE
+kill $(cat $TMP/opencode/slow.pid) 2>/dev/null || true
 kill $(cat $TMP/opencode/turn.pid) 2>/dev/null || true
 if [ -n "${OPENROUTER_API_KEY:-}" ]; then
   ./zig-out/bin/st-client --port $PORT chat.turn '{"character":"Alice","chat":"realchat","user_message":"Reply with one short word.","provider":"openrouter","model":"openai/gpt-4o-mini"}' | grep -q '"saved":true' && echo PASS_TURN_REAL

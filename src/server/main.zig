@@ -698,6 +698,61 @@ const JobCtx = struct {
     data_root: []u8,
 };
 
+const SseCtx = struct {
+    alloc: std.mem.Allocator,
+    pending: std.ArrayListUnmanaged(u8) = .empty,
+    full: std.ArrayListUnmanaged(u8) = .empty,
+    chunks: usize = 0,
+    raw_bytes: usize = 0,
+    job_id: ?[]const u8 = null,
+    data_root: []const u8 = "data",
+};
+
+fn writeJobProgress(alloc: std.mem.Allocator, data_root_path: []const u8, job_id: []const u8, partial_text: []const u8, chunks: usize, partial_bytes: usize) void {
+    const jobs_dir = std.fs.path.join(alloc, &.{ data_root_path, "jobs" }) catch return;
+    defer alloc.free(jobs_dir);
+    std.fs.cwd().makePath(jobs_dir) catch return;
+    const fname = std.fmt.allocPrint(alloc, "{s}.json", .{job_id}) catch return;
+    defer alloc.free(fname);
+    const fpath = std.fs.path.join(alloc, &.{ jobs_dir, fname }) catch return;
+    defer alloc.free(fpath);
+    const tq = protocol.jsonQuote(alloc, partial_text) catch return;
+    defer alloc.free(tq);
+    const content = std.fmt.allocPrint(alloc, "{{\"status\":\"running\",\"partial_text\":{s},\"chunks\":{d},\"partial_bytes\":{d}}}", .{ tq, chunks, partial_bytes }) catch return;
+    defer alloc.free(content);
+    store.writeAtomic(fpath, content) catch {};
+}
+
+fn sseChunk(ctx_ptr: *anyopaque, bytes: []const u8) anyerror!void {
+    const ctx: *SseCtx = @ptrCast(@alignCast(ctx_ptr));
+    try ctx.pending.appendSlice(ctx.alloc, bytes);
+    ctx.raw_bytes += bytes.len;
+    if (std.mem.lastIndexOfScalar(u8, ctx.pending.items, '\n')) |last_nl| {
+        const complete_len = last_nl + 1;
+        const complete = try ctx.alloc.dupe(u8, ctx.pending.items[0..complete_len]);
+        defer ctx.alloc.free(complete);
+        const before_len = ctx.full.items.len;
+        try providers_mod.appendSseDeltas(ctx.alloc, complete, &ctx.full);
+        if (ctx.full.items.len > before_len) {
+            // Count data: lines as chunks
+            var c: usize = 0;
+            var search: usize = 0;
+            while (std.mem.indexOf(u8, complete[search..], "data:")) |di| {
+                c += 1;
+                search += di + 5;
+            }
+            ctx.chunks += c;
+        }
+        // Drop processed prefix
+        ctx.pending.replaceRange(ctx.alloc, 0, complete_len, &.{}) catch {
+            ctx.pending.clearRetainingCapacity();
+        };
+        if (ctx.job_id) |jid| {
+            writeJobProgress(ctx.alloc, ctx.data_root, jid, ctx.full.items, ctx.chunks, ctx.raw_bytes);
+        }
+    }
+}
+
 fn jobThread(ctx: *JobCtx) void {
     defer {
         const alloc = std.heap.page_allocator;
@@ -708,13 +763,15 @@ fn jobThread(ctx: *JobCtx) void {
         alloc.destroy(ctx);
     }
     const alloc = std.heap.page_allocator;
-    // Build loopback request: {"method":"chat.turn","version":1,"params":{...,"token":...}}
+    // Build loopback request: {"method":"chat.turn","version":1,"params":{...,"token":...,"job_id":...}}
     const tq = protocol.jsonQuote(alloc, ctx.token) catch return;
     defer alloc.free(tq);
+    const jq = protocol.jsonQuote(alloc, ctx.job_id) catch return;
+    defer alloc.free(jq);
     const params = if (ctx.params_json.len > 2 and std.mem.startsWith(u8, std.mem.trim(u8, ctx.params_json, " \t\r\n"), "{"))
-        std.fmt.allocPrint(alloc, "{s},\"token\":{s}}}", .{ ctx.params_json[0 .. ctx.params_json.len - 1], tq }) catch return
+        std.fmt.allocPrint(alloc, "{s},\"job_id\":{s},\"token\":{s}}}", .{ ctx.params_json[0 .. ctx.params_json.len - 1], jq, tq }) catch return
     else
-        std.fmt.allocPrint(alloc, "{{\"token\":{s}}}", .{tq}) catch return;
+        std.fmt.allocPrint(alloc, "{{\"job_id\":{s},\"token\":{s}}}", .{ jq, tq }) catch return;
     defer alloc.free(params);
     const line = std.fmt.allocPrint(alloc, "{{\"method\":\"chat.turn\",\"version\":1,\"params\":{s}}}\n", .{params}) catch return;
     defer alloc.free(line);
@@ -734,8 +791,9 @@ fn jobThread(ctx: *JobCtx) void {
         return;
     };
     writeAll(sock, line);
-    // Stream pickup: write partial progress as chunks arrive so a reconnected
-    // client can poll job_status and see bytes received so far.
+    // Collect the single loopback response. Progress (partial_text/chunks)
+    // is written directly by chat.turn via sseChunk; do not clobber it here
+    // with loopback-byte counts.
     var resp_list: std.ArrayListUnmanaged(u8) = .empty;
     defer resp_list.deinit(alloc);
     var rchunk: [8192]u8 = undefined;
@@ -743,9 +801,6 @@ fn jobThread(ctx: *JobCtx) void {
         const rn = posix.read(sock, &rchunk) catch break;
         if (rn == 0) break;
         resp_list.appendSlice(alloc, rchunk[0..rn]) catch break;
-        const partial = std.fmt.allocPrint(alloc, "{{\"status\":\"running\",\"partial_bytes\":{d}}}", .{resp_list.items.len}) catch continue;
-        defer alloc.free(partial);
-        writeJobFile(alloc, ctx, partial);
     }
     const resp = resp_list.toOwnedSlice(alloc) catch return;
     defer alloc.free(resp);
@@ -3824,53 +3879,55 @@ fn handleClient(conn: posix.fd_t) void {
                 nheaders = 3;
             }
         }
-        const fetched = backend.fetchUrlHeaders(alloc, url, "POST", with_stream, headers_buf[0..nheaders]) catch {
-            resp = protocol.encodeErr(alloc, "backend_unreachable") catch return;
-            defer alloc.free(resp);
-            _ = posix.write(conn, resp) catch {};
-            return;
-        };
-        defer alloc.free(fetched.body);
-        if (fetched.status < 200 or fetched.status >= 300) {
-            const inner = std.fmt.allocPrint(alloc, "{{\"provider\":\"{s}\",\"status\":{d},\"error\":\"provider_error\"}}", .{ prov.name, fetched.status }) catch return;
+        // True incremental SSE streaming with job progress pickup.
+        const raw_job = getStr(req, "job_id");
+        var valid_job: ?[]const u8 = null;
+        if (raw_job) |rj| {
+            if (protocol.isSafeName(rj) and std.mem.startsWith(u8, rj, "job-")) valid_job = rj;
+        }
+        var stream_ctx = SseCtx{ .alloc = alloc, .job_id = valid_job, .data_root = data_root };
+        defer stream_ctx.pending.deinit(alloc);
+        defer stream_ctx.full.deinit(alloc);
+        if (valid_job) |vj| writeJobProgress(alloc, data_root, vj, "", 0, 0);
+        var status: u16 = 0;
+        if (backend.fetchUrlHeadersStream(alloc, url, "POST", with_stream, headers_buf[0..nheaders], sseChunk, @ptrCast(&stream_ctx))) |st| {
+            status = st;
+        } else |_| {
+            const fetched = backend.fetchUrlHeaders(alloc, url, "POST", with_stream, headers_buf[0..nheaders]) catch {
+                resp = protocol.encodeErr(alloc, "backend_unreachable") catch return;
+                defer alloc.free(resp);
+                _ = posix.write(conn, resp) catch {};
+                return;
+            };
+            defer alloc.free(fetched.body);
+            status = fetched.status;
+            if (status >= 200 and status < 300) {
+                providers_mod.appendSseDeltas(alloc, fetched.body, &stream_ctx.full) catch {};
+                var c: usize = 0;
+                var search: usize = 0;
+                while (std.mem.indexOf(u8, fetched.body[search..], "data:")) |di| {
+                    c += 1;
+                    search += di + 5;
+                }
+                stream_ctx.chunks = c;
+            }
+        }
+        if (status < 200 or status >= 300) {
+            const inner = std.fmt.allocPrint(alloc, "{{\"provider\":\"{s}\",\"status\":{d},\"error\":\"provider_error\"}}", .{ prov.name, status }) catch return;
             defer alloc.free(inner);
             resp = protocol.encodeOk(alloc, inner) catch return;
             defer alloc.free(resp);
             _ = posix.write(conn, resp) catch {};
             return;
         }
-        // Parse SSE deltas (OpenAI-compatible)
-        var full: std.ArrayListUnmanaged(u8) = .empty;
-        defer full.deinit(alloc);
-        var pos: usize = 0;
-        while (pos < fetched.body.len) {
-            const data_idx = std.mem.indexOf(u8, fetched.body[pos..], "data:") orelse break;
-            const line_start = pos + data_idx + 5;
-            const line_end = std.mem.indexOfScalar(u8, fetched.body[line_start..], '\n') orelse fetched.body.len;
-            const payload = std.mem.trim(u8, fetched.body[line_start .. line_start + line_end], " \r");
-            pos = line_start + line_end;
-            if (std.mem.eql(u8, payload, "[DONE]")) break;
-            if (payload.len == 0) continue;
-            if (std.json.parseFromSlice(std.json.Value, alloc, payload, .{})) |parsed| {
-                if (parsed.value == .object) {
-                    if (parsed.value.object.get("choices")) |ch| {
-                        if (ch == .array and ch.array.items.len > 0) {
-                            const f = ch.array.items[0];
-                            if (f == .object) {
-                                if (f.object.get("delta")) |d| {
-                                    if (d == .object) {
-                                        if (d.object.get("content")) |c| {
-                                            if (c == .string) full.appendSlice(alloc, c.string) catch return;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            } else |_| {}
+        // Flush trailing incomplete SSE line (if any) through the parser.
+        if (stream_ctx.pending.items.len > 0) {
+            const tail = std.fmt.allocPrint(alloc, "{s}\n", .{stream_ctx.pending.items}) catch return;
+            defer alloc.free(tail);
+            providers_mod.appendSseDeltas(alloc, tail, &stream_ctx.full) catch {};
+            stream_ctx.pending.clearRetainingCapacity();
         }
-        const text = full.toOwnedSlice(alloc) catch return;
+        const text = stream_ctx.full.toOwnedSlice(alloc) catch return;
         defer alloc.free(text);
         // Save user + assistant turns, then reload
         const uq = protocol.jsonQuote(alloc, user_msg2) catch return;
